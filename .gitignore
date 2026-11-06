@@ -1,0 +1,9 @@
+/target
+/bin/synapse-core
+/bin/synapse-core.exe
+/bin/android/
+*.db
+*.db-wal
+*.db-shm
+*.log
+.synapse/
