@@ -42,8 +42,9 @@ similar = { version = "2.6", features = ["text"] }
 # CLI Arguments & Config
 clap = { version = "4.5", features = ["derive", "env"] }
 
-# Filesystem Watching
+# Filesystem Watching & Metadata
 notify = "6.1"
+filetime = "0.2"
 
 # Cryptography & Identities
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }

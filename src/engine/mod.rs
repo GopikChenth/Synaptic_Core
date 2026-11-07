@@ -3,17 +3,25 @@
 //! Orchestrates Content-Defined Chunking, CAS persistence, Merkle DAG updates,
 //! and continuous filesystem change tracking via `notify`.
 
+pub mod fs_utils;
+pub mod ignore;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::broadcast;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::chunker::Chunker;
 use crate::conflict::{ConflictEngine, CoreEvent};
 use crate::dag::{LcaResult, MerkleDag, RevisionNode};
+use crate::engine::fs_utils::{
+    archive_file_version, atomic_write_file, ensure_folder_marker, sanitize_relative_path,
+    verify_folder_marker,
+};
+use crate::engine::ignore::IgnoreEngine;
 use crate::storage::{FileRecord, RevisionRecord, StorageEngine};
 
 #[derive(Clone)]
@@ -57,6 +65,29 @@ impl SyncEngine {
         &self.device_id
     }
 
+    /// Builds the IgnoreEngine for a folder by loading `.synapseignore`, `.stignore`, and DB rules.
+    pub fn get_folder_ignore_engine(&self, folder_id: &str, local_path: &Path) -> IgnoreEngine {
+        let mut engine = IgnoreEngine::new();
+        let syn_ignore = local_path.join(".synapseignore");
+        if syn_ignore.exists() {
+            if let Ok(c) = fs::read_to_string(&syn_ignore) {
+                engine.parse_rules(&c);
+            }
+        }
+        let st_ignore = local_path.join(".stignore");
+        if st_ignore.exists() {
+            if let Ok(c) = fs::read_to_string(&st_ignore) {
+                engine.parse_rules(&c);
+            }
+        }
+        if let Ok(pats) = self.storage.get_folder_ignores(folder_id) {
+            for p in pats {
+                engine.parse_rules(&p);
+            }
+        }
+        engine
+    }
+
     /// Indexes an entire folder recursively from scratch or incremental delta.
     pub fn index_folder(&self, folder_id: &str) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let folder = match self.storage.get_folder(folder_id)? {
@@ -74,6 +105,16 @@ impl SyncEngine {
             fs::create_dir_all(&base_path)?;
         }
 
+        // Mount Safety Marker verification: prevent cascading deletes if volume unmounted
+        if let Err(_e) = verify_folder_marker(&base_path, &folder.marker_name) {
+            let _ = ensure_folder_marker(&base_path, &folder.marker_name);
+            if let Err(e2) = verify_folder_marker(&base_path, &folder.marker_name) {
+                warn!("Mount safety check failed for folder {}: {}", folder_id, e2);
+                return Err(Box::new(e2));
+            }
+        }
+
+        let ignore_engine = self.get_folder_ignore_engine(folder_id, &base_path);
         let mut indexed_count = 0;
         let mut stack = vec![base_path.clone()];
 
@@ -85,14 +126,29 @@ impl SyncEngine {
                 let name_str = file_name.to_string_lossy();
 
                 // Skip internal metadata folders and hidden control files
-                if name_str.starts_with(".synapse") || name_str.starts_with(".git") || name_str.ends_with(".tmp_synapse") {
+                if name_str.starts_with(".synapse")
+                    || name_str.starts_with(".git")
+                    || name_str.ends_with(".tmp_synapse")
+                    || name_str.starts_with(".stfolder")
+                    || name_str == folder.marker_name
+                {
+                    continue;
+                }
+
+                let rel_path = sanitize_relative_path(&path.strip_prefix(&base_path)?.to_string_lossy());
+                if ignore_engine.is_ignored(&rel_path, path.is_dir()) {
                     continue;
                 }
 
                 if path.is_dir() {
                     stack.push(path);
                 } else if path.is_file() {
-                    let rel_path = path.strip_prefix(&base_path)?.to_string_lossy().to_string();
+                    let _ = self.event_sender.send(CoreEvent::FolderScanProgress {
+                        folder_id: folder_id.to_string(),
+                        current_file: rel_path.clone(),
+                        scanned_files: indexed_count + 1,
+                    });
+
                     if self.index_single_file(folder_id, &rel_path)? {
                         indexed_count += 1;
                     }
@@ -115,7 +171,14 @@ impl SyncEngine {
             None => return Err(format!("Folder not registered: {}", folder_id).into()),
         };
 
-        let full_path = PathBuf::from(&folder.local_path).join(relative_path);
+        // If folder is ReceiveOnly, do NOT index or propagate local changes to peers
+        if folder.sync_mode.eq_ignore_ascii_case("ReceiveOnly") {
+            info!("Folder {} is ReceiveOnly; ignoring local changes in {}", folder_id, relative_path);
+            return Ok(false);
+        }
+
+        let rel_clean = sanitize_relative_path(relative_path);
+        let full_path = PathBuf::from(&folder.local_path).join(&rel_clean);
         if !full_path.exists() {
             return Ok(false);
         }
@@ -130,7 +193,7 @@ impl SyncEngine {
             .unwrap_or(0);
 
         // Check if file is already up to date in database
-        let existing = self.storage.get_file(folder_id, relative_path)?;
+        let existing = self.storage.get_file(folder_id, &rel_clean)?;
         if let Some(record) = &existing {
             if record.size == file_size && record.mtime_nanos == mtime_nanos && !record.is_deleted {
                 return Ok(false); // No changes detected
@@ -175,7 +238,7 @@ impl SyncEngine {
 
         self.storage.upsert_file(&FileRecord {
             folder_id: folder_id.to_string(),
-            relative_path: relative_path.to_string(),
+            relative_path: rel_clean.clone(),
             size: file_size,
             mtime_nanos,
             current_revision: rev_node.revision_hash.clone(),
@@ -184,7 +247,7 @@ impl SyncEngine {
 
         let _ = self.event_sender.send(CoreEvent::FileChanged {
             folder_id: folder_id.to_string(),
-            relative_path: relative_path.to_string(),
+            relative_path: rel_clean,
             revision: rev_node.revision_hash,
         });
 
@@ -201,7 +264,28 @@ impl SyncEngine {
         remote_chunk_hashes: &[String],
         remote_payload: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // First ensure all remote chunks and revision are inserted in storage
+        let folder = match self.storage.get_folder(folder_id)? {
+            Some(f) => f,
+            None => return Err(format!("Folder not registered: {}", folder_id).into()),
+        };
+
+        // If folder is SendOnly, reject incoming modifications from remote peers
+        if folder.sync_mode.eq_ignore_ascii_case("SendOnly") {
+            warn!("Folder {} is SendOnly; rejecting incoming remote changes for {}", folder_id, relative_path);
+            return Ok(());
+        }
+
+        let rel_clean = sanitize_relative_path(relative_path);
+        let base_path = PathBuf::from(&folder.local_path);
+        let local_path = base_path.join(&rel_clean);
+
+        let _ = self.event_sender.send(CoreEvent::ItemStarted {
+            folder_id: folder_id.to_string(),
+            relative_path: rel_clean.clone(),
+            action: "SYNC_INCOMING".to_string(),
+        });
+
+        // Ensure all remote chunks and revision are inserted in storage
         self.storage.insert_revision(
             &RevisionRecord {
                 revision_hash: remote_rev.revision_hash.clone(),
@@ -214,17 +298,12 @@ impl SyncEngine {
             remote_chunk_hashes,
         )?;
 
-        let local_file = self.storage.get_file(folder_id, relative_path)?;
+        let local_file = self.storage.get_file(folder_id, &rel_clean)?;
 
         match local_file {
             None => {
-                // Completely new file remotely: fast-forward accept remote
-                let folder = self.storage.get_folder(folder_id)?.ok_or("Folder missing")?;
-                let local_path = PathBuf::from(&folder.local_path).join(relative_path);
-                if let Some(parent) = local_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&local_path, remote_payload)?;
+                // Completely new file remotely: fast-forward accept remote with atomic write
+                atomic_write_file(&local_path, remote_payload, Some(remote_rev.mtime_nanos), None)?;
 
                 // Save chunks in CAS
                 let (chunks, _) = self.chunker.chunk_slice(remote_payload);
@@ -234,17 +313,18 @@ impl SyncEngine {
 
                 self.storage.upsert_file(&FileRecord {
                     folder_id: folder_id.to_string(),
-                    relative_path: relative_path.to_string(),
+                    relative_path: rel_clean.clone(),
                     size: remote_rev.file_size,
                     mtime_nanos: remote_rev.mtime_nanos,
                     current_revision: remote_rev.revision_hash.clone(),
                     is_deleted: false,
                 })?;
 
-                let _ = self.event_sender.send(CoreEvent::FileChanged {
+                let _ = self.event_sender.send(CoreEvent::ItemFinished {
                     folder_id: folder_id.to_string(),
-                    relative_path: relative_path.to_string(),
-                    revision: remote_rev.revision_hash.clone(),
+                    relative_path: rel_clean.clone(),
+                    action: "CREATED".to_string(),
+                    error: None,
                 });
             }
             Some(existing) => {
@@ -268,12 +348,14 @@ impl SyncEngine {
                             "Fast-forwarding remote revision {} over local {}",
                             remote_rev.revision_hash, existing.current_revision
                         );
-                        let folder = self.storage.get_folder(folder_id)?.ok_or("Folder missing")?;
-                        let local_path = PathBuf::from(&folder.local_path).join(relative_path);
 
-                        let tmp = local_path.with_extension("tmp_synapse");
-                        fs::write(&tmp, remote_payload)?;
-                        fs::rename(&tmp, &local_path)?;
+                        // File versioning archive if configured
+                        if local_path.exists() && folder.versioning_type != "None" {
+                            let _ = archive_file_version(&base_path, &rel_clean);
+                        }
+
+                        // Atomic staging write with timestamp preservation
+                        atomic_write_file(&local_path, remote_payload, Some(remote_rev.mtime_nanos), None)?;
 
                         let (chunks, _) = self.chunker.chunk_slice(remote_payload);
                         for (info, data) in &chunks {
@@ -282,24 +364,25 @@ impl SyncEngine {
 
                         self.storage.upsert_file(&FileRecord {
                             folder_id: folder_id.to_string(),
-                            relative_path: relative_path.to_string(),
+                            relative_path: rel_clean.clone(),
                             size: remote_rev.file_size,
                             mtime_nanos: remote_rev.mtime_nanos,
                             current_revision: remote_rev.revision_hash.clone(),
                             is_deleted: false,
                         })?;
 
-                        let _ = self.event_sender.send(CoreEvent::FileChanged {
+                        let _ = self.event_sender.send(CoreEvent::ItemFinished {
                             folder_id: folder_id.to_string(),
-                            relative_path: relative_path.to_string(),
-                            revision: remote_rev.revision_hash.clone(),
+                            relative_path: rel_clean.clone(),
+                            action: "UPDATED".to_string(),
+                            error: None,
                         });
                     }
                     LcaResult::Diverged { base_revision } => {
                         // Branches diverged: trigger Multi-Strategy Conflict Resolution Pipeline
                         self.conflict_engine.handle_divergence(
                             folder_id,
-                            relative_path,
+                            &rel_clean,
                             base_revision.as_deref(),
                             &existing.current_revision,
                             &remote_rev.revision_hash,

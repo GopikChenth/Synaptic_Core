@@ -18,6 +18,109 @@ pub struct FolderRecord {
     pub local_path: String,
     pub conflict_policy: String, // THREE_WAY_AUTO, LWW, MANUAL
     pub is_paused: bool,
+    #[serde(default = "default_sync_mode")]
+    pub sync_mode: String, // SendReceive, SendOnly, ReceiveOnly
+    #[serde(default = "default_pull_order")]
+    pub pull_order: String, // Alphabetical, SmallestFirst, LargestFirst, NewestFirst, OldestFirst
+    #[serde(default = "default_versioning_type")]
+    pub versioning_type: String, // None, TrashCan, Simple, Staggered
+    #[serde(default = "default_versioning_keep_days")]
+    pub versioning_keep_days: i64,
+    #[serde(default = "default_marker_name")]
+    pub marker_name: String, // .synapse-folder
+}
+
+fn default_sync_mode() -> String { "SendReceive".to_string() }
+fn default_pull_order() -> String { "Alphabetical".to_string() }
+fn default_versioning_type() -> String { "None".to_string() }
+fn default_versioning_keep_days() -> i64 { 30 }
+fn default_marker_name() -> String { ".synapse-folder".to_string() }
+
+impl FolderRecord {
+    pub fn new(folder_id: impl Into<String>, local_path: impl Into<String>) -> Self {
+        Self {
+            folder_id: folder_id.into(),
+            local_path: local_path.into(),
+            conflict_policy: "THREE_WAY_AUTO".to_string(),
+            is_paused: false,
+            sync_mode: default_sync_mode(),
+            pull_order: default_pull_order(),
+            versioning_type: default_versioning_type(),
+            versioning_keep_days: default_versioning_keep_days(),
+            marker_name: default_marker_name(),
+        }
+    }
+}
+
+/// Device record in cluster pairing database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceRecord {
+    pub device_id: String, // Luhn-check formatted (XXXXXXX-XXXXXXX-...)
+    pub name: String,
+    pub addresses: Vec<String>,
+    pub is_paused: bool,
+    pub is_trusted: bool,
+    pub introducer: bool,
+    pub cert_name: Option<String>,
+    pub created_at: i64,
+}
+
+/// Pending incoming device pairing request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingDeviceRecord {
+    pub device_id: String,
+    pub name: String,
+    pub address: String,
+    pub received_at: i64,
+}
+
+/// Pending incoming folder invitation from remote peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingFolderRecord {
+    pub folder_id: String,
+    pub device_id: String,
+    pub folder_label: String,
+    pub offered_at: i64,
+}
+
+/// Folder sync metrics for UI status dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderStatusMetrics {
+    pub folder_id: String,
+    pub state: String, // "idle", "scanning", "syncing", "error"
+    pub global_files: u64,
+    pub global_bytes: u64,
+    pub local_files: u64,
+    pub local_bytes: u64,
+    pub need_files: u64,
+    pub need_bytes: u64,
+    pub in_sync_bytes: u64,
+    pub completion_pct: f64,
+    pub sequence: u64,
+}
+
+/// Folder completion percentage per remote device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceCompletionMetrics {
+    pub device_id: String,
+    pub folder_id: String,
+    pub completion_pct: f64,
+    pub global_bytes: u64,
+    pub need_bytes: u64,
+}
+
+/// Real-time peer connection statistics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerConnectionMetrics {
+    pub device_id: String,
+    pub address: String,
+    pub is_connected: bool,
+    pub in_bps: u64,
+    pub out_bps: u64,
+    pub total_in_bytes: u64,
+    pub total_out_bytes: u64,
+    pub latency_ms: u64,
+    pub client_type: String,
 }
 
 /// File metadata index record.
@@ -136,7 +239,12 @@ impl StorageEngine {
                 folder_id TEXT PRIMARY KEY,
                 local_path TEXT NOT NULL,
                 conflict_policy TEXT NOT NULL DEFAULT 'THREE_WAY_AUTO',
-                is_paused INTEGER NOT NULL DEFAULT 0
+                is_paused INTEGER NOT NULL DEFAULT 0,
+                sync_mode TEXT NOT NULL DEFAULT 'SendReceive',
+                pull_order TEXT NOT NULL DEFAULT 'Alphabetical',
+                versioning_type TEXT NOT NULL DEFAULT 'None',
+                versioning_keep_days INTEGER NOT NULL DEFAULT 30,
+                marker_name TEXT NOT NULL DEFAULT '.synapse-folder'
             );
 
             -- File metadata state
@@ -190,12 +298,76 @@ impl StorageEngine {
                 detected_at INTEGER NOT NULL
             );
 
+            -- Cluster & Paired Devices
+            CREATE TABLE IF NOT EXISTS devices (
+                device_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                addresses TEXT NOT NULL DEFAULT 'dynamic',
+                is_paused INTEGER NOT NULL DEFAULT 0,
+                is_trusted INTEGER NOT NULL DEFAULT 1,
+                introducer INTEGER NOT NULL DEFAULT 0,
+                cert_name TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            -- Pending incoming device pairings
+            CREATE TABLE IF NOT EXISTS pending_devices (
+                device_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                address TEXT NOT NULL,
+                received_at INTEGER NOT NULL
+            );
+
+            -- Folder Sharing Matrix (Which folders are shared with which devices)
+            CREATE TABLE IF NOT EXISTS folder_devices (
+                folder_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                PRIMARY KEY (folder_id, device_id),
+                FOREIGN KEY (folder_id) REFERENCES folders(folder_id) ON DELETE CASCADE
+            );
+
+            -- Pending incoming folder invitations
+            CREATE TABLE IF NOT EXISTS pending_folders (
+                folder_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                folder_label TEXT NOT NULL,
+                offered_at INTEGER NOT NULL,
+                PRIMARY KEY (folder_id, device_id)
+            );
+
+            -- Folder Ignore Patterns (.synapseignore/.stignore rules)
+            CREATE TABLE IF NOT EXISTS folder_ignores (
+                folder_id TEXT NOT NULL,
+                pattern TEXT NOT NULL,
+                PRIMARY KEY (folder_id, pattern),
+                FOREIGN KEY (folder_id) REFERENCES folders(folder_id) ON DELETE CASCADE
+            );
+
+            -- Historical File Versions
+            CREATE TABLE IF NOT EXISTS file_versions (
+                version_id TEXT PRIMARY KEY,
+                folder_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                archived_path TEXT NOT NULL,
+                archived_at INTEGER NOT NULL,
+                size INTEGER NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folder_id);
             CREATE INDEX IF NOT EXISTS idx_revisions_parent1 ON revisions(parent_1);
             CREATE INDEX IF NOT EXISTS idx_revisions_parent2 ON revisions(parent_2);
             CREATE INDEX IF NOT EXISTS idx_conflicts_status ON quarantine_conflicts(status);
+            CREATE INDEX IF NOT EXISTS idx_folder_devices_folder ON folder_devices(folder_id);
+            CREATE INDEX IF NOT EXISTS idx_file_versions_folder ON file_versions(folder_id);
             "
         )?;
+
+        // Safe migrations for folders table columns if upgraded from earlier schema
+        let _ = conn.execute("ALTER TABLE folders ADD COLUMN sync_mode TEXT NOT NULL DEFAULT 'SendReceive'", []);
+        let _ = conn.execute("ALTER TABLE folders ADD COLUMN pull_order TEXT NOT NULL DEFAULT 'Alphabetical'", []);
+        let _ = conn.execute("ALTER TABLE folders ADD COLUMN versioning_type TEXT NOT NULL DEFAULT 'None'", []);
+        let _ = conn.execute("ALTER TABLE folders ADD COLUMN versioning_keep_days INTEGER NOT NULL DEFAULT 30", []);
+        let _ = conn.execute("ALTER TABLE folders ADD COLUMN marker_name TEXT NOT NULL DEFAULT '.synapse-folder'", []);
 
         Ok(())
     }
@@ -215,17 +387,29 @@ impl StorageEngine {
     pub fn add_folder(&self, folder: &FolderRecord) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO folders (folder_id, local_path, conflict_policy, is_paused)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO folders (
+                folder_id, local_path, conflict_policy, is_paused,
+                sync_mode, pull_order, versioning_type, versioning_keep_days, marker_name
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(folder_id) DO UPDATE SET
                 local_path = excluded.local_path,
                 conflict_policy = excluded.conflict_policy,
-                is_paused = excluded.is_paused",
+                is_paused = excluded.is_paused,
+                sync_mode = excluded.sync_mode,
+                pull_order = excluded.pull_order,
+                versioning_type = excluded.versioning_type,
+                versioning_keep_days = excluded.versioning_keep_days,
+                marker_name = excluded.marker_name",
             params![
                 folder.folder_id,
                 folder.local_path,
                 folder.conflict_policy,
                 if folder.is_paused { 1 } else { 0 },
+                folder.sync_mode,
+                folder.pull_order,
+                folder.versioning_type,
+                folder.versioning_keep_days,
+                folder.marker_name,
             ],
         )?;
         Ok(())
@@ -233,13 +417,22 @@ impl StorageEngine {
 
     pub fn list_folders(&self) -> SqlResult<Vec<FolderRecord>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT folder_id, local_path, conflict_policy, is_paused FROM folders")?;
+        let mut stmt = conn.prepare(
+            "SELECT folder_id, local_path, conflict_policy, is_paused,
+                    sync_mode, pull_order, versioning_type, versioning_keep_days, marker_name
+             FROM folders",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok(FolderRecord {
                 folder_id: row.get(0)?,
                 local_path: row.get(1)?,
                 conflict_policy: row.get(2)?,
                 is_paused: row.get::<_, i64>(3)? != 0,
+                sync_mode: row.get(4).unwrap_or_else(|_| default_sync_mode()),
+                pull_order: row.get(5).unwrap_or_else(|_| default_pull_order()),
+                versioning_type: row.get(6).unwrap_or_else(|_| default_versioning_type()),
+                versioning_keep_days: row.get(7).unwrap_or_else(|_| default_versioning_keep_days()),
+                marker_name: row.get(8).unwrap_or_else(|_| default_marker_name()),
             })
         })?;
 
@@ -252,13 +445,22 @@ impl StorageEngine {
 
     pub fn get_folder(&self, folder_id: &str) -> SqlResult<Option<FolderRecord>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT folder_id, local_path, conflict_policy, is_paused FROM folders WHERE folder_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT folder_id, local_path, conflict_policy, is_paused,
+                    sync_mode, pull_order, versioning_type, versioning_keep_days, marker_name
+             FROM folders WHERE folder_id = ?1",
+        )?;
         let mut rows = stmt.query_map(params![folder_id], |row| {
             Ok(FolderRecord {
                 folder_id: row.get(0)?,
                 local_path: row.get(1)?,
                 conflict_policy: row.get(2)?,
                 is_paused: row.get::<_, i64>(3)? != 0,
+                sync_mode: row.get(4).unwrap_or_else(|_| default_sync_mode()),
+                pull_order: row.get(5).unwrap_or_else(|_| default_pull_order()),
+                versioning_type: row.get(6).unwrap_or_else(|_| default_versioning_type()),
+                versioning_keep_days: row.get(7).unwrap_or_else(|_| default_versioning_keep_days()),
+                marker_name: row.get(8).unwrap_or_else(|_| default_marker_name()),
             })
         })?;
 
@@ -266,6 +468,386 @@ impl StorageEngine {
             Some(res) => Ok(Some(res?)),
             None => Ok(None),
         }
+    }
+
+    pub fn set_folder_paused(&self, folder_id: &str, paused: bool) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE folders SET is_paused = ?1 WHERE folder_id = ?2",
+            params![if paused { 1 } else { 0 }, folder_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_folder(&self, folder_id: &str) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM folders WHERE folder_id = ?1", params![folder_id])?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // CLUSTER & DEVICE OPERATIONS
+    // =========================================================================
+
+    pub fn add_device(&self, device: &DeviceRecord) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let addrs_json = serde_json::to_string(&device.addresses).unwrap_or_else(|_| "[]".to_string());
+        conn.execute(
+            "INSERT INTO devices (
+                device_id, name, addresses, is_paused, is_trusted, introducer, cert_name, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(device_id) DO UPDATE SET
+                name = excluded.name,
+                addresses = excluded.addresses,
+                is_paused = excluded.is_paused,
+                is_trusted = excluded.is_trusted,
+                introducer = excluded.introducer,
+                cert_name = excluded.cert_name",
+            params![
+                device.device_id,
+                device.name,
+                addrs_json,
+                if device.is_paused { 1 } else { 0 },
+                if device.is_trusted { 1 } else { 0 },
+                if device.introducer { 1 } else { 0 },
+                device.cert_name,
+                device.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_devices(&self) -> SqlResult<Vec<DeviceRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT device_id, name, addresses, is_paused, is_trusted, introducer, cert_name, created_at FROM devices",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let addrs_raw: String = row.get(2)?;
+            let addresses: Vec<String> = serde_json::from_str(&addrs_raw).unwrap_or_default();
+            Ok(DeviceRecord {
+                device_id: row.get(0)?,
+                name: row.get(1)?,
+                addresses,
+                is_paused: row.get::<_, i64>(3)? != 0,
+                is_trusted: row.get::<_, i64>(4)? != 0,
+                introducer: row.get::<_, i64>(5)? != 0,
+                cert_name: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for item in rows {
+            list.push(item?);
+        }
+        Ok(list)
+    }
+
+    pub fn get_device(&self, device_id: &str) -> SqlResult<Option<DeviceRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT device_id, name, addresses, is_paused, is_trusted, introducer, cert_name, created_at
+             FROM devices WHERE device_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![device_id], |row| {
+            let addrs_raw: String = row.get(2)?;
+            let addresses: Vec<String> = serde_json::from_str(&addrs_raw).unwrap_or_default();
+            Ok(DeviceRecord {
+                device_id: row.get(0)?,
+                name: row.get(1)?,
+                addresses,
+                is_paused: row.get::<_, i64>(3)? != 0,
+                is_trusted: row.get::<_, i64>(4)? != 0,
+                introducer: row.get::<_, i64>(5)? != 0,
+                cert_name: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+
+        match rows.next() {
+            Some(res) => Ok(Some(res?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn remove_device(&self, device_id: &str) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM devices WHERE device_id = ?1", params![device_id])?;
+        conn.execute("DELETE FROM folder_devices WHERE device_id = ?1", params![device_id])?;
+        Ok(())
+    }
+
+    pub fn set_device_paused(&self, device_id: &str, paused: bool) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE devices SET is_paused = ?1 WHERE device_id = ?2",
+            params![if paused { 1 } else { 0 }, device_id],
+        )?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // PENDING PAIRING OPERATIONS
+    // =========================================================================
+
+    pub fn add_pending_device(&self, rec: &PendingDeviceRecord) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO pending_devices (device_id, name, address, received_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(device_id) DO UPDATE SET
+                name = excluded.name,
+                address = excluded.address,
+                received_at = excluded.received_at",
+            params![rec.device_id, rec.name, rec.address, rec.received_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_pending_devices(&self) -> SqlResult<Vec<PendingDeviceRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT device_id, name, address, received_at FROM pending_devices ORDER BY received_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PendingDeviceRecord {
+                device_id: row.get(0)?,
+                name: row.get(1)?,
+                address: row.get(2)?,
+                received_at: row.get(3)?,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for item in rows {
+            list.push(item?);
+        }
+        Ok(list)
+    }
+
+    pub fn accept_pending_device(&self, device_id: &str) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT device_id, name, address, received_at FROM pending_devices WHERE device_id = ?1",
+        )?;
+        let pending = stmt.query_row(params![device_id], |row| {
+            Ok(PendingDeviceRecord {
+                device_id: row.get(0)?,
+                name: row.get(1)?,
+                address: row.get(2)?,
+                received_at: row.get(3)?,
+            })
+        })?;
+
+        let addrs = vec![pending.address];
+        let addrs_json = serde_json::to_string(&addrs).unwrap_or_else(|_| "[]".to_string());
+
+        conn.execute(
+            "INSERT INTO devices (device_id, name, addresses, is_paused, is_trusted, introducer, cert_name, created_at)
+             VALUES (?1, ?2, ?3, 0, 1, 0, NULL, ?4)
+             ON CONFLICT(device_id) DO UPDATE SET name = excluded.name",
+            params![pending.device_id, pending.name, addrs_json, pending.received_at],
+        )?;
+
+        conn.execute("DELETE FROM pending_devices WHERE device_id = ?1", params![device_id])?;
+        Ok(())
+    }
+
+    pub fn reject_pending_device(&self, device_id: &str) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM pending_devices WHERE device_id = ?1", params![device_id])?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // FOLDER SHARING MATRIX OPERATIONS
+    // =========================================================================
+
+    pub fn share_folder_with_device(&self, folder_id: &str, device_id: &str) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO folder_devices (folder_id, device_id) VALUES (?1, ?2)",
+            params![folder_id, device_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn unshare_folder_from_device(&self, folder_id: &str, device_id: &str) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM folder_devices WHERE folder_id = ?1 AND device_id = ?2",
+            params![folder_id, device_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_folder_devices(&self, folder_id: &str) -> SqlResult<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT device_id FROM folder_devices WHERE folder_id = ?1")?;
+        let rows = stmt.query_map(params![folder_id], |row| row.get::<_, String>(0))?;
+        let mut list = Vec::new();
+        for item in rows {
+            list.push(item?);
+        }
+        Ok(list)
+    }
+
+    // =========================================================================
+    // PENDING FOLDER INVITATIONS
+    // =========================================================================
+
+    pub fn add_pending_folder(&self, rec: &PendingFolderRecord) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO pending_folders (folder_id, device_id, folder_label, offered_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(folder_id, device_id) DO UPDATE SET
+                folder_label = excluded.folder_label,
+                offered_at = excluded.offered_at",
+            params![rec.folder_id, rec.device_id, rec.folder_label, rec.offered_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_pending_folders(&self) -> SqlResult<Vec<PendingFolderRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT folder_id, device_id, folder_label, offered_at FROM pending_folders ORDER BY offered_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PendingFolderRecord {
+                folder_id: row.get(0)?,
+                device_id: row.get(1)?,
+                folder_label: row.get(2)?,
+                offered_at: row.get(3)?,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for item in rows {
+            list.push(item?);
+        }
+        Ok(list)
+    }
+
+    pub fn accept_pending_folder(&self, folder_id: &str, device_id: &str, local_path: &str) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        // Create folder locally if not exists
+        conn.execute(
+            "INSERT OR IGNORE INTO folders (folder_id, local_path, conflict_policy, is_paused)
+             VALUES (?1, ?2, 'THREE_WAY_AUTO', 0)",
+            params![folder_id, local_path],
+        )?;
+        // Add to sharing matrix
+        conn.execute(
+            "INSERT OR IGNORE INTO folder_devices (folder_id, device_id) VALUES (?1, ?2)",
+            params![folder_id, device_id],
+        )?;
+        // Remove from pending
+        conn.execute(
+            "DELETE FROM pending_folders WHERE folder_id = ?1 AND device_id = ?2",
+            params![folder_id, device_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn reject_pending_folder(&self, folder_id: &str, device_id: &str) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM pending_folders WHERE folder_id = ?1 AND device_id = ?2",
+            params![folder_id, device_id],
+        )?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // FOLDER IGNORES
+    // =========================================================================
+
+    pub fn get_folder_ignores(&self, folder_id: &str) -> SqlResult<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT pattern FROM folder_ignores WHERE folder_id = ?1")?;
+        let rows = stmt.query_map(params![folder_id], |row| row.get::<_, String>(0))?;
+        let mut list = Vec::new();
+        for item in rows {
+            list.push(item?);
+        }
+        Ok(list)
+    }
+
+    pub fn set_folder_ignores(&self, folder_id: &str, patterns: &[String]) -> SqlResult<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM folder_ignores WHERE folder_id = ?1", params![folder_id])?;
+        for pat in patterns {
+            let trimmed = pat.trim();
+            if !trimmed.is_empty() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO folder_ignores (folder_id, pattern) VALUES (?1, ?2)",
+                    params![folder_id, trimmed],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // METRICS & COMPLETION
+    // =========================================================================
+
+    pub fn get_folder_status(&self, folder_id: &str) -> SqlResult<FolderStatusMetrics> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM files WHERE folder_id = ?1 AND is_deleted = 0",
+        )?;
+        let (local_files, local_bytes): (i64, i64) = stmt.query_row(params![folder_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+
+        let is_paused: bool = conn
+            .query_row(
+                "SELECT is_paused FROM folders WHERE folder_id = ?1",
+                params![folder_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|val| val != 0)
+            .unwrap_or(false);
+
+        let state = if is_paused {
+            "paused".to_string()
+        } else {
+            "idle".to_string()
+        };
+
+        let u_local_files = local_files.max(0) as u64;
+        let u_local_bytes = local_bytes.max(0) as u64;
+
+        Ok(FolderStatusMetrics {
+            folder_id: folder_id.to_string(),
+            state,
+            global_files: u_local_files,
+            global_bytes: u_local_bytes,
+            local_files: u_local_files,
+            local_bytes: u_local_bytes,
+            need_files: 0,
+            need_bytes: 0,
+            in_sync_bytes: u_local_bytes,
+            completion_pct: 100.0,
+            sequence: u_local_files,
+        })
+    }
+
+    pub fn get_device_completion(&self, device_id: &str, folder_id: &str) -> SqlResult<DeviceCompletionMetrics> {
+        let status = self.get_folder_status(folder_id)?;
+        Ok(DeviceCompletionMetrics {
+            device_id: device_id.to_string(),
+            folder_id: folder_id.to_string(),
+            completion_pct: status.completion_pct,
+            global_bytes: status.global_bytes,
+            need_bytes: status.need_bytes,
+        })
     }
 
     // =========================================================================
@@ -618,16 +1200,33 @@ mod tests {
         let engine = StorageEngine::new(&temp_dir).unwrap();
 
         // 1. Add folder
-        let folder = FolderRecord {
-            folder_id: "test_vault".into(),
-            local_path: "/tmp/test".into(),
-            conflict_policy: "THREE_WAY_AUTO".into(),
-            is_paused: false,
-        };
+        let folder = FolderRecord::new("test_vault", "/tmp/test");
         engine.add_folder(&folder).unwrap();
         let folders = engine.list_folders().unwrap();
         assert_eq!(folders.len(), 1);
         assert_eq!(folders[0].folder_id, "test_vault");
+        assert_eq!(folders[0].sync_mode, "SendReceive");
+
+        // 1b. Test Device & Pairing CRUD
+        let dev = DeviceRecord {
+            device_id: "7777777-777777N-7777777-777777N".into(),
+            name: "Pixel 9 Pro".into(),
+            addresses: vec!["tcp://192.168.1.100:9190".into()],
+            is_paused: false,
+            is_trusted: true,
+            introducer: false,
+            cert_name: None,
+            created_at: 1000,
+        };
+        engine.add_device(&dev).unwrap();
+        let devs = engine.list_devices().unwrap();
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].name, "Pixel 9 Pro");
+
+        // Folder sharing matrix
+        engine.share_folder_with_device("test_vault", &dev.device_id).unwrap();
+        let shared_devs = engine.list_folder_devices("test_vault").unwrap();
+        assert_eq!(shared_devs, vec![dev.device_id.clone()]);
 
         // 2. Put chunk and check CAS
         let chunk_hash = "abc1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd";

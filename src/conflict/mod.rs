@@ -72,6 +72,43 @@ pub enum CoreEvent {
     PeerDisconnected {
         peer_id: String,
     },
+    #[serde(rename = "FOLDER_SCAN_PROGRESS")]
+    FolderScanProgress {
+        folder_id: String,
+        current_file: String,
+        scanned_files: usize,
+    },
+    #[serde(rename = "DOWNLOAD_PROGRESS")]
+    DownloadProgress {
+        folder_id: String,
+        relative_path: String,
+        bytes_transferred: u64,
+        total_bytes: u64,
+    },
+    #[serde(rename = "ITEM_STARTED")]
+    ItemStarted {
+        folder_id: String,
+        relative_path: String,
+        action: String,
+    },
+    #[serde(rename = "ITEM_FINISHED")]
+    ItemFinished {
+        folder_id: String,
+        relative_path: String,
+        action: String,
+        error: Option<String>,
+    },
+    #[serde(rename = "DEVICE_PAIRED")]
+    DevicePaired {
+        device_id: String,
+        name: String,
+    },
+    #[serde(rename = "REMOTE_INDEX_UPDATED")]
+    RemoteIndexUpdated {
+        device_id: String,
+        folder_id: String,
+        file_count: usize,
+    },
 }
 
 /// Action submitted by UI to resolve a quarantined conflict.

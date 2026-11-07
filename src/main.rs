@@ -159,12 +159,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
                 FolderCommands::Add { id, path, policy } => {
-                    let rec = synapse_core::storage::FolderRecord {
-                        folder_id: id.clone(),
-                        local_path: path.to_string_lossy().to_string(),
-                        conflict_policy: policy,
-                        is_paused: false,
-                    };
+                    let mut rec = synapse_core::storage::FolderRecord::new(id.clone(), path.to_string_lossy());
+                    rec.conflict_policy = policy;
                     storage.add_folder(&rec)?;
                     println!("Successfully registered folder '{}' at '{}'", id, rec.local_path);
                 }

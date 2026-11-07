@@ -7,6 +7,7 @@
 //! - Content-addressed block exchange and file revision replication
 
 pub mod identity;
+pub mod nat;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -25,7 +26,7 @@ use crate::conflict::CoreEvent;
 use crate::dag::RevisionNode;
 use crate::engine::SyncEngine;
 use crate::p2p::identity::NodeIdentity;
-use crate::storage::{FileRecord, RevisionRecord};
+use crate::storage::{FileRecord, PendingDeviceRecord, RevisionRecord};
 
 pub const DEFAULT_P2P_PORT: u16 = 9190;
 pub const DEFAULT_DISCOVERY_PORT: u16 = 21027;
@@ -132,7 +133,8 @@ impl P2PManager {
         let peers = self.peers.clone();
         let peer_count = self.peer_count.clone();
         let event_sender = self.event_sender.clone();
-        let storage = self.sync_engine.storage().clone();
+        let storage_listener = self.sync_engine.storage().clone();
+        let storage_announcer = self.sync_engine.storage().clone();
 
         // 1. Discovery listener task
         tokio::spawn(async move {
@@ -152,6 +154,27 @@ impl P2PManager {
                             let mut peer_addr = src_addr;
                             peer_addr.set_port(peer.p2p_port);
 
+                            // Check cluster pairing status in SQLite
+                            let is_paired = match storage_listener.get_device(&peer.device_id) {
+                                Ok(Some(dev)) => {
+                                    if dev.is_paused {
+                                        continue;
+                                    }
+                                    true
+                                }
+                                Ok(None) => {
+                                    // Unknown peer: record in pending pairing requests
+                                    let _ = storage_listener.add_pending_device(&PendingDeviceRecord {
+                                        device_id: peer.device_id.clone(),
+                                        name: peer.device_name.clone(),
+                                        address: peer_addr.to_string(),
+                                        received_at: chrono::Utc::now().timestamp_millis(),
+                                    });
+                                    false
+                                }
+                                Err(_) => false,
+                            };
+
                             let mut map = peers.lock().await;
                             let is_new = !map.contains_key(&peer.device_id);
                             map.insert(
@@ -165,9 +188,9 @@ impl P2PManager {
                             );
                             peer_count.store(map.len(), Ordering::Relaxed);
 
-                            if is_new {
+                            if is_new && is_paired {
                                 info!(
-                                    "Discovered peer {} ({}) at {}",
+                                    "Discovered paired peer {} ({}) at {}",
                                     peer.device_name, peer.device_id, peer_addr
                                 );
                                 let _ = event_sender.send(CoreEvent::PeerConnected {
@@ -197,7 +220,7 @@ impl P2PManager {
             let target_addr = SocketAddr::from(([255, 255, 255, 255], discovery_port));
 
             loop {
-                let folders = storage
+                let folders = storage_announcer
                     .list_folders()
                     .map(|list| list.into_iter().map(|f| f.folder_id).collect())
                     .unwrap_or_default();

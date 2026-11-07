@@ -85,12 +85,10 @@ async fn test_tier1_automated_3way_merge() {
     fs::create_dir_all(&folder_path).unwrap();
 
     let folder_id = "notes_vault";
-    harness.storage.add_folder(&FolderRecord {
-        folder_id: folder_id.into(),
-        local_path: folder_path.to_string_lossy().to_string(),
-        conflict_policy: "THREE_WAY_AUTO".into(),
-        is_paused: false,
-    }).unwrap();
+    harness.storage.add_folder(&FolderRecord::new(
+        folder_id,
+        folder_path.to_string_lossy(),
+    )).unwrap();
 
     // 1. Create Base File
     let file_rel = "doc.md";
@@ -159,12 +157,10 @@ async fn test_tier2_virtual_quarantine_zero_pollution() {
     fs::create_dir_all(&folder_path).unwrap();
 
     let folder_id = "vault";
-    harness.storage.add_folder(&FolderRecord {
-        folder_id: folder_id.into(),
-        local_path: folder_path.to_string_lossy().to_string(),
-        conflict_policy: "THREE_WAY_AUTO".into(),
-        is_paused: false,
-    }).unwrap();
+    harness.storage.add_folder(&FolderRecord::new(
+        folder_id,
+        folder_path.to_string_lossy(),
+    )).unwrap();
 
     // 1. Base File
     let file_rel = "todo.txt";
@@ -274,4 +270,136 @@ async fn test_tier2_virtual_quarantine_zero_pollution() {
     // Quarantine entry should be resolved and staging cleaned
     let pending_after = harness.storage.list_pending_conflicts().unwrap();
     assert_eq!(pending_after.len(), 0);
+}
+
+#[tokio::test]
+async fn test_cluster_pairing_and_syncthing_rest_api() {
+    let harness = TestHarness::new();
+    let router = ApiServer::create_router(harness.app_state.clone());
+
+    // 1. Stage a pending pairing request
+    let pending_dev = synapse_core::storage::PendingDeviceRecord {
+        device_id: "MF7F22G-ABCD123-WXYZ789-KLMN456".into(),
+        name: "MacBook Pro".into(),
+        address: "192.168.1.50:9190".into(),
+        received_at: 1000,
+    };
+    harness.storage.add_pending_device(&pending_dev).unwrap();
+
+    // 2. Query pending devices via both /api/v1 and Syncthing /rest alias
+    let req = Request::builder()
+        .uri("/api/v1/cluster/pending/devices")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let list: Vec<synapse_core::storage::PendingDeviceRecord> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].name, "MacBook Pro");
+
+    // Test Syncthing /rest alias
+    let req_rest = Request::builder()
+        .uri("/rest/cluster/pending/devices")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res_rest = router.clone().oneshot(req_rest).await.unwrap();
+    assert_eq!(res_rest.status(), StatusCode::OK);
+
+    // 3. Accept the pairing request
+    let accept_uri = format!("/api/v1/cluster/pending/devices/{}/accept", pending_dev.device_id);
+    let req_accept = Request::builder()
+        .uri(&accept_uri)
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    let res_accept = router.clone().oneshot(req_accept).await.unwrap();
+    assert_eq!(res_accept.status(), StatusCode::OK);
+
+    // 4. Verify device moved to paired devices
+    let req_devs = Request::builder()
+        .uri("/api/v1/devices")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res_devs = router.clone().oneshot(req_devs).await.unwrap();
+    assert_eq!(res_devs.status(), StatusCode::OK);
+    let body_devs = axum::body::to_bytes(res_devs.into_body(), usize::MAX).await.unwrap();
+    let devs: Vec<synapse_core::storage::DeviceRecord> = serde_json::from_slice(&body_devs).unwrap();
+    assert_eq!(devs.len(), 1);
+    assert_eq!(devs[0].device_id, pending_dev.device_id);
+
+    // 5. Verify real-time connections endpoint
+    let req_conn = Request::builder()
+        .uri("/rest/system/connections")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res_conn = router.clone().oneshot(req_conn).await.unwrap();
+    assert_eq!(res_conn.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_folder_controls_status_and_ignores() {
+    let harness = TestHarness::new();
+    let router = ApiServer::create_router(harness.app_state.clone());
+
+    let folder_path = harness.temp_dir.join("docs");
+    fs::create_dir_all(&folder_path).unwrap();
+
+    let folder_id = "docs";
+    let folder = FolderRecord::new(folder_id, folder_path.to_string_lossy());
+    harness.storage.add_folder(&folder).unwrap();
+
+    // 1. Query status via /api/v1/folders/:id/status
+    let status_uri = format!("/api/v1/folders/{}/status", folder_id);
+    let req = Request::builder()
+        .uri(&status_uri)
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let status: synapse_core::storage::FolderStatusMetrics = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status.folder_id, "docs");
+    assert_eq!(status.state, "idle");
+    assert_eq!(status.completion_pct, 100.0);
+
+    // 2. Query Syncthing alias /rest/db/status?folder=docs
+    let req_query = Request::builder()
+        .uri("/rest/db/status?folder=docs")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res_query = router.clone().oneshot(req_query).await.unwrap();
+    assert_eq!(res_query.status(), StatusCode::OK);
+
+    // 3. Set and get ignore patterns
+    let ignores_uri = format!("/api/v1/folders/{}/ignores", folder_id);
+    let ignores_payload = serde_json::to_string(&serde_json::json!({
+        "ignore": ["*.tmp", "node_modules/", "(?d).DS_Store"]
+    })).unwrap();
+
+    let req_ig_set = Request::builder()
+        .uri(&ignores_uri)
+        .method("POST")
+        .header("Content-Type", "application/json")
+        .body(Body::from(ignores_payload))
+        .unwrap();
+    let res_ig_set = router.clone().oneshot(req_ig_set).await.unwrap();
+    assert_eq!(res_ig_set.status(), StatusCode::OK);
+
+    let req_ig_get = Request::builder()
+        .uri(&ignores_uri)
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res_ig_get = router.clone().oneshot(req_ig_get).await.unwrap();
+    assert_eq!(res_ig_get.status(), StatusCode::OK);
+    let body_ig = axum::body::to_bytes(res_ig_get.into_body(), usize::MAX).await.unwrap();
+    let ig_json: serde_json::Value = serde_json::from_slice(&body_ig).unwrap();
+    assert_eq!(ig_json["ignore"].as_array().unwrap().len(), 3);
 }
