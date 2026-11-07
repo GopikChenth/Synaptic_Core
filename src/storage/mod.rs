@@ -14,11 +14,15 @@ use serde::{Deserialize, Serialize};
 /// Folder synchronization configuration and policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderRecord {
+    #[serde(alias = "id")]
     pub folder_id: String,
+    #[serde(alias = "path")]
     pub local_path: String,
+    #[serde(default = "default_policy")]
     pub conflict_policy: String, // THREE_WAY_AUTO, LWW, MANUAL
+    #[serde(default, alias = "paused")]
     pub is_paused: bool,
-    #[serde(default = "default_sync_mode")]
+    #[serde(default = "default_sync_mode", alias = "type")]
     pub sync_mode: String, // SendReceive, SendOnly, ReceiveOnly
     #[serde(default = "default_pull_order")]
     pub pull_order: String, // Alphabetical, SmallestFirst, LargestFirst, NewestFirst, OldestFirst
@@ -30,6 +34,7 @@ pub struct FolderRecord {
     pub marker_name: String, // .synapse-folder
 }
 
+fn default_policy() -> String { "THREE_WAY_AUTO".to_string() }
 fn default_sync_mode() -> String { "SendReceive".to_string() }
 fn default_pull_order() -> String { "Alphabetical".to_string() }
 fn default_versioning_type() -> String { "None".to_string() }
@@ -55,13 +60,19 @@ impl FolderRecord {
 /// Device record in cluster pairing database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceRecord {
+    #[serde(alias = "deviceID", alias = "id")]
     pub device_id: String, // Luhn-check formatted (XXXXXXX-XXXXXXX-...)
     pub name: String,
     pub addresses: Vec<String>,
+    #[serde(default, alias = "paused")]
     pub is_paused: bool,
+    #[serde(default)]
     pub is_trusted: bool,
+    #[serde(default)]
     pub introducer: bool,
+    #[serde(default)]
     pub cert_name: Option<String>,
+    #[serde(default)]
     pub created_at: i64,
 }
 
@@ -72,6 +83,27 @@ pub struct PendingDeviceRecord {
     pub name: String,
     pub address: String,
     pub received_at: i64,
+}
+
+/// Introduced device payload announced by an introducer peer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntroducedDevice {
+    pub device_id: String,
+    pub name: String,
+    pub addresses: Vec<String>,
+    pub is_trusted: bool,
+    #[serde(default)]
+    pub cert_name: Option<String>,
+}
+
+/// Propagation outcome summary when an introducer announces cluster devices.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct IntroducerPropagationResult {
+    pub introducer_id: String,
+    pub added_trusted: Vec<String>,
+    pub added_pending: Vec<String>,
+    pub updated: Vec<String>,
+    pub ignored: Vec<String>,
 }
 
 /// Pending incoming folder invitation from remote peer.
@@ -86,15 +118,24 @@ pub struct PendingFolderRecord {
 /// Folder sync metrics for UI status dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderStatusMetrics {
+    #[serde(alias = "folder", alias = "folderId")]
     pub folder_id: String,
     pub state: String, // "idle", "scanning", "syncing", "error"
+    #[serde(alias = "globalFiles")]
     pub global_files: u64,
+    #[serde(alias = "globalBytes")]
     pub global_bytes: u64,
+    #[serde(alias = "localFiles")]
     pub local_files: u64,
+    #[serde(alias = "localBytes")]
     pub local_bytes: u64,
+    #[serde(alias = "needFiles")]
     pub need_files: u64,
+    #[serde(alias = "needBytes")]
     pub need_bytes: u64,
+    #[serde(alias = "inSyncBytes")]
     pub in_sync_bytes: u64,
+    #[serde(alias = "completionPct", alias = "completion")]
     pub completion_pct: f64,
     pub sequence: u64,
 }
@@ -102,10 +143,15 @@ pub struct FolderStatusMetrics {
 /// Folder completion percentage per remote device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceCompletionMetrics {
+    #[serde(alias = "deviceId", alias = "device")]
     pub device_id: String,
+    #[serde(alias = "folderId", alias = "folder")]
     pub folder_id: String,
+    #[serde(alias = "completion")]
     pub completion_pct: f64,
+    #[serde(alias = "globalBytes")]
     pub global_bytes: u64,
+    #[serde(alias = "needBytes")]
     pub need_bytes: u64,
 }
 
@@ -587,6 +633,200 @@ impl StorageEngine {
         Ok(())
     }
 
+    pub fn is_device_introducer(&self, device_id: &str) -> SqlResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT introducer FROM devices WHERE device_id = ?1")?;
+        let mut rows = stmt.query_map(params![device_id], |row| row.get::<_, i64>(0))?;
+        if let Some(r) = rows.next() {
+            Ok(r? != 0)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn set_device_introducer(&self, device_id: &str, introducer: bool) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE devices SET introducer = ?1 WHERE device_id = ?2",
+            params![if introducer { 1 } else { 0 }, device_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_device_trusted(&self, device_id: &str) -> SqlResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT is_trusted FROM devices WHERE device_id = ?1")?;
+        let mut rows = stmt.query_map(params![device_id], |row| row.get::<_, i64>(0))?;
+        if let Some(r) = rows.next() {
+            Ok(r? != 0)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn set_device_trusted(&self, device_id: &str, is_trusted: bool) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE devices SET is_trusted = ?1 WHERE device_id = ?2",
+            params![if is_trusted { 1 } else { 0 }, device_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_introducer_devices(&self) -> SqlResult<Vec<DeviceRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT device_id, name, addresses, is_paused, is_trusted, introducer, cert_name, created_at FROM devices WHERE introducer != 0",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let addrs_raw: String = row.get(2)?;
+            let addresses: Vec<String> = serde_json::from_str(&addrs_raw).unwrap_or_default();
+            Ok(DeviceRecord {
+                device_id: row.get(0)?,
+                name: row.get(1)?,
+                addresses,
+                is_paused: row.get::<_, i64>(3)? != 0,
+                is_trusted: row.get::<_, i64>(4)? != 0,
+                introducer: row.get::<_, i64>(5)? != 0,
+                cert_name: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for item in rows {
+            list.push(item?);
+        }
+        Ok(list)
+    }
+
+    pub fn list_untrusted_devices(&self) -> SqlResult<Vec<DeviceRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT device_id, name, addresses, is_paused, is_trusted, introducer, cert_name, created_at FROM devices WHERE is_trusted = 0",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let addrs_raw: String = row.get(2)?;
+            let addresses: Vec<String> = serde_json::from_str(&addrs_raw).unwrap_or_default();
+            Ok(DeviceRecord {
+                device_id: row.get(0)?,
+                name: row.get(1)?,
+                addresses,
+                is_paused: row.get::<_, i64>(3)? != 0,
+                is_trusted: row.get::<_, i64>(4)? != 0,
+                introducer: row.get::<_, i64>(5)? != 0,
+                cert_name: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for item in rows {
+            list.push(item?);
+        }
+        Ok(list)
+    }
+
+    /// Propagates cluster devices announced by an introducer peer.
+    ///
+    /// When `introducer_id` is marked as an introducer (`introducer = 1`):
+    /// - If `auto_trust` is true: automatically adds new devices to trusted `devices` table.
+    /// - If `auto_trust` is false: adds new devices to `pending_devices` table for user pairing review.
+    /// - If device already exists in `devices`: merges addresses.
+    /// - If `introducer_id` is NOT marked with `introducer = 1`: ignores announcement (preventing spoofing).
+    pub fn propagate_introducer_devices(
+        &self,
+        introducer_id: &str,
+        announced_devices: &[IntroducedDevice],
+        auto_trust: bool,
+    ) -> SqlResult<IntroducerPropagationResult> {
+        let mut result = IntroducerPropagationResult {
+            introducer_id: introducer_id.to_string(),
+            added_trusted: Vec::new(),
+            added_pending: Vec::new(),
+            updated: Vec::new(),
+            ignored: Vec::new(),
+        };
+
+        // Security check: Only verified introducers may announce cluster devices
+        if !self.is_device_introducer(introducer_id)? {
+            tracing::warn!("Ignored cluster device announcement from non-introducer peer {}", introducer_id);
+            return Ok(result);
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+
+        for dev in announced_devices {
+            // Cannot introduce itself
+            if dev.device_id == introducer_id {
+                result.ignored.push(dev.device_id.clone());
+                continue;
+            }
+
+            // Check if device already paired in devices table
+            if let Some(existing) = self.get_device(&dev.device_id)? {
+                let mut updated_addrs = existing.addresses;
+                let mut changed = false;
+                for a in &dev.addresses {
+                    if !updated_addrs.contains(a) {
+                        updated_addrs.push(a.clone());
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let conn = self.conn.lock().unwrap();
+                    let addrs_json = serde_json::to_string(&updated_addrs).unwrap_or_else(|_| "[]".to_string());
+                    conn.execute(
+                        "UPDATE devices SET addresses = ?1 WHERE device_id = ?2",
+                        params![addrs_json, dev.device_id],
+                    )?;
+                }
+                result.updated.push(dev.device_id.clone());
+                continue;
+            }
+
+            // Check if already in pending_devices
+            let in_pending = {
+                let conn = self.conn.lock().unwrap();
+                let mut stmt = conn.prepare("SELECT 1 FROM pending_devices WHERE device_id = ?1")?;
+                stmt.exists(params![dev.device_id])?
+            };
+
+            if auto_trust {
+                if in_pending {
+                    self.accept_pending_device(&dev.device_id)?;
+                } else {
+                    let record = DeviceRecord {
+                        device_id: dev.device_id.clone(),
+                        name: dev.name.clone(),
+                        addresses: dev.addresses.clone(),
+                        is_paused: false,
+                        is_trusted: dev.is_trusted,
+                        introducer: false,
+                        cert_name: dev.cert_name.clone(),
+                        created_at: now,
+                    };
+                    self.add_device(&record)?;
+                }
+                result.added_trusted.push(dev.device_id.clone());
+            } else if !in_pending {
+                let address = dev.addresses.first().cloned().unwrap_or_else(|| "dynamic".into());
+                let pending = PendingDeviceRecord {
+                    device_id: dev.device_id.clone(),
+                    name: dev.name.clone(),
+                    address,
+                    received_at: now,
+                };
+                self.add_pending_device(&pending)?;
+                result.added_pending.push(dev.device_id.clone());
+            } else {
+                result.ignored.push(dev.device_id.clone());
+            }
+        }
+
+        Ok(result)
+    }
+
     // =========================================================================
     // PENDING PAIRING OPERATIONS
     // =========================================================================
@@ -1039,6 +1279,24 @@ impl StorageEngine {
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
         Ok(Some(buf))
+    }
+
+    /// Stores an encrypted chunk envelope in the CAS store for untrusted nodes.
+    pub fn put_encrypted_chunk(&self, envelope: &crate::p2p::crypto::EncryptedChunkEnvelope) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let payload = envelope.to_bytes()?;
+        self.put_chunk(&envelope.chunk_hash, &payload)?;
+        Ok(())
+    }
+
+    /// Reads an encrypted chunk envelope from the CAS store.
+    pub fn get_encrypted_chunk(&self, chunk_hash: &str) -> Result<Option<crate::p2p::crypto::EncryptedChunkEnvelope>, Box<dyn std::error::Error + Send + Sync>> {
+        match self.get_chunk(chunk_hash)? {
+            Some(data) => {
+                let envelope = crate::p2p::crypto::EncryptedChunkEnvelope::from_bytes(&data)?;
+                Ok(Some(envelope))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Checks if a chunk is locally available in CAS.

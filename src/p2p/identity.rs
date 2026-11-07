@@ -8,8 +8,11 @@ use std::path::Path;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 
+pub use super::crypto::{CryptoError, EncryptedChunkEnvelope, EncryptionAlgorithm};
+
 pub const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
+#[derive(Clone)]
 pub struct NodeIdentity {
     pub signing_key: SigningKey,
     pub verifying_key: VerifyingKey,

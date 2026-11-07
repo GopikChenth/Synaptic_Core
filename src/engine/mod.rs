@@ -5,6 +5,7 @@
 
 pub mod fs_utils;
 pub mod ignore;
+pub mod versioning;
 
 use std::fs;
 use std::path::{Path, PathBuf};

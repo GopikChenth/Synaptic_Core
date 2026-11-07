@@ -1811,6 +1811,7 @@ dependencies = [
  "quinn",
  "rand 0.8.8",
  "rcgen",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",

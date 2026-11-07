@@ -6,8 +6,16 @@
 //! - High-performance QUIC multiplexed streams via Quinn
 //! - Content-addressed block exchange and file revision replication
 
+pub mod crypto;
 pub mod identity;
 pub mod nat;
+pub mod relay;
+pub mod swarm;
+pub mod throttle;
+
+pub use crypto::{CryptoError, EncryptedChunkEnvelope, EncryptionAlgorithm};
+pub use swarm::{ChunkAssignment, FilePullItem, PullOrder, SchedulingStrategy, SwarmScheduler};
+pub use throttle::{BandwidthLimiter, RateLimiter};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -26,7 +34,9 @@ use crate::conflict::CoreEvent;
 use crate::dag::RevisionNode;
 use crate::engine::SyncEngine;
 use crate::p2p::identity::NodeIdentity;
-use crate::storage::{FileRecord, PendingDeviceRecord, RevisionRecord};
+use crate::storage::{
+    FileRecord, IntroducedDevice, IntroducerPropagationResult, PendingDeviceRecord, RevisionRecord,
+};
 
 pub const DEFAULT_P2P_PORT: u16 = 9190;
 pub const DEFAULT_DISCOVERY_PORT: u16 = 21027;
@@ -38,6 +48,8 @@ pub enum P2PMessage {
         device_id: String,
         device_name: String,
         folders: Vec<String>,
+        #[serde(default)]
+        cluster_devices: Vec<IntroducedDevice>,
     },
     IndexRequest {
         folder_id: String,
@@ -60,6 +72,22 @@ pub enum P2PMessage {
         revision: RevisionNode,
         chunk_hashes: Vec<String>,
     },
+    /// Cluster device announcement sent by an introducer node
+    ClusterDevicesAnnouncement {
+        introducer_id: String,
+        devices: Vec<IntroducedDevice>,
+        #[serde(default)]
+        auto_trust: bool,
+    },
+    /// Request an encrypted chunk envelope from an untrusted storage node
+    EncryptedChunkRequest {
+        chunk_hash: String,
+    },
+    /// Encrypted chunk envelope exchanged with an untrusted storage node
+    EncryptedChunkResponse {
+        chunk_hash: String,
+        envelope: EncryptedChunkEnvelope,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +96,8 @@ pub struct DiscoveredPeer {
     pub device_name: String,
     pub p2p_port: u16,
     pub folders: Vec<String>,
+    #[serde(default)]
+    pub introduced_devices: Vec<IntroducedDevice>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +108,7 @@ pub struct PeerInfo {
     pub last_seen: std::time::Instant,
 }
 
+#[derive(Clone)]
 pub struct P2PManager {
     identity: NodeIdentity,
     device_name: String,
@@ -188,6 +219,30 @@ impl P2PManager {
                             );
                             peer_count.store(map.len(), Ordering::Relaxed);
 
+                            // Introducer propagation via UDP broadcast discovery:
+                            // If discovered peer is marked as an introducer (introducer = 1) in SQLite
+                            // and announced introduced cluster peers, automatically propagate them
+                            if storage_listener.is_device_introducer(&peer.device_id).unwrap_or(false)
+                                && !peer.introduced_devices.is_empty()
+                            {
+                                let report = storage_listener.propagate_introducer_devices(
+                                    &peer.device_id,
+                                    &peer.introduced_devices,
+                                    false,
+                                );
+                                if let Ok(r) = report {
+                                    if !r.added_pending.is_empty() || !r.added_trusted.is_empty() {
+                                        info!(
+                                            "Introducer {} announced {} new devices via discovery ({} pending, {} trusted)",
+                                            peer.device_id,
+                                            r.added_pending.len() + r.added_trusted.len(),
+                                            r.added_pending.len(),
+                                            r.added_trusted.len(),
+                                        );
+                                    }
+                                }
+                            }
+
                             if is_new && is_paired {
                                 info!(
                                     "Discovered paired peer {} ({}) at {}",
@@ -225,11 +280,26 @@ impl P2PManager {
                     .map(|list| list.into_iter().map(|f| f.folder_id).collect())
                     .unwrap_or_default();
 
+                let introduced_devices = if storage_announcer.is_device_introducer(&dev_id).unwrap_or(false) {
+                    storage_announcer.list_devices()
+                        .map(|list| list.into_iter().map(|d| IntroducedDevice {
+                            device_id: d.device_id,
+                            name: d.name,
+                            addresses: d.addresses,
+                            is_trusted: d.is_trusted,
+                            cert_name: d.cert_name,
+                        }).collect())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
                 let announcement = DiscoveredPeer {
                     device_id: dev_id.clone(),
                     device_name: dev_name.clone(),
                     p2p_port,
                     folders,
+                    introduced_devices,
                 };
 
                 if let Ok(payload) = serde_json::to_vec(&announcement) {
@@ -239,6 +309,102 @@ impl P2PManager {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
+    }
+
+    /// Processes introduced device announcements from a peer.
+    /// If the peer is marked as an introducer in SQLite (introducer = 1),
+    /// the announced devices are automatically propagated to pending or trusted devices.
+    pub fn handle_cluster_announcement(
+        &self,
+        introducer_id: &str,
+        devices: &[IntroducedDevice],
+        auto_trust: bool,
+    ) -> Result<IntroducerPropagationResult, Box<dyn std::error::Error + Send + Sync>> {
+        let storage = self.sync_engine.storage();
+        let report = storage.propagate_introducer_devices(introducer_id, devices, auto_trust)?;
+
+        for trusted_id in &report.added_trusted {
+            if let Ok(Some(dev)) = storage.get_device(trusted_id) {
+                let _ = self.event_sender.send(CoreEvent::DevicePaired {
+                    device_id: dev.device_id,
+                    name: dev.name,
+                });
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Handles incoming P2P messages over QUIC or tests.
+    pub async fn handle_p2p_message(
+        &self,
+        msg: P2PMessage,
+        peer_addr: Option<SocketAddr>,
+    ) -> Result<Option<P2PMessage>, Box<dyn std::error::Error + Send + Sync>> {
+        match msg {
+            P2PMessage::ClusterDevicesAnnouncement {
+                introducer_id,
+                devices,
+                auto_trust,
+            } => {
+                let report = self.handle_cluster_announcement(&introducer_id, &devices, auto_trust)?;
+                info!(
+                    "Introducer {} announced {} cluster devices: added {} trusted, {} pending",
+                    introducer_id,
+                    devices.len(),
+                    report.added_trusted.len(),
+                    report.added_pending.len(),
+                );
+                Ok(None)
+            }
+            P2PMessage::Hello {
+                device_id,
+                device_name,
+                folders: _,
+                cluster_devices,
+            } => {
+                if !cluster_devices.is_empty() {
+                    let _ = self.handle_cluster_announcement(&device_id, &cluster_devices, false);
+                }
+                if let Some(addr) = peer_addr {
+                    let mut map = self.peers.lock().await;
+                    map.insert(
+                        device_id.clone(),
+                        PeerInfo {
+                            device_id,
+                            device_name,
+                            addr,
+                            last_seen: std::time::Instant::now(),
+                        },
+                    );
+                    self.peer_count.store(map.len(), Ordering::Relaxed);
+                }
+                Ok(None)
+            }
+            P2PMessage::ChunkRequest { chunk_hash } => {
+                if let Some(data) = self.sync_engine.storage().get_chunk(&chunk_hash)? {
+                    Ok(Some(P2PMessage::ChunkResponse { chunk_hash, data }))
+                } else {
+                    Ok(None)
+                }
+            }
+            P2PMessage::ChunkResponse { chunk_hash, data } => {
+                self.sync_engine.storage().put_chunk(&chunk_hash, &data)?;
+                Ok(None)
+            }
+            P2PMessage::EncryptedChunkRequest { chunk_hash } => {
+                if let Some(envelope) = self.sync_engine.storage().get_encrypted_chunk(&chunk_hash)? {
+                    Ok(Some(P2PMessage::EncryptedChunkResponse { chunk_hash, envelope }))
+                } else {
+                    Ok(None)
+                }
+            }
+            P2PMessage::EncryptedChunkResponse { chunk_hash: _, envelope } => {
+                self.sync_engine.storage().put_encrypted_chunk(&envelope)?;
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Configures Quinn QUIC server endpoint with self-signed certificate.
@@ -272,13 +438,13 @@ impl P2PManager {
         };
 
         info!("Synapse Core QUIC P2P listening on {}", bind_addr);
-        let engine = self.sync_engine.clone();
+        let manager = Arc::new(self.clone());
 
         while let Some(conn) = endpoint.accept().await {
-            let engine = engine.clone();
+            let manager = manager.clone();
             tokio::spawn(async move {
                 if let Ok(connection) = conn.await {
-                    let _ = handle_quic_connection(connection, engine).await;
+                    let _ = handle_quic_connection(connection, manager).await;
                 }
             });
         }
@@ -290,15 +456,21 @@ impl P2PManager {
 /// Handles incoming streams on an active QUIC connection.
 async fn handle_quic_connection(
     conn: quinn::Connection,
-    engine: SyncEngine,
+    manager: Arc<P2PManager>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    while let Ok((send, mut recv)) = conn.accept_bi().await {
-        let engine = engine.clone();
+    let remote_addr = conn.remote_address();
+    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+        let p2p = manager.clone();
         tokio::spawn(async move {
             if let Ok(buf) = recv.read_to_end(16 * 1024 * 1024).await {
-                let _ = buf;
-                let _ = engine;
-                let _ = send;
+                if let Ok(msg) = serde_json::from_slice::<P2PMessage>(&buf) {
+                    if let Ok(Some(reply)) = p2p.handle_p2p_message(msg, Some(remote_addr)).await {
+                        if let Ok(reply_bytes) = serde_json::to_vec(&reply) {
+                            let _ = send.write_all(&reply_bytes).await;
+                            let _ = send.finish();
+                        }
+                    }
+                }
             }
         });
     }

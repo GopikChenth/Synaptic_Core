@@ -143,6 +143,14 @@ impl ApiServer {
             // System
             .route("/api/v1/system/status", get(get_system_status))
             .route("/rest/system/status", get(get_system_status))
+            .route("/api/v1/system/version", get(get_system_version))
+            .route("/rest/system/version", get(get_system_version))
+            .route("/api/v1/system/ping", get(get_system_ping))
+            .route("/rest/system/ping", get(get_system_ping))
+            .route("/api/v1/system/shutdown", post(system_shutdown))
+            .route("/rest/system/shutdown", post(system_shutdown))
+            .route("/api/v1/system/restart", post(system_restart))
+            .route("/rest/system/restart", post(system_restart))
             .route("/api/v1/connections", get(get_connections))
             .route("/rest/system/connections", get(get_connections))
 
@@ -233,6 +241,37 @@ async fn get_system_status(State(state): State<AppState>) -> impl IntoResponse {
         pending_conflicts_count: conflicts.len(),
         memory_footprint_bytes: mem,
     })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SystemVersionResponse {
+    pub version: String,
+    pub codename: String,
+    pub os: String,
+    pub arch: String,
+}
+
+async fn get_system_version() -> impl IntoResponse {
+    Json(SystemVersionResponse {
+        version: "v1.0.0".into(),
+        codename: "Synapse-SynapticCore".into(),
+        os: std::env::consts::OS.into(),
+        arch: std::env::consts::ARCH.into(),
+    })
+}
+
+async fn get_system_ping() -> impl IntoResponse {
+    Json(serde_json::json!({ "ping": "pong" }))
+}
+
+async fn system_shutdown() -> impl IntoResponse {
+    info!("System shutdown requested via API");
+    StatusCode::OK.into_response()
+}
+
+async fn system_restart() -> impl IntoResponse {
+    info!("System restart requested via API");
+    StatusCode::OK.into_response()
 }
 
 async fn get_connections(State(state): State<AppState>) -> impl IntoResponse {

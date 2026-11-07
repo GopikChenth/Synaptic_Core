@@ -403,3 +403,51 @@ async fn test_folder_controls_status_and_ignores() {
     let ig_json: serde_json::Value = serde_json::from_slice(&body_ig).unwrap();
     assert_eq!(ig_json["ignore"].as_array().unwrap().len(), 3);
 }
+
+#[tokio::test]
+async fn test_syncthing_system_endpoints() {
+    let harness = TestHarness::new();
+    let router = ApiServer::create_router(harness.app_state.clone());
+
+    // 1. /rest/system/version
+    let req_ver = Request::builder()
+        .uri("/rest/system/version")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res_ver = router.clone().oneshot(req_ver).await.unwrap();
+    assert_eq!(res_ver.status(), StatusCode::OK);
+    let body_ver = axum::body::to_bytes(res_ver.into_body(), usize::MAX).await.unwrap();
+    let ver: serde_json::Value = serde_json::from_slice(&body_ver).unwrap();
+    assert_eq!(ver["version"], "v1.0.0");
+    assert_eq!(ver["codename"], "Synapse-SynapticCore");
+
+    // 2. /rest/system/ping
+    let req_ping = Request::builder()
+        .uri("/rest/system/ping")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res_ping = router.clone().oneshot(req_ping).await.unwrap();
+    assert_eq!(res_ping.status(), StatusCode::OK);
+    let body_ping = axum::body::to_bytes(res_ping.into_body(), usize::MAX).await.unwrap();
+    let ping: serde_json::Value = serde_json::from_slice(&body_ping).unwrap();
+    assert_eq!(ping["ping"], "pong");
+
+    // 3. /rest/system/shutdown & restart
+    let req_sd = Request::builder()
+        .uri("/rest/system/shutdown")
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    let res_sd = router.clone().oneshot(req_sd).await.unwrap();
+    assert_eq!(res_sd.status(), StatusCode::OK);
+
+    let req_rs = Request::builder()
+        .uri("/rest/system/restart")
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    let res_rs = router.clone().oneshot(req_rs).await.unwrap();
+    assert_eq!(res_rs.status(), StatusCode::OK);
+}
