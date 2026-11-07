@@ -648,7 +648,7 @@ async fn list_pending_folders(State(state): State<AppState>) -> impl IntoRespons
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcceptFolderPayload {
     pub device_id: String,
     pub local_path: String,
@@ -665,7 +665,7 @@ async fn accept_pending_folder(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RejectFolderPayload {
     pub device_id: String,
 }

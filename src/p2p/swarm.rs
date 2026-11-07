@@ -946,4 +946,362 @@ mod tests {
         assert_eq!(scheduler.file_progress("f", "doc.pdf"), Some((3, 3)));
         assert!(scheduler.is_finished());
     }
+
+    #[test]
+    fn test_rarest_first_complex_mesh_parallel_distribution() {
+        let mut scheduler = SwarmScheduler::new(PullOrder::Alphabetical);
+        scheduler.set_max_in_flight_per_peer(2);
+
+        // 5 peers:
+        // node_1: c_rare1, c_rare2, c_med1, c_med2, c_com
+        // node_2: c_med1, c_med2, c_med3, c_com
+        // node_3: c_med3, c_com
+        // node_4: c_med3, c_com
+        // node_5: c_com
+        //
+        // Rarities:
+        // c_rare1, c_rare2: 1 peer (node_1)
+        // c_med1, c_med2: 2 peers (node_1, node_2)
+        // c_med3: 3 peers (node_2, node_3, node_4)
+        // c_com: 5 peers (all)
+        scheduler.register_peer("node_1", vec!["c_rare1", "c_rare2", "c_med1", "c_med2", "c_com"]);
+        scheduler.register_peer("node_2", vec!["c_med1", "c_med2", "c_med3", "c_com"]);
+        scheduler.register_peer("node_3", vec!["c_med3", "c_com"]);
+        scheduler.register_peer("node_4", vec!["c_med3", "c_com"]);
+        scheduler.register_peer("node_5", vec!["c_com"]);
+
+        assert_eq!(scheduler.rarity_of("c_rare1"), 1);
+        assert_eq!(scheduler.rarity_of("c_rare2"), 1);
+        assert_eq!(scheduler.rarity_of("c_med1"), 2);
+        assert_eq!(scheduler.rarity_of("c_med2"), 2);
+        assert_eq!(scheduler.rarity_of("c_med3"), 3);
+        assert_eq!(scheduler.rarity_of("c_com"), 5);
+
+        scheduler.queue_chunks(vec!["c_com", "c_med3", "c_med2", "c_med1", "c_rare2", "c_rare1"]);
+
+        // First two scheduled must be rarity 1 (c_rare1 and c_rare2), assigned to node_1
+        let a1 = scheduler.schedule_next().unwrap();
+        let a2 = scheduler.schedule_next().unwrap();
+        assert!(a1.chunk_hash == "c_rare1" || a1.chunk_hash == "c_rare2");
+        assert!(a2.chunk_hash == "c_rare1" || a2.chunk_hash == "c_rare2");
+        assert_ne!(a1.chunk_hash, a2.chunk_hash);
+        assert_eq!(a1.peer_id, "node_1");
+        assert_eq!(a2.peer_id, "node_1");
+
+        // node_1 is now full (in-flight = 2).
+        assert_eq!(scheduler.peer_in_flight("node_1"), 2);
+
+        // Next two chunks must be rarity 2 (c_med1 and c_med2).
+        // Since node_1 is saturated, they must be assigned to node_2!
+        let a3 = scheduler.schedule_next().unwrap();
+        let a4 = scheduler.schedule_next().unwrap();
+        assert!(a3.chunk_hash == "c_med1" || a3.chunk_hash == "c_med2");
+        assert!(a4.chunk_hash == "c_med1" || a4.chunk_hash == "c_med2");
+        assert_ne!(a3.chunk_hash, a4.chunk_hash);
+        assert_eq!(a3.peer_id, "node_2");
+        assert_eq!(a4.peer_id, "node_2");
+
+        // node_2 is now full (in-flight = 2).
+        assert_eq!(scheduler.peer_in_flight("node_2"), 2);
+
+        // Next chunk is rarity 3 (c_med3).
+        // Held by node_2, node_3, node_4. Since node_2 is saturated, must go to node_3 or node_4.
+        let a5 = scheduler.schedule_next().unwrap();
+        assert_eq!(a5.chunk_hash, "c_med3");
+        assert!(a5.peer_id == "node_3" || a5.peer_id == "node_4");
+
+        // Last chunk is rarity 5 (c_com).
+        // Goes to one of the remaining eligible peers with lowest load.
+        let a6 = scheduler.schedule_next().unwrap();
+        assert_eq!(a6.chunk_hash, "c_com");
+
+        // All 6 chunks are in flight, 0 pending
+        assert_eq!(scheduler.in_flight_count(), 6);
+        assert_eq!(scheduler.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_dynamic_peer_inventory_update_modifies_rarity() {
+        let mut scheduler = SwarmScheduler::new(PullOrder::Alphabetical);
+        scheduler.register_peer("peer_1", vec!["chunk_a", "chunk_b"]);
+        scheduler.register_peer("peer_2", vec!["chunk_a"]);
+
+        scheduler.queue_chunk("chunk_a");
+        scheduler.queue_chunk("chunk_b");
+
+        // chunk_b: rarity 1, chunk_a: rarity 2
+        assert_eq!(scheduler.rarity_of("chunk_b"), 1);
+        assert_eq!(scheduler.rarity_of("chunk_a"), 2);
+
+        // peer_3 connects and announces chunk_b
+        scheduler.register_peer("peer_3", vec!["chunk_b"]);
+        assert_eq!(scheduler.rarity_of("chunk_b"), 2);
+
+        // peer_2 downloads/discovers chunk_b dynamically
+        scheduler.add_peer_chunk("peer_2", "chunk_b");
+        assert_eq!(scheduler.rarity_of("chunk_b"), 3);
+
+        // Now chunk_a is rarer than chunk_b (2 vs 3)!
+        let a1 = scheduler.schedule_next().unwrap();
+        assert_eq!(a1.chunk_hash, "chunk_a");
+
+        let a2 = scheduler.schedule_next().unwrap();
+        assert_eq!(a2.chunk_hash, "chunk_b");
+    }
+
+    #[test]
+    fn test_max_total_in_flight_concurrency_ceiling() {
+        let mut scheduler = SwarmScheduler::new(PullOrder::Alphabetical);
+        scheduler.set_max_total_in_flight(3);
+        scheduler.set_max_in_flight_per_peer(4);
+
+        let chunks = vec!["c1", "c2", "c3", "c4", "c5", "c6"];
+        scheduler.register_peer("peer_1", chunks.clone());
+        scheduler.queue_chunks(chunks);
+
+        // Request batch of 6, but max_total_in_flight = 3
+        let batch = scheduler.schedule_batch(6);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(scheduler.in_flight_count(), 3);
+        assert_eq!(scheduler.pending_count(), 3);
+
+        // No more can be scheduled right now
+        assert!(scheduler.schedule_next().is_none());
+
+        // Complete 1 chunk
+        scheduler.mark_completed(&batch[0].chunk_hash);
+        assert_eq!(scheduler.in_flight_count(), 2);
+
+        // Now exactly 1 can be scheduled
+        let _next_a = scheduler.schedule_next().unwrap();
+        assert_eq!(scheduler.in_flight_count(), 3);
+        assert_eq!(scheduler.pending_count(), 2);
+    }
+
+    #[test]
+    fn test_all_five_pull_ordering_policies_in_scheduler() {
+        let make_scheduler = |order: PullOrder| {
+            let mut s = SwarmScheduler::with_strategy(order, SchedulingStrategy::FilePriorityRarest);
+            s.register_peer("seed", vec!["c_a", "c_b", "c_c", "c_d", "c_e"]);
+
+            // File items:
+            // a: size 50_000, mtime 100 -> c_a
+            // b: size 10_000, mtime 500 -> c_b
+            // c: size 30_000, mtime 300 -> c_c
+            // d: size 20_000, mtime 200 -> c_d
+            // e: size 40_000, mtime 400 -> c_e
+            s.queue_file("f", "a.bin", 50_000, 100, vec!["c_a".into()]);
+            s.queue_file("f", "b.bin", 10_000, 500, vec!["c_b".into()]);
+            s.queue_file("f", "c.bin", 30_000, 300, vec!["c_c".into()]);
+            s.queue_file("f", "d.bin", 20_000, 200, vec!["c_d".into()]);
+            s.queue_file("f", "e.bin", 40_000, 400, vec!["c_e".into()]);
+            s
+        };
+
+        // 1. Alphabetical: a -> b -> c -> d -> e
+        let mut s = make_scheduler(PullOrder::Alphabetical);
+        let order: Vec<String> = s.schedule_batch(5).into_iter().map(|a| a.chunk_hash).collect();
+        assert_eq!(order, vec!["c_a", "c_b", "c_c", "c_d", "c_e"]);
+
+        // 2. SmallestFirst: b (10k) -> d (20k) -> c (30k) -> e (40k) -> a (50k)
+        let mut s = make_scheduler(PullOrder::SmallestFirst);
+        let order: Vec<String> = s.schedule_batch(5).into_iter().map(|a| a.chunk_hash).collect();
+        assert_eq!(order, vec!["c_b", "c_d", "c_c", "c_e", "c_a"]);
+
+        // 3. LargestFirst: a (50k) -> e (40k) -> c (30k) -> d (20k) -> b (10k)
+        let mut s = make_scheduler(PullOrder::LargestFirst);
+        let order: Vec<String> = s.schedule_batch(5).into_iter().map(|a| a.chunk_hash).collect();
+        assert_eq!(order, vec!["c_a", "c_e", "c_c", "c_d", "c_b"]);
+
+        // 4. NewestFirst: b (500) -> e (400) -> c (300) -> d (200) -> a (100)
+        let mut s = make_scheduler(PullOrder::NewestFirst);
+        let order: Vec<String> = s.schedule_batch(5).into_iter().map(|a| a.chunk_hash).collect();
+        assert_eq!(order, vec!["c_b", "c_e", "c_c", "c_d", "c_a"]);
+
+        // 5. OldestFirst: a (100) -> d (200) -> c (300) -> e (400) -> b (500)
+        let mut s = make_scheduler(PullOrder::OldestFirst);
+        let order: Vec<String> = s.schedule_batch(5).into_iter().map(|a| a.chunk_hash).collect();
+        assert_eq!(order, vec!["c_a", "c_d", "c_c", "c_e", "c_b"]);
+    }
+
+    #[test]
+    fn test_dynamic_pull_order_reconfiguration() {
+        let mut scheduler = SwarmScheduler::with_strategy(
+            PullOrder::Alphabetical,
+            SchedulingStrategy::FilePriorityRarest,
+        );
+        scheduler.register_peer("peer_1", vec!["c_alpha", "c_middle", "c_zeta"]);
+
+        scheduler.queue_file("f", "alpha.txt", 10_000, 100, vec!["c_alpha".into()]);
+        scheduler.queue_file("f", "middle.txt", 50_000, 200, vec!["c_middle".into()]);
+        scheduler.queue_file("f", "zeta.txt", 5_000, 300, vec!["c_zeta".into()]);
+
+        // Schedule first item under Alphabetical -> alpha.txt
+        let a1 = scheduler.schedule_next().unwrap();
+        assert_eq!(a1.chunk_hash, "c_alpha");
+
+        // Reconfigure to LargestFirst dynamically
+        scheduler.set_pull_order(PullOrder::LargestFirst);
+        assert_eq!(scheduler.pull_order(), PullOrder::LargestFirst);
+
+        // Next item must be middle.txt (size 50_000 > zeta.txt size 5_000)
+        let a2 = scheduler.schedule_next().unwrap();
+        assert_eq!(a2.chunk_hash, "c_middle");
+
+        let a3 = scheduler.schedule_next().unwrap();
+        assert_eq!(a3.chunk_hash, "c_zeta");
+    }
+
+    #[test]
+    fn test_multi_peer_disconnect_reconnect_lifecycle() {
+        let mut scheduler = SwarmScheduler::new(PullOrder::Alphabetical);
+        scheduler.register_peer("peer_1", vec!["c1", "c2"]);
+        scheduler.register_peer("peer_2", vec!["c3", "c4"]);
+        scheduler.register_peer("peer_3", vec!["c1", "c2", "c3", "c4"]);
+
+        scheduler.queue_chunks(vec!["c1", "c2", "c3", "c4"]);
+
+        // Schedule 4 requests across peers
+        let b = scheduler.schedule_batch(4);
+        assert_eq!(b.len(), 4);
+        assert_eq!(scheduler.in_flight_count(), 4);
+        assert_eq!(scheduler.pending_count(), 0);
+
+        // Disconnect peer_1 and peer_2
+        scheduler.mark_peer_disconnected("peer_1");
+        scheduler.mark_peer_disconnected("peer_2");
+
+        assert_eq!(scheduler.connected_peers(), vec!["peer_3"]);
+
+        // The chunks assigned to peer_1 and peer_2 must be back in pending
+        assert!(scheduler.pending_count() >= 2);
+
+        // Peer 3 can now pick up the orphaned chunks
+        let reassigned = scheduler.schedule_next();
+        assert!(reassigned.is_some());
+        assert_eq!(reassigned.unwrap().peer_id, "peer_3");
+
+        // Reconnect peer_1
+        scheduler.mark_peer_connected("peer_1");
+        assert!(scheduler.connected_peers().contains(&"peer_1".to_string()));
+    }
+
+    #[test]
+    fn test_unregister_peer_cleanup() {
+        let mut scheduler = SwarmScheduler::new(PullOrder::Alphabetical);
+        scheduler.register_peer("leaving_peer", vec!["c_orphan"]);
+        scheduler.register_peer("staying_peer", vec!["c_orphan"]);
+
+        scheduler.queue_chunk("c_orphan");
+        let a = scheduler.schedule_next().unwrap();
+
+        if a.peer_id == "leaving_peer" {
+            scheduler.unregister_peer("leaving_peer");
+            assert_eq!(scheduler.in_flight_count(), 0);
+            assert_eq!(scheduler.pending_count(), 1);
+
+            let a2 = scheduler.schedule_next().unwrap();
+            assert_eq!(a2.peer_id, "staying_peer");
+        } else {
+            scheduler.unregister_peer("staying_peer");
+            assert_eq!(scheduler.in_flight_count(), 0);
+            assert_eq!(scheduler.pending_count(), 1);
+
+            let a2 = scheduler.schedule_next().unwrap();
+            assert_eq!(a2.peer_id, "leaving_peer");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timeout_detection_and_peer_penalty() {
+        tokio::time::pause();
+
+        let mut scheduler = SwarmScheduler::new(PullOrder::Alphabetical);
+        scheduler.register_peer("faulty_peer", vec!["timeout_block"]);
+        scheduler.register_peer("backup_peer", vec!["timeout_block"]);
+
+        scheduler.queue_chunk("timeout_block");
+
+        let a1 = scheduler.schedule_next().unwrap();
+        let first_peer = a1.peer_id.clone();
+
+        // Advance 15s (past 10s timeout threshold)
+        tokio::time::advance(Duration::from_secs(15)).await;
+
+        let timed_out = scheduler.check_timeouts(Duration::from_secs(10));
+        assert_eq!(timed_out, vec!["timeout_block"]);
+        assert_eq!(scheduler.in_flight_count(), 0);
+        assert_eq!(scheduler.pending_count(), 1);
+
+        // Next schedule must pick the OTHER peer because first_peer was penalized with failed_attempts
+        let a2 = scheduler.schedule_next().unwrap();
+        assert_eq!(a2.chunk_hash, "timeout_block");
+        assert_ne!(a2.peer_id, first_peer);
+    }
+
+    #[tokio::test]
+    async fn test_end_to_end_swarm_lifecycle() {
+        tokio::time::pause();
+
+        let mut scheduler = SwarmScheduler::with_strategy(
+            PullOrder::SmallestFirst,
+            SchedulingStrategy::RarestFirstSwarm,
+        );
+
+        // 4 nodes in cluster
+        scheduler.register_peer("node_1", vec!["b1", "b2", "b3"]);
+        scheduler.register_peer("node_2", vec!["b3", "b4", "b5"]);
+        scheduler.register_peer("node_3", vec!["b5", "b6", "b7"]);
+        scheduler.register_peer("node_4", vec!["b1", "b4", "b7", "b8"]);
+
+        // 3 files totaling 8 blocks
+        scheduler.queue_file("docs", "readme.txt", 100, 1, vec!["b1".into(), "b2".into()]);
+        scheduler.queue_file("docs", "data.csv", 500, 2, vec!["b3".into(), "b4".into(), "b5".into()]);
+        scheduler.queue_file("docs", "archive.tar", 1000, 3, vec!["b6".into(), "b7".into(), "b8".into()]);
+
+        assert_eq!(scheduler.pending_count(), 8);
+        assert_eq!(scheduler.completed_count(), 0);
+        assert!(!scheduler.is_finished());
+
+        // Step 1: Schedule first batch of 4
+        let b1 = scheduler.schedule_batch(4);
+        assert_eq!(b1.len(), 4);
+
+        // Node 1 disconnects unexpectedly
+        scheduler.mark_peer_disconnected("node_1");
+
+        // Complete 2 assignments that were not on node_1
+        for a in &b1 {
+            if a.peer_id != "node_1" {
+                scheduler.mark_completed(&a.chunk_hash);
+            }
+        }
+
+        // Advance time to trigger timeouts on any lingering requests
+        tokio::time::advance(Duration::from_secs(20)).await;
+        scheduler.check_timeouts(Duration::from_secs(10));
+
+        // Node 1 reconnects
+        scheduler.mark_peer_connected("node_1");
+
+        // Drain remainder until scheduler finishes
+        let mut max_steps = 50;
+        while !scheduler.is_finished() && max_steps > 0 {
+            max_steps -= 1;
+            if let Some(a) = scheduler.schedule_next() {
+                // Simulate successful download
+                scheduler.mark_completed(&a.chunk_hash);
+            }
+        }
+
+        assert!(scheduler.is_finished());
+        assert_eq!(scheduler.pending_count(), 0);
+        assert_eq!(scheduler.in_flight_count(), 0);
+        assert_eq!(scheduler.completed_count(), 8);
+
+        // Progress for all files is 100%
+        assert_eq!(scheduler.file_progress("docs", "readme.txt"), Some((2, 2)));
+        assert_eq!(scheduler.file_progress("docs", "data.csv"), Some((3, 3)));
+        assert_eq!(scheduler.file_progress("docs", "archive.tar"), Some((3, 3)));
+    }
 }

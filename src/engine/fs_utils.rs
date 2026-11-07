@@ -418,19 +418,23 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("synapse_case_test_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
 
-        let readme = temp_dir.join("README.md");
+        let readme = temp_dir.join("ReadMe.md");
         fs::write(&readme, b"Hello").unwrap();
 
-        // Differing letter case -> collision detected!
+        // Differing letter case (e.g. ReadMe.md vs readme.md) -> collision detected!
         let collision = detect_case_collision(&temp_dir, "readme.md");
         assert!(collision.is_some());
-        assert_eq!(collision.unwrap().to_string_lossy().replace('\\', "/"), "README.md");
+        assert_eq!(collision.unwrap().to_string_lossy().replace('\\', "/"), "ReadMe.md");
 
         let collision_upper = detect_case_collision(&temp_dir, "README.MD");
         assert!(collision_upper.is_some());
+        assert_eq!(collision_upper.unwrap().to_string_lossy().replace('\\', "/"), "ReadMe.md");
+
+        let collision_all_caps = detect_case_collision(&temp_dir, "README.md");
+        assert!(collision_all_caps.is_some());
 
         // Identical case -> not a collision
-        let exact = detect_case_collision(&temp_dir, "README.md");
+        let exact = detect_case_collision(&temp_dir, "ReadMe.md");
         assert!(exact.is_none());
 
         // Non-existent file -> not a collision
@@ -443,23 +447,42 @@ mod tests {
     #[test]
     fn test_case_collision_nested_directories() {
         let temp_dir = std::env::temp_dir().join(format!("synapse_case_nested_{}", uuid::Uuid::new_v4()));
-        let sub = temp_dir.join("SubFolder");
+        let sub = temp_dir.join("Docs").join("SubFolder");
         fs::create_dir_all(&sub).unwrap();
-        let target = sub.join("MyDoc.pdf");
-        fs::write(&target, b"PDF bytes").unwrap();
+        let target = sub.join("ReadMe.md");
+        fs::write(&target, b"Doc bytes").unwrap();
 
-        // Differing case in both directory and filename
-        let collision = detect_case_collision(&temp_dir, "subfolder/mydoc.pdf");
+        // Differing case across all nested directories and filename
+        let collision = detect_case_collision(&temp_dir, "docs/subfolder/readme.md");
         assert!(collision.is_some());
-        assert_eq!(collision.unwrap().to_string_lossy().replace('\\', "/"), "SubFolder/MyDoc.pdf");
+        assert_eq!(collision.unwrap().to_string_lossy().replace('\\', "/"), "Docs/SubFolder/ReadMe.md");
 
-        // Differing case only in directory
-        let collision2 = detect_case_collision(&temp_dir, "subfolder/MyDoc.pdf");
-        assert!(collision2.is_some());
+        // Windows backslash path
+        let collision_win = detect_case_collision(&temp_dir, "docs\\subfolder\\readme.md");
+        assert!(collision_win.is_some());
+        assert_eq!(collision_win.unwrap().to_string_lossy().replace('\\', "/"), "Docs/SubFolder/ReadMe.md");
+
+        // All uppercase
+        let collision_caps = detect_case_collision(&temp_dir, "DOCS/SUBFOLDER/README.MD");
+        assert!(collision_caps.is_some());
+
+        // Differing case only in directory segment
+        let collision_dir = detect_case_collision(&temp_dir, "docs/subfolder/ReadMe.md");
+        assert!(collision_dir.is_some());
+        assert_eq!(collision_dir.unwrap().to_string_lossy().replace('\\', "/"), "Docs/SubFolder/ReadMe.md");
+
+        // Differing case only in filename
+        let collision_file = detect_case_collision(&temp_dir, "Docs/SubFolder/readme.md");
+        assert!(collision_file.is_some());
+        assert_eq!(collision_file.unwrap().to_string_lossy().replace('\\', "/"), "Docs/SubFolder/ReadMe.md");
 
         // Exact match
-        let exact = detect_case_collision(&temp_dir, "SubFolder/MyDoc.pdf");
+        let exact = detect_case_collision(&temp_dir, "Docs/SubFolder/ReadMe.md");
         assert!(exact.is_none());
+
+        // Nonexistent file in same directory
+        let nonexistent = detect_case_collision(&temp_dir, "Docs/SubFolder/NonExistent.md");
+        assert!(nonexistent.is_none());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -522,12 +545,45 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("synapse_marker_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
 
-        // Marker missing initially
-        assert!(verify_folder_marker(&temp_dir, ".synapse-folder").is_err());
+        // 1. Marker missing initially
+        let res_missing = verify_folder_marker(&temp_dir, ".synapse-folder");
+        assert!(res_missing.is_err());
+        match res_missing {
+            Err(FsSafetyError::MarkerMissing(name)) => assert_eq!(name, ".synapse-folder"),
+            other => panic!("Expected MarkerMissing, got {:?}", other),
+        }
 
-        // Create marker
+        // 2. Ensure / create marker
         ensure_folder_marker(&temp_dir, ".synapse-folder").unwrap();
         assert!(verify_folder_marker(&temp_dir, ".synapse-folder").is_ok());
+
+        // 3. Delete marker -> verify detection of missing/deleted marker
+        let marker_path = temp_dir.join(".synapse-folder");
+        fs::remove_dir_all(&marker_path).unwrap();
+        let res_deleted = verify_folder_marker(&temp_dir, ".synapse-folder");
+        assert!(res_deleted.is_err());
+        match res_deleted {
+            Err(FsSafetyError::MarkerMissing(name)) => assert_eq!(name, ".synapse-folder"),
+            other => panic!("Expected MarkerMissing after deletion, got {:?}", other),
+        }
+
+        // 4. Verify fallback marker (.stfolder)
+        let fallback_marker = temp_dir.join(".stfolder");
+        fs::create_dir_all(&fallback_marker).unwrap();
+        assert!(verify_folder_marker(&temp_dir, ".synapse-folder").is_ok());
+
+        // Delete fallback marker
+        fs::remove_dir_all(&fallback_marker).unwrap();
+        assert!(verify_folder_marker(&temp_dir, ".synapse-folder").is_err());
+
+        // 5. Verify unmounted / nonexistent directory
+        let unmounted = temp_dir.join("nonexistent_mount");
+        let res_unmounted = verify_folder_marker(&unmounted, ".synapse-folder");
+        assert!(res_unmounted.is_err());
+        match res_unmounted {
+            Err(FsSafetyError::DirectoryNotFound(_)) => {},
+            other => panic!("Expected DirectoryNotFound, got {:?}", other),
+        }
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -535,19 +591,88 @@ mod tests {
     #[test]
     fn test_atomic_write() {
         let temp_dir = std::env::temp_dir().join(format!("synapse_atomic_{}", uuid::Uuid::new_v4()));
-        let file_path = temp_dir.join("sub/test.txt");
+        let parent_dir = temp_dir.join("sub");
+        let file_path = parent_dir.join("test.txt");
 
-        atomic_write_file(&file_path, b"Atomic Payload Content", Some(1_700_000_000_000_000_000), None).unwrap();
+        let target_nanos = 1_700_000_123_000_000_000i64;
+        let target_mode = 0o755u32;
+
+        // 1. Initial write
+        atomic_write_file(&file_path, b"Atomic Payload Content", Some(target_nanos), Some(target_mode)).unwrap();
         assert!(file_path.exists());
         assert_eq!(fs::read(&file_path).unwrap(), b"Atomic Payload Content");
+
+        // Verify temporary files are cleaned up
+        let temp_files: Vec<_> = fs::read_dir(&parent_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".synapse.tmp."))
+            .collect();
+        assert!(temp_files.is_empty(), "Temporary files must be cleaned up");
+
+        // Verify timestamp preservation
+        let meta = fs::metadata(&file_path).unwrap();
+        let mtime = FileTime::from_last_modification_time(&meta);
+        assert_eq!(mtime.unix_seconds(), 1_700_000_123);
+
+        // Verify POSIX permissions on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(meta.permissions().mode() & 0o777, target_mode);
+        }
+
+        // 2. Atomic overwrite of existing file
+        let update_nanos = 1_705_000_456_000_000_000i64;
+        let update_mode = 0o644u32;
+        atomic_write_file(&file_path, b"Updated Atomic Payload", Some(update_nanos), Some(update_mode)).unwrap();
+
+        assert_eq!(fs::read(&file_path).unwrap(), b"Updated Atomic Payload");
+
+        let updated_meta = fs::metadata(&file_path).unwrap();
+        let updated_mtime = FileTime::from_last_modification_time(&updated_meta);
+        assert_eq!(updated_mtime.unix_seconds(), 1_705_000_456);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(updated_meta.permissions().mode() & 0o777, update_mode);
+        }
+
+        // Verify no leftover temporary files after overwrite
+        let temp_files_after: Vec<_> = fs::read_dir(&parent_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".synapse.tmp."))
+            .collect();
+        assert!(temp_files_after.is_empty(), "No temporary files should remain after overwrite");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_path_sanitization() {
+        // Standard path
         assert_eq!(sanitize_relative_path("foo/bar/test.txt"), "foo/bar/test.txt");
+
+        // Directory traversal with ..
         assert_eq!(sanitize_relative_path("foo/../bar/test.txt"), "bar/test.txt");
+        assert_eq!(sanitize_relative_path("a/b/../../c/d/../e/file.txt"), "c/e/file.txt");
+        assert_eq!(sanitize_relative_path("../../../../etc/passwd"), "etc/passwd");
+        assert_eq!(sanitize_relative_path("foo/bar/baz/../../qux"), "foo/qux");
+
+        // Current directory components and redundant slashes
+        assert_eq!(sanitize_relative_path("./foo/./bar/./test.txt"), "foo/bar/test.txt");
+        assert_eq!(sanitize_relative_path("foo///bar//file.txt"), "foo/bar/file.txt");
+
+        // Windows backslash normalization
+        assert_eq!(sanitize_relative_path("nested\\folder/sub\\file.txt"), "nested/folder/sub/file.txt");
+
+        // Windows illegal characters replacement
         assert_eq!(sanitize_relative_path("illegal:name*file?.txt"), "illegal_name_file_.txt");
+        assert_eq!(sanitize_relative_path("folder<1>/file:name?version*\"test\"|pipe.txt"), "folder_1_/file_name_version__test__pipe.txt");
+
+        // Whitespace trimming in path segments
+        assert_eq!(sanitize_relative_path(" foo / bar / file.txt "), "foo/bar/file.txt");
     }
 }

@@ -549,21 +549,29 @@ mod tests {
     fn test_staggered_bucket_calculation() {
         let max_age = 90 * ONE_DAY_SECS; // 90 days
 
-        // Past 24 hours -> Hourly buckets
+        // Past 24 hours -> Hourly buckets: Hourly(0..23)
         assert_eq!(get_staggered_bucket(0, max_age), Some(RetentionBucket::Hourly(0)));
         assert_eq!(get_staggered_bucket(1800, max_age), Some(RetentionBucket::Hourly(0)));
+        assert_eq!(get_staggered_bucket(3599, max_age), Some(RetentionBucket::Hourly(0)));
         assert_eq!(get_staggered_bucket(3600, max_age), Some(RetentionBucket::Hourly(1)));
-        assert_eq!(get_staggered_bucket(23 * ONE_HOUR_SECS + 10, max_age), Some(RetentionBucket::Hourly(23)));
+        assert_eq!(get_staggered_bucket(7199, max_age), Some(RetentionBucket::Hourly(1)));
+        assert_eq!(get_staggered_bucket(23 * ONE_HOUR_SECS, max_age), Some(RetentionBucket::Hourly(23)));
+        assert_eq!(get_staggered_bucket(ONE_DAY_SECS - 1, max_age), Some(RetentionBucket::Hourly(23)));
 
-        // Past 30 days -> Daily buckets
+        // Past 30 days -> Daily buckets: Daily(1..29)
         assert_eq!(get_staggered_bucket(ONE_DAY_SECS, max_age), Some(RetentionBucket::Daily(1)));
+        assert_eq!(get_staggered_bucket(ONE_DAY_SECS + 3600, max_age), Some(RetentionBucket::Daily(1)));
+        assert_eq!(get_staggered_bucket(2 * ONE_DAY_SECS, max_age), Some(RetentionBucket::Daily(2)));
         assert_eq!(get_staggered_bucket(2 * ONE_DAY_SECS + 500, max_age), Some(RetentionBucket::Daily(2)));
-        assert_eq!(get_staggered_bucket(29 * ONE_DAY_SECS + 3600, max_age), Some(RetentionBucket::Daily(29)));
+        assert_eq!(get_staggered_bucket(29 * ONE_DAY_SECS, max_age), Some(RetentionBucket::Daily(29)));
+        assert_eq!(get_staggered_bucket(THIRTY_DAYS_SECS - 1, max_age), Some(RetentionBucket::Daily(29)));
 
-        // Beyond 30 days -> Weekly buckets
+        // Beyond 30 days -> Weekly buckets: Weekly(0..)
         assert_eq!(get_staggered_bucket(THIRTY_DAYS_SECS, max_age), Some(RetentionBucket::Weekly(0)));
         assert_eq!(get_staggered_bucket(THIRTY_DAYS_SECS + 5 * ONE_DAY_SECS, max_age), Some(RetentionBucket::Weekly(0)));
+        assert_eq!(get_staggered_bucket(THIRTY_DAYS_SECS + ONE_WEEK_SECS - 1, max_age), Some(RetentionBucket::Weekly(0)));
         assert_eq!(get_staggered_bucket(THIRTY_DAYS_SECS + ONE_WEEK_SECS, max_age), Some(RetentionBucket::Weekly(1)));
+        assert_eq!(get_staggered_bucket(THIRTY_DAYS_SECS + 2 * ONE_WEEK_SECS, max_age), Some(RetentionBucket::Weekly(2)));
 
         // Exceeded max_age
         assert_eq!(get_staggered_bucket(max_age + 1, max_age), None);
@@ -622,6 +630,23 @@ mod tests {
 
         assert_eq!(kept.len(), 4);
         assert_eq!(removed.len(), 5);
+
+        // Also verify through VersioningPolicy::Staggered plan_retention
+        let file_versions: Vec<FileVersion> = timestamps
+            .iter()
+            .enumerate()
+            .map(|(i, &ts)| FileVersion {
+                path: PathBuf::from(format!("/v_{}", i)),
+                relative_path: "file.txt".to_string(),
+                timestamp: DateTime::from_timestamp(ts, 0).unwrap(),
+                size: 100,
+            })
+            .collect();
+
+        let policy = VersioningPolicy::Staggered(ONE_HOUR_SECS, max_age_secs);
+        let plan = policy.plan_retention(&file_versions, DateTime::from_timestamp(now_secs, 0).unwrap());
+        assert_eq!(plan.keep.len(), 4);
+        assert_eq!(plan.remove.len(), 5);
     }
 
     #[test]
@@ -636,25 +661,90 @@ mod tests {
             })
             .collect();
 
+        // 1. Cutoff to 3 versions
         let plan = apply_simple_retention(&versions, 3);
         assert_eq!(plan.keep.len(), 3);
         assert_eq!(plan.remove.len(), 2);
-
-        // Keep 3 newest (hours 0, 1, 2)
         assert_eq!(plan.keep[0].timestamp, now);
         assert_eq!(plan.keep[1].timestamp, now - chrono::Duration::hours(1));
         assert_eq!(plan.keep[2].timestamp, now - chrono::Duration::hours(2));
+        assert_eq!(plan.remove[0].timestamp, now - chrono::Duration::hours(3));
+        assert_eq!(plan.remove[1].timestamp, now - chrono::Duration::hours(4));
+
+        // 2. Cutoff with max_versions = 0 (removes everything)
+        let plan_zero = apply_simple_retention(&versions, 0);
+        assert_eq!(plan_zero.keep.len(), 0);
+        assert_eq!(plan_zero.remove.len(), 5);
+
+        // 3. Cutoff with max_versions >= total (keeps everything)
+        let plan_all = apply_simple_retention(&versions, 5);
+        assert_eq!(plan_all.keep.len(), 5);
+        assert_eq!(plan_all.remove.len(), 0);
+
+        let plan_excess = apply_simple_retention(&versions, 10);
+        assert_eq!(plan_excess.keep.len(), 5);
+        assert_eq!(plan_excess.remove.len(), 0);
+
+        // 4. Empty versions input
+        let plan_empty = apply_simple_retention(&[], 3);
+        assert!(plan_empty.keep.is_empty());
+        assert!(plan_empty.remove.is_empty());
+
+        // 5. Unsorted input order is correctly handled by sorting newest first
+        let mut reverse_versions = versions.clone();
+        reverse_versions.reverse();
+        let plan_reverse = apply_simple_retention(&reverse_versions, 2);
+        assert_eq!(plan_reverse.keep.len(), 2);
+        assert_eq!(plan_reverse.keep[0].timestamp, now);
+        assert_eq!(plan_reverse.keep[1].timestamp, now - chrono::Duration::hours(1));
+
+        // 6. Test through VersioningPolicy::Simple
+        let policy = VersioningPolicy::Simple(2);
+        let plan_policy = policy.plan_retention(&versions, now);
+        assert_eq!(plan_policy.keep.len(), 2);
+        assert_eq!(plan_policy.remove.len(), 3);
     }
 
     #[test]
     fn test_trashcan_retention() {
         let now = Utc::now();
-        let v1 = FileVersion::new(PathBuf::from("/v1"), "a.txt", now - chrono::Duration::days(5), 50);
-        let v2 = FileVersion::new(PathBuf::from("/v2"), "a.txt", now - chrono::Duration::days(40), 50);
+        let v_recent = FileVersion::new(PathBuf::from("/v_recent"), "a.txt", now - chrono::Duration::days(5), 50);
+        let v_exact = FileVersion::new(PathBuf::from("/v_exact"), "a.txt", now - chrono::Duration::seconds(30 * ONE_DAY_SECS as i64), 50);
+        let v_expired = FileVersion::new(PathBuf::from("/v_expired"), "a.txt", now - chrono::Duration::seconds((30 * ONE_DAY_SECS + 1) as i64), 50);
+        let v_old = FileVersion::new(PathBuf::from("/v_old"), "a.txt", now - chrono::Duration::days(40), 50);
 
-        let plan = apply_trashcan_retention(&[v1.clone(), v2.clone()], now, 30 * ONE_DAY_SECS);
-        assert_eq!(plan.keep, vec![v1]);
-        assert_eq!(plan.remove, vec![v2]);
+        // 1. Exact 30-day max age retention
+        let plan = apply_trashcan_retention(
+            &[v_recent.clone(), v_exact.clone(), v_expired.clone(), v_old.clone()],
+            now,
+            30 * ONE_DAY_SECS,
+        );
+        assert_eq!(plan.keep, vec![v_recent.clone(), v_exact.clone()]);
+        assert_eq!(plan.remove, vec![v_expired.clone(), v_old.clone()]);
+
+        // 2. Custom trash days (e.g. 7 days) via plan_retention_with_trash_days
+        let policy = VersioningPolicy::TrashCan;
+        let plan_7d = policy.plan_retention_with_trash_days(
+            &[v_recent.clone(), v_old.clone()],
+            now,
+            7,
+        );
+        assert_eq!(plan_7d.keep, vec![v_recent.clone()]);
+        assert_eq!(plan_7d.remove, vec![v_old.clone()]);
+
+        // 3. Custom trash days (e.g. 3 days): 5-day old version is expired
+        let plan_3d = policy.plan_retention_with_trash_days(
+            &[v_recent.clone(), v_old.clone()],
+            now,
+            3,
+        );
+        assert!(plan_3d.keep.is_empty());
+        assert_eq!(plan_3d.remove.len(), 2);
+
+        // 4. Unlimited retention when max_age_secs is 0
+        let plan_unlimited = apply_trashcan_retention(&[v_old.clone()], now, 0);
+        assert_eq!(plan_unlimited.keep, vec![v_old]);
+        assert!(plan_unlimited.remove.is_empty());
     }
 
     #[test]
@@ -686,18 +776,40 @@ mod tests {
         let v3_path = v3_dir.join("doc.txt");
         fs::write(&v3_path, b"expired content").unwrap();
 
+        // 4. Nested subdirectory version for another file
+        let ts4 = (now - chrono::Duration::minutes(5)).format("%Y%m%d-%H%M%S").to_string();
+        let v4_dir = versions_dir.join(&ts4).join("sub");
+        fs::create_dir_all(&v4_dir).unwrap();
+        let v4_path = v4_dir.join("notes.pdf");
+        fs::write(&v4_path, b"pdf content").unwrap();
+
         let policy = VersioningPolicy::Staggered(3600, 60 * ONE_DAY_SECS);
         let report = cleanup_expired_versions_at(&temp_dir, &policy, now).unwrap();
 
         assert_eq!(report.deleted_files_count, 2);
+        assert_eq!(report.freed_bytes, b"older content in same hour".len() as u64 + b"expired content".len() as u64);
         assert!(v1_path.exists());
         assert!(!v2_path.exists());
         assert!(!v3_path.exists());
+        assert!(v4_path.exists());
 
         // Empty directory v2_dir and v3_dir should be pruned
         assert!(!v2_dir.exists());
         assert!(!v3_dir.exists());
         assert!(v1_dir.exists());
+
+        // Test garbage collection with VersioningPolicy::Simple(1) on remaining files
+        let simple_policy = VersioningPolicy::Simple(1);
+        let report_simple = cleanup_expired_versions_at(&temp_dir, &simple_policy, now).unwrap();
+        // v1_path and v4_path are single versions of distinct files, so none deleted
+        assert_eq!(report_simple.deleted_files_count, 0);
+
+        // Test garbage collection with VersioningPolicy::None (deletes all versions)
+        let none_policy = VersioningPolicy::None;
+        let report_none = cleanup_expired_versions_at(&temp_dir, &none_policy, now).unwrap();
+        assert_eq!(report_none.deleted_files_count, 2);
+        assert!(!v1_path.exists());
+        assert!(!v4_path.exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

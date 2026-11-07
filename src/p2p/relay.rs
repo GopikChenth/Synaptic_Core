@@ -703,4 +703,569 @@ mod tests {
 
         assert!(session.verify_inbound_data(&spoofed).is_err());
     }
+
+    // ========================================================================
+    // Additional RelayJoin Tests
+    // ========================================================================
+
+    #[test]
+    fn test_relay_join_exhaustive_tamper() {
+        let key = SigningKey::generate(&mut OsRng);
+        let device_id = hex::encode(key.verifying_key().as_bytes());
+
+        // Tamper device_id
+        let mut join_dev = RelayJoin::new(&key, device_id.clone(), "s1".into(), None);
+        join_dev.device_id = "tampered_device".into();
+        assert!(!join_dev.verify().unwrap());
+
+        // Tamper timestamp
+        let mut join_time = RelayJoin::new(&key, device_id.clone(), "s1".into(), None);
+        join_time.timestamp += 1000;
+        assert!(!join_time.verify().unwrap());
+
+        // Tamper signature byte
+        let mut join_sig = RelayJoin::new(&key, device_id.clone(), "s1".into(), None);
+        join_sig.signature[0] ^= 0xFF;
+        assert!(!join_sig.verify().unwrap());
+
+        // Invalid signature length (< 64)
+        let mut join_short_sig = RelayJoin::new(&key, device_id.clone(), "s1".into(), None);
+        join_short_sig.signature.truncate(32);
+        assert!(!join_short_sig.verify().unwrap());
+
+        // Invalid signature length (> 64)
+        let mut join_long_sig = RelayJoin::new(&key, device_id.clone(), "s1".into(), None);
+        join_long_sig.signature.push(0x00);
+        assert!(!join_long_sig.verify().unwrap());
+
+        // Invalid public key hex
+        let mut join_bad_hex = RelayJoin::new(&key, device_id.clone(), "s1".into(), None);
+        join_bad_hex.public_key = "not_valid_hex!".into();
+        assert!(join_bad_hex.verify().is_err());
+
+        // Wrong length public key hex (16 bytes = 32 hex chars)
+        let mut join_short_pk = RelayJoin::new(&key, device_id.clone(), "s1".into(), None);
+        join_short_pk.public_key = hex::encode([0u8; 16]);
+        assert!(!join_short_pk.verify().unwrap());
+
+        // Different public key
+        let key2 = SigningKey::generate(&mut OsRng);
+        let mut join_diff_pk = RelayJoin::new(&key, device_id.clone(), "s1".into(), None);
+        join_diff_pk.public_key = hex::encode(key2.verifying_key().as_bytes());
+        assert!(!join_diff_pk.verify().unwrap());
+    }
+
+    #[test]
+    fn test_relay_join_auth_token_options() {
+        let key = SigningKey::generate(&mut OsRng);
+        let device_id = hex::encode(key.verifying_key().as_bytes());
+
+        let join_none = RelayJoin::new(&key, device_id.clone(), "s-none".into(), None);
+        assert!(join_none.auth_token.is_none());
+        assert!(join_none.verify().unwrap());
+
+        let join_some = RelayJoin::new(&key, device_id, "s-some".into(), Some("my_auth_token".into()));
+        assert_eq!(join_some.auth_token.as_deref(), Some("my_auth_token"));
+        assert!(join_some.verify().unwrap());
+    }
+
+    // ========================================================================
+    // Additional RelayInvitation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_relay_invitation_exhaustive_tamper() {
+        let key = SigningKey::generate(&mut OsRng);
+        let dev_a = hex::encode(key.verifying_key().as_bytes());
+        let dev_b = "target_peer_id".to_string();
+
+        let base_inv = RelayInvitation::new(
+            &key,
+            dev_a.clone(),
+            dev_b.clone(),
+            "relay.synapse.network:443".into(),
+            "sess-123".into(),
+            "ecdh-share-data".into(),
+            30_000,
+        );
+        assert!(base_inv.verify().unwrap());
+
+        // Tamper invitation_id
+        let mut inv = base_inv.clone();
+        inv.invitation_id = uuid::Uuid::new_v4().to_string();
+        assert!(!inv.verify().unwrap());
+
+        // Tamper session_id
+        let mut inv = base_inv.clone();
+        inv.session_id = "tampered-sess".into();
+        assert!(!inv.verify().unwrap());
+
+        // Tamper relay_addr
+        let mut inv = base_inv.clone();
+        inv.relay_addr = "evil.relay.network:443".into();
+        assert!(!inv.verify().unwrap());
+
+        // Tamper from_device_id
+        let mut inv = base_inv.clone();
+        inv.from_device_id = "attacker-id".into();
+        assert!(!inv.verify().unwrap());
+
+        // Tamper to_device_id
+        let mut inv = base_inv.clone();
+        inv.to_device_id = "wrong-recipient".into();
+        assert!(!inv.verify().unwrap());
+
+        // Tamper session_pubkey
+        let mut inv = base_inv.clone();
+        inv.session_pubkey = "corrupted-share".into();
+        assert!(!inv.verify().unwrap());
+
+        // Tamper expires_at
+        let mut inv = base_inv.clone();
+        inv.expires_at += 10_000;
+        assert!(!inv.verify().unwrap());
+
+        // Tamper signature
+        let mut inv = base_inv.clone();
+        inv.signature[5] ^= 0xAA;
+        assert!(!inv.verify().unwrap());
+
+        // Short signature
+        let mut inv = base_inv.clone();
+        inv.signature.truncate(63);
+        assert!(!inv.verify().unwrap());
+
+        // Bad hex initiator pubkey
+        let mut inv = base_inv.clone();
+        inv.initiator_pubkey = "NOT_HEX".into();
+        assert!(inv.verify().is_err());
+
+        // Short initiator pubkey
+        let mut inv = base_inv.clone();
+        inv.initiator_pubkey = hex::encode([0u8; 16]);
+        assert!(!inv.verify().unwrap());
+    }
+
+    #[test]
+    fn test_relay_invitation_expiry_boundaries() {
+        let key = SigningKey::generate(&mut OsRng);
+        let dev = hex::encode(key.verifying_key().as_bytes());
+
+        let inv = RelayInvitation::new(
+            &key,
+            dev.clone(),
+            "target".into(),
+            "relay:443".into(),
+            "sess-exp".into(),
+            "pubkey".into(),
+            5000,
+        );
+
+        assert!(!inv.is_expired(inv.created_at.saturating_sub(100)));
+        assert!(!inv.is_expired(inv.created_at));
+        assert!(!inv.is_expired(inv.expires_at - 1));
+        assert!(inv.is_expired(inv.expires_at));
+        assert!(inv.is_expired(inv.expires_at + 1));
+        assert!(inv.is_expired(u64::MAX));
+    }
+
+    // ========================================================================
+    // Additional RelayTunnelData Validation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_relay_tunnel_data_validation_matrix() {
+        // Valid
+        let valid = RelayTunnelData::new(
+            "sess".into(),
+            1,
+            "alice".into(),
+            "bob".into(),
+            vec![1, 2, 3],
+            vec![4, 5, 6],
+            vec![7, 8, 9],
+        );
+        assert!(valid.validate().is_ok());
+
+        // Empty session_id
+        let mut bad = valid.clone();
+        bad.session_id = "".into();
+        assert_eq!(bad.validate().unwrap_err(), "Session ID cannot be empty");
+
+        // Empty sender_id
+        let mut bad = valid.clone();
+        bad.sender_id = "".into();
+        assert_eq!(bad.validate().unwrap_err(), "Sender ID cannot be empty");
+
+        // Empty recipient_id
+        let mut bad = valid.clone();
+        bad.recipient_id = "".into();
+        assert_eq!(bad.validate().unwrap_err(), "Recipient ID cannot be empty");
+
+        // sender_id == recipient_id
+        let mut bad = valid.clone();
+        bad.sender_id = "same_peer".into();
+        bad.recipient_id = "same_peer".into();
+        assert_eq!(bad.validate().unwrap_err(), "Sender ID and Recipient ID cannot be identical");
+
+        // Empty encrypted_payload
+        let mut bad = valid.clone();
+        bad.encrypted_payload = vec![];
+        assert_eq!(bad.validate().unwrap_err(), "Encrypted payload cannot be empty");
+
+        // Empty auth_tag
+        let mut bad = valid.clone();
+        bad.auth_tag = vec![];
+        assert_eq!(bad.validate().unwrap_err(), "Authentication tag cannot be empty");
+
+        // Empty nonce
+        let mut bad = valid.clone();
+        bad.nonce = vec![];
+        assert_eq!(bad.validate().unwrap_err(), "Nonce cannot be empty");
+    }
+
+    // ========================================================================
+    // RelayMessage Framing & All Variants Round-trip Tests
+    // ========================================================================
+
+    #[test]
+    fn test_relay_message_all_variants_roundtrip() {
+        let key = SigningKey::generate(&mut OsRng);
+        let dev = hex::encode(key.verifying_key().as_bytes());
+
+        let join = RelayJoin::new(&key, dev.clone(), "sess-01".into(), Some("tok".into()));
+        let invitation = RelayInvitation::new(&key, dev.clone(), "target".into(), "relay:443".into(), "sess-02".into(), "key-share".into(), 60_000);
+        let tunnel = RelayTunnelData::new("sess-03".into(), 10, "sender".into(), "receiver".into(), vec![1, 2], vec![3], vec![4]);
+
+        let variants = vec![
+            RelayMessage::Join(join),
+            RelayMessage::JoinAck {
+                session_id: "sess-01".into(),
+                accepted: true,
+                reason: None,
+            },
+            RelayMessage::JoinAck {
+                session_id: "sess-01b".into(),
+                accepted: false,
+                reason: Some("Quota exceeded".into()),
+            },
+            RelayMessage::Invitation(invitation),
+            RelayMessage::InvitationResponse {
+                invitation_id: "inv-99".into(),
+                accepted: true,
+                reason: None,
+            },
+            RelayMessage::InvitationResponse {
+                invitation_id: "inv-100".into(),
+                accepted: false,
+                reason: Some("Busy".into()),
+            },
+            RelayMessage::Tunnel(tunnel),
+            RelayMessage::Ping {
+                session_id: "sess-ping".into(),
+                timestamp: 1234567890,
+            },
+            RelayMessage::Pong {
+                session_id: "sess-ping".into(),
+                timestamp: 1234567891,
+            },
+            RelayMessage::CloseSession {
+                session_id: "sess-close".into(),
+                reason: "Normal teardown".into(),
+            },
+        ];
+
+        for msg in variants {
+            let bytes = msg.to_bytes().expect("Serialization failed");
+            let decoded = RelayMessage::from_bytes(&bytes).expect("Deserialization failed");
+            assert_eq!(msg, decoded);
+
+            let framed = msg.to_length_prefixed().expect("Framing failed");
+            let (unframed, consumed) = RelayMessage::from_length_prefixed(&framed).expect("Unframing failed");
+            assert_eq!(consumed, framed.len());
+            assert_eq!(msg, unframed);
+        }
+    }
+
+    #[test]
+    fn test_relay_message_session_id_accessor() {
+        let key = SigningKey::generate(&mut OsRng);
+        let dev = hex::encode(key.verifying_key().as_bytes());
+
+        let join = RelayJoin::new(&key, dev.clone(), "s-join".into(), None);
+        assert_eq!(RelayMessage::Join(join).session_id(), Some("s-join"));
+
+        assert_eq!(
+            RelayMessage::JoinAck { session_id: "s-ack".into(), accepted: true, reason: None }.session_id(),
+            Some("s-ack")
+        );
+
+        let inv = RelayInvitation::new(&key, dev.clone(), "t".into(), "r".into(), "s-inv".into(), "k".into(), 1000);
+        assert_eq!(RelayMessage::Invitation(inv).session_id(), Some("s-inv"));
+
+        assert_eq!(
+            RelayMessage::InvitationResponse { invitation_id: "inv-1".into(), accepted: true, reason: None }.session_id(),
+            None
+        );
+
+        let tun = RelayTunnelData::new("s-tun".into(), 1, "a".into(), "b".into(), vec![1], vec![1], vec![1]);
+        assert_eq!(RelayMessage::Tunnel(tun).session_id(), Some("s-tun"));
+
+        assert_eq!(RelayMessage::Ping { session_id: "s-p".into(), timestamp: 0 }.session_id(), Some("s-p"));
+        assert_eq!(RelayMessage::Pong { session_id: "s-po".into(), timestamp: 0 }.session_id(), Some("s-po"));
+        assert_eq!(RelayMessage::CloseSession { session_id: "s-cl".into(), reason: "".into() }.session_id(), Some("s-cl"));
+    }
+
+    #[test]
+    fn test_relay_framing_partial_and_corrupt() {
+        // Buffer < 4 bytes
+        assert!(RelayMessage::from_length_prefixed(&[]).is_err());
+        assert!(RelayMessage::from_length_prefixed(&[0, 0, 1]).is_err());
+
+        // Incomplete frame (declared length 50, but only 10 bytes present)
+        let mut incomplete = Vec::new();
+        incomplete.extend_from_slice(&50u32.to_be_bytes());
+        incomplete.extend_from_slice(&[0u8; 10]);
+        assert!(RelayMessage::from_length_prefixed(&incomplete).is_err());
+
+        // Corrupted JSON payload
+        let mut corrupt = Vec::new();
+        let payload = b"NOT_VALID_JSON{";
+        corrupt.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        corrupt.extend_from_slice(payload);
+        assert!(RelayMessage::from_length_prefixed(&corrupt).is_err());
+    }
+
+    #[test]
+    fn test_relay_multi_frame_stream_unframing() {
+        let msg1 = RelayMessage::Ping { session_id: "stream-1".into(), timestamp: 100 };
+        let msg2 = RelayMessage::Tunnel(RelayTunnelData::new(
+            "stream-1".into(),
+            1,
+            "peer-a".into(),
+            "peer-b".into(),
+            vec![10, 20, 30],
+            vec![99],
+            vec![77],
+        ));
+        let msg3 = RelayMessage::Pong { session_id: "stream-1".into(), timestamp: 101 };
+        let msg4 = RelayMessage::CloseSession { session_id: "stream-1".into(), reason: "done".into() };
+
+        // Concatenate all 4 frames into a single continuous byte stream
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&msg1.to_length_prefixed().unwrap());
+        stream.extend_from_slice(&msg2.to_length_prefixed().unwrap());
+        stream.extend_from_slice(&msg3.to_length_prefixed().unwrap());
+        stream.extend_from_slice(&msg4.to_length_prefixed().unwrap());
+
+        // Iteratively unframing each message
+        let (unframed1, consumed1) = RelayMessage::from_length_prefixed(&stream).unwrap();
+        assert_eq!(unframed1, msg1);
+
+        let rem1 = &stream[consumed1..];
+        let (unframed2, consumed2) = RelayMessage::from_length_prefixed(rem1).unwrap();
+        assert_eq!(unframed2, msg2);
+
+        let rem2 = &rem1[consumed2..];
+        let (unframed3, consumed3) = RelayMessage::from_length_prefixed(rem2).unwrap();
+        assert_eq!(unframed3, msg3);
+
+        let rem3 = &rem2[consumed3..];
+        let (unframed4, consumed4) = RelayMessage::from_length_prefixed(rem3).unwrap();
+        assert_eq!(unframed4, msg4);
+
+        assert_eq!(consumed1 + consumed2 + consumed3 + consumed4, stream.len());
+    }
+
+    // ========================================================================
+    // RelaySession State & Replay Protection Tests
+    // ========================================================================
+
+    #[test]
+    fn test_relay_session_state_transitions() {
+        let mut session = RelaySession::new(
+            "sess-state".into(),
+            "local".into(),
+            "remote".into(),
+            "relay:443".into(),
+        );
+
+        assert_eq!(session.state, RelaySessionState::Disconnected);
+        session.state = RelaySessionState::Connecting;
+        assert_eq!(session.state, RelaySessionState::Connecting);
+        session.state = RelaySessionState::Joined;
+        assert_eq!(session.state, RelaySessionState::Joined);
+        session.state = RelaySessionState::Invited;
+        assert_eq!(session.state, RelaySessionState::Invited);
+        session.state = RelaySessionState::Active;
+        assert_eq!(session.state, RelaySessionState::Active);
+        session.state = RelaySessionState::Closed;
+        assert_eq!(session.state, RelaySessionState::Closed);
+    }
+
+    #[test]
+    fn test_relay_session_inbound_rejections() {
+        let mut session = RelaySession::new(
+            "sess-rej".into(),
+            "local_node".into(),
+            "remote_node".into(),
+            "relay.synapse.network:443".into(),
+        );
+
+        // Sequence number 0 rejected
+        let zero_seq = RelayTunnelData::new(
+            "sess-rej".into(),
+            0,
+            "remote_node".into(),
+            "local_node".into(),
+            vec![1],
+            vec![1],
+            vec![1],
+        );
+        let err = session.verify_inbound_data(&zero_seq).unwrap_err();
+        assert!(err.contains("Replay or out-of-order"));
+
+        // Normal packet 1 accepted
+        let mut frame = zero_seq.clone();
+        frame.sequence_number = 1;
+        assert!(session.verify_inbound_data(&frame).is_ok());
+
+        // Replay of packet 1 rejected
+        assert!(session.verify_inbound_data(&frame).is_err());
+
+        // Packet 5 accepted (gaps allowed in datagram sequence)
+        frame.sequence_number = 5;
+        assert!(session.verify_inbound_data(&frame).is_ok());
+
+        // Packet 3 (older) rejected
+        frame.sequence_number = 3;
+        assert!(session.verify_inbound_data(&frame).is_err());
+
+        // Session ID mismatch
+        frame.sequence_number = 6;
+        frame.session_id = "wrong-session".into();
+        let err = session.verify_inbound_data(&frame).unwrap_err();
+        assert!(err.contains("Session mismatch"));
+
+        // Sender mismatch
+        frame.session_id = "sess-rej".into();
+        frame.sender_id = "imposter".into();
+        let err = session.verify_inbound_data(&frame).unwrap_err();
+        assert!(err.contains("Sender mismatch"));
+
+        // Recipient mismatch
+        frame.sender_id = "remote_node".into();
+        frame.recipient_id = "someone_else".into();
+        let err = session.verify_inbound_data(&frame).unwrap_err();
+        assert!(err.contains("Recipient mismatch"));
+    }
+
+    // ========================================================================
+    // Stress Testing: Sequences, Replay Attacks & Concurrency
+    // ========================================================================
+
+    #[test]
+    fn test_stress_relay_tunnel_sequencing_10000_frames() {
+        let mut sender_session = RelaySession::new(
+            "stress-seq-10k".into(),
+            "peer-a".into(),
+            "peer-b".into(),
+            "relay.server:443".into(),
+        );
+        let mut receiver_session = RelaySession::new(
+            "stress-seq-10k".into(),
+            "peer-b".into(),
+            "peer-a".into(),
+            "relay.server:443".into(),
+        );
+
+        for expected_seq in 1..=10_000u64 {
+            let payload = vec![(expected_seq & 0xFF) as u8; 32];
+            let tag = vec![0xAA; 16];
+            let nonce = vec![0xBB; 12];
+
+            let frame = sender_session.pack_tunnel_data(payload.clone(), tag, nonce);
+            assert_eq!(frame.sequence_number, expected_seq);
+
+            let verified_payload = receiver_session.verify_inbound_data(&frame).expect("Inbound frame verification failed");
+            assert_eq!(verified_payload, &payload[..]);
+        }
+
+        assert_eq!(sender_session.outbound_seq, 10_000);
+        assert_eq!(receiver_session.inbound_seq, 10_000);
+    }
+
+    #[test]
+    fn test_stress_relay_replay_attack_storm() {
+        let mut sender_session = RelaySession::new(
+            "stress-replay".into(),
+            "peer-a".into(),
+            "peer-b".into(),
+            "relay:443".into(),
+        );
+        let mut receiver_session = RelaySession::new(
+            "stress-replay".into(),
+            "peer-b".into(),
+            "peer-a".into(),
+            "relay:443".into(),
+        );
+
+        let mut captured_frames = Vec::new();
+        // Exchange 250 legitimate frames
+        for _ in 1..=250 {
+            let frame = sender_session.pack_tunnel_data(vec![1, 2, 3], vec![9], vec![0]);
+            receiver_session.verify_inbound_data(&frame).expect("Legitimate frame should be accepted");
+            captured_frames.push(frame);
+        }
+        assert_eq!(receiver_session.inbound_seq, 250);
+
+        // Adversary re-injects all 250 captured frames in reverse order (replay attack storm)
+        for replayed_frame in captured_frames.iter().rev() {
+            let res = receiver_session.verify_inbound_data(replayed_frame);
+            assert!(res.is_err(), "Replay frame seq {} must be rejected!", replayed_frame.sequence_number);
+        }
+
+        // Receiver state remains at seq 250
+        assert_eq!(receiver_session.inbound_seq, 250);
+
+        // Next legitimate frame 251 succeeds
+        let frame251 = sender_session.pack_tunnel_data(vec![4, 5, 6], vec![9], vec![1]);
+        assert_eq!(frame251.sequence_number, 251);
+        assert!(receiver_session.verify_inbound_data(&frame251).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_stress_relay_concurrent_sessions() {
+        let mut handles = Vec::new();
+
+        for session_idx in 0..25 {
+            let handle = tokio::spawn(async move {
+                let session_id = format!("concurrent-sess-{}", session_idx);
+                let mut sender = RelaySession::new(
+                    session_id.clone(),
+                    format!("peer-a-{}", session_idx),
+                    format!("peer-b-{}", session_idx),
+                    "relay:443".into(),
+                );
+                let mut receiver = RelaySession::new(
+                    session_id,
+                    format!("peer-b-{}", session_idx),
+                    format!("peer-a-{}", session_idx),
+                    "relay:443".into(),
+                );
+
+                for i in 1..=200u64 {
+                    let frame = sender.pack_tunnel_data(vec![(i % 256) as u8; 64], vec![0x55; 16], vec![0x33; 12]);
+                    assert_eq!(frame.sequence_number, i);
+                    let payload = receiver.verify_inbound_data(&frame).expect("Concurrent inbound frame failed");
+                    assert_eq!(payload.len(), 64);
+                }
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.await.expect("Concurrent session task failed");
+        }
+    }
 }

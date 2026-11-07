@@ -1518,4 +1518,379 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn test_pending_device_pairing_workflow() {
+        let temp_dir = std::env::temp_dir().join(format!("synapse_pairing_test_{}", uuid::Uuid::new_v4()));
+        let engine = StorageEngine::new(&temp_dir).unwrap();
+
+        // 1. Add pending device requests
+        let dev1 = PendingDeviceRecord {
+            device_id: "DEV-PHONE-001".into(),
+            name: "Alice's Android Phone".into(),
+            address: "tcp://192.168.1.150:9190".into(),
+            received_at: 1000,
+        };
+        let dev2 = PendingDeviceRecord {
+            device_id: "DEV-LAPTOP-002".into(),
+            name: "Bob's Work Laptop".into(),
+            address: "tcp://192.168.1.151:9190".into(),
+            received_at: 2000,
+        };
+        engine.add_pending_device(&dev1).unwrap();
+        engine.add_pending_device(&dev2).unwrap();
+
+        let pending = engine.list_pending_devices().unwrap();
+        assert_eq!(pending.len(), 2);
+        // Ordered by received_at DESC
+        assert_eq!(pending[0].device_id, "DEV-LAPTOP-002");
+        assert_eq!(pending[1].device_id, "DEV-PHONE-001");
+
+        // 2. Accept dev1 -> promoted to devices table as trusted
+        engine.accept_pending_device("DEV-PHONE-001").unwrap();
+
+        let pending_after_accept = engine.list_pending_devices().unwrap();
+        assert_eq!(pending_after_accept.len(), 1);
+        assert_eq!(pending_after_accept[0].device_id, "DEV-LAPTOP-002");
+
+        let paired = engine.get_device("DEV-PHONE-001").unwrap().expect("device should be in devices table");
+        assert_eq!(paired.name, "Alice's Android Phone");
+        assert_eq!(paired.addresses, vec!["tcp://192.168.1.150:9190"]);
+        assert!(paired.is_trusted, "Accepted pending device must be marked trusted");
+        assert!(!paired.is_paused);
+        assert!(!paired.introducer);
+
+        // 3. Reject dev2 -> deleted from pending, not added to devices
+        engine.reject_pending_device("DEV-LAPTOP-002").unwrap();
+        let pending_after_reject = engine.list_pending_devices().unwrap();
+        assert_eq!(pending_after_reject.len(), 0);
+        assert!(engine.get_device("DEV-LAPTOP-002").unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_introducer_propagation_unauthorized_rejection() {
+        let temp_dir = std::env::temp_dir().join(format!("synapse_intro_unauth_{}", uuid::Uuid::new_v4()));
+        let engine = StorageEngine::new(&temp_dir).unwrap();
+
+        // Add regular non-introducer peer
+        let peer = DeviceRecord {
+            device_id: "PEER-REGULAR-01".into(),
+            name: "Regular Peer".into(),
+            addresses: vec!["tcp://10.0.0.1:9190".into()],
+            is_paused: false,
+            is_trusted: true,
+            introducer: false, // NOT an introducer
+            cert_name: None,
+            created_at: 100,
+        };
+        engine.add_device(&peer).unwrap();
+        assert!(!engine.is_device_introducer("PEER-REGULAR-01").unwrap());
+
+        // Rogue peer attempts to propagate cluster devices
+        let announced = vec![
+            IntroducedDevice {
+                device_id: "SPOOFED-DEV-01".into(),
+                name: "Spoofed Device".into(),
+                addresses: vec!["tcp://10.0.0.99:9190".into()],
+                is_trusted: true,
+                cert_name: None,
+            },
+        ];
+
+        let result = engine.propagate_introducer_devices("PEER-REGULAR-01", &announced, true).unwrap();
+        assert!(result.added_trusted.is_empty(), "Unauthorized propagation must not add trusted devices");
+        assert!(result.added_pending.is_empty(), "Unauthorized propagation must not add pending devices");
+
+        assert!(engine.get_device("SPOOFED-DEV-01").unwrap().is_none());
+        assert!(engine.list_pending_devices().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_introducer_propagation_auto_trust() {
+        let temp_dir = std::env::temp_dir().join(format!("synapse_intro_autotrust_{}", uuid::Uuid::new_v4()));
+        let engine = StorageEngine::new(&temp_dir).unwrap();
+
+        // Add designated introducer peer
+        let introducer = DeviceRecord {
+            device_id: "MASTER-INTRODUCER-01".into(),
+            name: "Cluster Master Introducer".into(),
+            addresses: vec!["tcp://master.lan:9190".into()],
+            is_paused: false,
+            is_trusted: true,
+            introducer: true,
+            cert_name: None,
+            created_at: 200,
+        };
+        engine.add_device(&introducer).unwrap();
+        assert!(engine.is_device_introducer("MASTER-INTRODUCER-01").unwrap());
+
+        let intro_list = engine.list_introducer_devices().unwrap();
+        assert_eq!(intro_list.len(), 1);
+        assert_eq!(intro_list[0].device_id, "MASTER-INTRODUCER-01");
+
+        // Introducer announces cluster peers with auto_trust = true
+        let announced = vec![
+            // 1. Valid new peer A
+            IntroducedDevice {
+                device_id: "CLUSTER-NODE-A".into(),
+                name: "Node Alpha".into(),
+                addresses: vec!["tcp://node-a.lan:9190".into()],
+                is_trusted: true,
+                cert_name: Some("cert-alpha".into()),
+            },
+            // 2. Valid new peer B
+            IntroducedDevice {
+                device_id: "CLUSTER-NODE-B".into(),
+                name: "Node Beta".into(),
+                addresses: vec!["tcp://node-b.lan:9190".into()],
+                is_trusted: true,
+                cert_name: None,
+            },
+            // 3. Self introduction (should be ignored)
+            IntroducedDevice {
+                device_id: "MASTER-INTRODUCER-01".into(),
+                name: "Self Master".into(),
+                addresses: vec!["tcp://master.lan:9190".into()],
+                is_trusted: true,
+                cert_name: None,
+            },
+        ];
+
+        let result = engine.propagate_introducer_devices("MASTER-INTRODUCER-01", &announced, true).unwrap();
+        assert_eq!(result.added_trusted.len(), 2);
+        assert!(result.added_trusted.contains(&"CLUSTER-NODE-A".to_string()));
+        assert!(result.added_trusted.contains(&"CLUSTER-NODE-B".to_string()));
+        assert_eq!(result.ignored, vec!["MASTER-INTRODUCER-01".to_string()]);
+
+        // Verify nodes were inserted into devices table
+        let node_a = engine.get_device("CLUSTER-NODE-A").unwrap().expect("Node A should exist");
+        assert_eq!(node_a.name, "Node Alpha");
+        assert!(node_a.is_trusted);
+        assert_eq!(node_a.addresses, vec!["tcp://node-a.lan:9190"]);
+
+        let node_b = engine.get_device("CLUSTER-NODE-B").unwrap().expect("Node B should exist");
+        assert_eq!(node_b.name, "Node Beta");
+        assert!(node_b.is_trusted);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_introducer_propagation_manual_pairing() {
+        let temp_dir = std::env::temp_dir().join(format!("synapse_intro_manual_{}", uuid::Uuid::new_v4()));
+        let engine = StorageEngine::new(&temp_dir).unwrap();
+
+        let introducer = DeviceRecord {
+            device_id: "MASTER-INTRO-02".into(),
+            name: "Master Introducer".into(),
+            addresses: vec!["tcp://master.lan:9190".into()],
+            is_paused: false,
+            is_trusted: true,
+            introducer: true,
+            cert_name: None,
+            created_at: 300,
+        };
+        engine.add_device(&introducer).unwrap();
+
+        let announced = vec![
+            IntroducedDevice {
+                device_id: "CLUSTER-NODE-C".into(),
+                name: "Node Gamma".into(),
+                addresses: vec!["tcp://node-c.lan:9190".into()],
+                is_trusted: true,
+                cert_name: None,
+            },
+        ];
+
+        // auto_trust = false -> routes to pending_devices
+        let result = engine.propagate_introducer_devices("MASTER-INTRO-02", &announced, false).unwrap();
+        assert_eq!(result.added_pending, vec!["CLUSTER-NODE-C".to_string()]);
+        assert!(result.added_trusted.is_empty());
+
+        assert!(engine.get_device("CLUSTER-NODE-C").unwrap().is_none());
+        let pending = engine.list_pending_devices().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].device_id, "CLUSTER-NODE-C");
+
+        // Manually accept pending device
+        engine.accept_pending_device("CLUSTER-NODE-C").unwrap();
+        assert!(engine.get_device("CLUSTER-NODE-C").unwrap().is_some());
+        assert_eq!(engine.list_pending_devices().unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_introducer_propagation_address_merging() {
+        let temp_dir = std::env::temp_dir().join(format!("synapse_intro_merge_{}", uuid::Uuid::new_v4()));
+        let engine = StorageEngine::new(&temp_dir).unwrap();
+
+        let introducer = DeviceRecord {
+            device_id: "MASTER-INTRO-03".into(),
+            name: "Master Introducer".into(),
+            addresses: vec!["tcp://master.lan:9190".into()],
+            is_paused: false,
+            is_trusted: true,
+            introducer: true,
+            cert_name: None,
+            created_at: 400,
+        };
+        engine.add_device(&introducer).unwrap();
+
+        // Existing device with 1 initial address
+        let existing = DeviceRecord {
+            device_id: "NODE-EXISTING-01".into(),
+            name: "Existing Node".into(),
+            addresses: vec!["tcp://192.168.1.10:9190".into()],
+            is_paused: false,
+            is_trusted: true,
+            introducer: false,
+            cert_name: None,
+            created_at: 401,
+        };
+        engine.add_device(&existing).unwrap();
+
+        // Introducer announces existing device with an additional new address
+        let announced = vec![
+            IntroducedDevice {
+                device_id: "NODE-EXISTING-01".into(),
+                name: "Existing Node Updated".into(),
+                addresses: vec![
+                    "tcp://192.168.1.10:9190".into(), // existing
+                    "tcp://10.200.0.1:9190".into(),    // new VPN address
+                ],
+                is_trusted: true,
+                cert_name: None,
+            },
+        ];
+
+        let result = engine.propagate_introducer_devices("MASTER-INTRO-03", &announced, true).unwrap();
+        assert_eq!(result.updated, vec!["NODE-EXISTING-01".to_string()]);
+
+        let updated = engine.get_device("NODE-EXISTING-01").unwrap().unwrap();
+        assert_eq!(updated.addresses.len(), 2);
+        assert!(updated.addresses.contains(&"tcp://192.168.1.10:9190".to_string()));
+        assert!(updated.addresses.contains(&"tcp://10.200.0.1:9190".to_string()));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_untrusted_node_support() {
+        let temp_dir = std::env::temp_dir().join(format!("synapse_untrusted_node_{}", uuid::Uuid::new_v4()));
+        let engine = StorageEngine::new(&temp_dir).unwrap();
+
+        // Add untrusted cloud VPS storage node
+        let untrusted_vps = DeviceRecord {
+            device_id: "VPS-UNTRUSTED-STORAGE-01".into(),
+            name: "Hetzner Storage Box".into(),
+            addresses: vec!["tcp://vps.cloud.net:9190".into()],
+            is_paused: false,
+            is_trusted: false, // Untrusted storage node
+            introducer: false,
+            cert_name: None,
+            created_at: 500,
+        };
+        engine.add_device(&untrusted_vps).unwrap();
+
+        // Check trust queries
+        assert!(!engine.is_device_trusted("VPS-UNTRUSTED-STORAGE-01").unwrap());
+        let untrusted_list = engine.list_untrusted_devices().unwrap();
+        assert_eq!(untrusted_list.len(), 1);
+        assert_eq!(untrusted_list[0].device_id, "VPS-UNTRUSTED-STORAGE-01");
+
+        // Toggle trust status to trusted
+        engine.set_device_trusted("VPS-UNTRUSTED-STORAGE-01", true).unwrap();
+        assert!(engine.is_device_trusted("VPS-UNTRUSTED-STORAGE-01").unwrap());
+        assert_eq!(engine.list_untrusted_devices().unwrap().len(), 0);
+
+        // Toggle back to untrusted
+        engine.set_device_trusted("VPS-UNTRUSTED-STORAGE-01", false).unwrap();
+        assert!(!engine.is_device_trusted("VPS-UNTRUSTED-STORAGE-01").unwrap());
+        assert_eq!(engine.list_untrusted_devices().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_device_pause_and_removal_cleanup() {
+        let temp_dir = std::env::temp_dir().join(format!("synapse_dev_mgmt_{}", uuid::Uuid::new_v4()));
+        let engine = StorageEngine::new(&temp_dir).unwrap();
+
+        let folder = FolderRecord::new("shared_folder_01", "/tmp/shared");
+        engine.add_folder(&folder).unwrap();
+
+        let dev = DeviceRecord {
+            device_id: "DEV-MGMT-01".into(),
+            name: "Test Device".into(),
+            addresses: vec!["tcp://127.0.0.1:9190".into()],
+            is_paused: false,
+            is_trusted: true,
+            introducer: false,
+            cert_name: None,
+            created_at: 600,
+        };
+        engine.add_device(&dev).unwrap();
+        engine.share_folder_with_device("shared_folder_01", "DEV-MGMT-01").unwrap();
+        assert_eq!(engine.list_folder_devices("shared_folder_01").unwrap(), vec!["DEV-MGMT-01".to_string()]);
+
+        // Pause device
+        engine.set_device_paused("DEV-MGMT-01", true).unwrap();
+        let dev_paused = engine.get_device("DEV-MGMT-01").unwrap().unwrap();
+        assert!(dev_paused.is_paused);
+
+        // Unpause device
+        engine.set_device_paused("DEV-MGMT-01", false).unwrap();
+        let dev_unpaused = engine.get_device("DEV-MGMT-01").unwrap().unwrap();
+        assert!(!dev_unpaused.is_paused);
+
+        // Remove device -> cleans up devices table and folder_devices associations
+        engine.remove_device("DEV-MGMT-01").unwrap();
+        assert!(engine.get_device("DEV-MGMT-01").unwrap().is_none());
+        assert!(engine.list_folder_devices("shared_folder_01").unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_pending_folder_invitations_workflow() {
+        let temp_dir = std::env::temp_dir().join(format!("synapse_folder_invites_{}", uuid::Uuid::new_v4()));
+        let engine = StorageEngine::new(&temp_dir).unwrap();
+
+        let inv1 = PendingFolderRecord {
+            folder_id: "folder_photos".into(),
+            device_id: "REMOTE-DEV-01".into(),
+            folder_label: "Family Photos".into(),
+            offered_at: 700,
+        };
+        let inv2 = PendingFolderRecord {
+            folder_id: "folder_finance".into(),
+            device_id: "REMOTE-DEV-02".into(),
+            folder_label: "Tax Documents".into(),
+            offered_at: 800,
+        };
+        engine.add_pending_folder(&inv1).unwrap();
+        engine.add_pending_folder(&inv2).unwrap();
+
+        let pending = engine.list_pending_folders().unwrap();
+        assert_eq!(pending.len(), 2);
+
+        // Accept folder_photos
+        engine.accept_pending_folder("folder_photos", "REMOTE-DEV-01", "/home/user/Photos").unwrap();
+        let folder = engine.get_folder("folder_photos").unwrap().expect("Folder should be registered");
+        assert_eq!(folder.local_path, "/home/user/Photos");
+        let shared = engine.list_folder_devices("folder_photos").unwrap();
+        assert_eq!(shared, vec!["REMOTE-DEV-01".to_string()]);
+
+        // Reject folder_finance
+        engine.reject_pending_folder("folder_finance", "REMOTE-DEV-02").unwrap();
+        assert!(engine.get_folder("folder_finance").unwrap().is_none());
+        assert_eq!(engine.list_pending_folders().unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
