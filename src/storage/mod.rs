@@ -55,6 +55,14 @@ impl FolderRecord {
             marker_name: default_marker_name(),
         }
     }
+
+    pub fn parsed_sync_mode(&self) -> crate::state::SyncMode {
+        self.sync_mode.parse().unwrap_or_default()
+    }
+
+    pub fn parsed_conflict_policy(&self) -> crate::state::ConflictPolicy {
+        self.conflict_policy.parse().unwrap_or_default()
+    }
 }
 
 /// Device record in cluster pairing database.
@@ -211,6 +219,12 @@ pub struct QuarantineConflict {
     pub staged_payload_path: String,
     pub status: String, // PENDING, RESOLVED, IGNORED
     pub detected_at: i64,
+}
+
+impl QuarantineConflict {
+    pub fn parsed_status(&self) -> crate::state::ConflictStatus {
+        self.status.parse().unwrap_or_default()
+    }
 }
 
 /// Central database and block storage manager.
@@ -866,6 +880,26 @@ impl StorageEngine {
         Ok(list)
     }
 
+    pub fn get_pending_device(&self, device_id: &str) -> SqlResult<Option<PendingDeviceRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT device_id, name, address, received_at FROM pending_devices WHERE device_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![device_id], |row| {
+            Ok(PendingDeviceRecord {
+                device_id: row.get(0)?,
+                name: row.get(1)?,
+                address: row.get(2)?,
+                received_at: row.get(3)?,
+            })
+        })?;
+
+        match rows.next() {
+            Some(res) => Ok(Some(res?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn accept_pending_device(&self, device_id: &str) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -1442,6 +1476,24 @@ impl StorageEngine {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE quarantine_conflicts SET status = 'RESOLVED' WHERE conflict_id = ?1",
+            params![conflict_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn ignore_conflict(&self, conflict_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE quarantine_conflicts SET status = 'IGNORED' WHERE conflict_id = ?1",
+            params![conflict_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn reopen_conflict(&self, conflict_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE quarantine_conflicts SET status = 'PENDING' WHERE conflict_id = ?1",
             params![conflict_id],
         )?;
         Ok(())

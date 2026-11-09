@@ -9,6 +9,7 @@ pub mod conflict;
 pub mod dag;
 pub mod engine;
 pub mod p2p;
+pub mod state;
 pub mod storage;
 
 use std::ffi::CStr;

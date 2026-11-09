@@ -267,6 +267,22 @@ impl SwarmScheduler {
         self.max_total_in_flight = max.max(1);
     }
 
+    /// Returns the active download state of a chunk in the swarm replication machine.
+    pub fn get_chunk_state(&self, chunk_hash: &str) -> Option<crate::state::ChunkDownloadState> {
+        if self.completed_chunks.contains(chunk_hash) {
+            Some(crate::state::ChunkDownloadState::Completed)
+        } else if let Some((peer_id, instant)) = self.in_flight.get(chunk_hash) {
+            Some(crate::state::ChunkDownloadState::InFlight {
+                peer_id: peer_id.clone(),
+                elapsed_millis: instant.elapsed().as_millis() as u64,
+            })
+        } else if self.pending_chunks.contains(chunk_hash) {
+            Some(crate::state::ChunkDownloadState::Pending)
+        } else {
+            None
+        }
+    }
+
     /// Registers a peer with its initially known set of available chunks.
     pub fn register_peer(
         &mut self,

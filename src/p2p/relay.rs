@@ -435,6 +435,40 @@ impl RelaySession {
         }
     }
 
+    /// Validates whether a state transition is legal according to the relay fallback protocol.
+    pub fn can_transition_to(&self, next: RelaySessionState) -> bool {
+        match (self.state, next) {
+            (RelaySessionState::Disconnected, RelaySessionState::Connecting) => true,
+            (RelaySessionState::Connecting, RelaySessionState::Joined) => true,
+            (RelaySessionState::Connecting, RelaySessionState::Closed) => true,
+            (RelaySessionState::Joined, RelaySessionState::Invited) => true,
+            (RelaySessionState::Joined, RelaySessionState::Active) => true,
+            (RelaySessionState::Joined, RelaySessionState::Closed) => true,
+            (RelaySessionState::Invited, RelaySessionState::Active) => true,
+            (RelaySessionState::Invited, RelaySessionState::Closed) => true,
+            (RelaySessionState::Active, RelaySessionState::Closed) => true,
+            (s1, s2) if s1 == s2 => true,
+            _ => false,
+        }
+    }
+
+    /// Transitions to a target state, verifying lifecycle invariants.
+    pub fn transition_to(&mut self, next: RelaySessionState) -> Result<(), crate::state::StateTransitionError> {
+        if !self.can_transition_to(next) {
+            return Err(crate::state::StateTransitionError {
+                entity: "relay_session".to_string(),
+                entity_id: self.session_id.clone(),
+                current_state: format!("{:?}", self.state),
+                attempted_transition: format!("{:?}", next),
+                allowed_transitions: vec![],
+                available_actions: vec![],
+                is_terminal: self.state == RelaySessionState::Closed,
+            });
+        }
+        self.state = next;
+        Ok(())
+    }
+
     /// Constructs an outbound tunnel data packet, incrementing outbound sequence counter.
     pub fn pack_tunnel_data(
         &mut self,

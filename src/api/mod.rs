@@ -94,6 +94,22 @@ fn default_policy() -> String {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ConflictDetailsDto {
+    pub conflict_id: String,
+    pub folder_id: String,
+    pub relative_path: String,
+    pub base_revision: Option<String>,
+    pub local_revision: String,
+    pub remote_revision: String,
+    pub staged_payload_path: String,
+    pub status: String,
+    pub detected_at: i64,
+    pub available_actions: Vec<String>,
+    pub is_terminal: bool,
+    pub state_description: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DiffResponse {
     pub conflict_id: String,
     pub folder_id: String,
@@ -151,6 +167,8 @@ impl ApiServer {
             .route("/rest/system/shutdown", post(system_shutdown))
             .route("/api/v1/system/restart", post(system_restart))
             .route("/rest/system/restart", post(system_restart))
+            .route("/api/v1/system/statemachines", get(get_system_statemachines))
+            .route("/rest/system/statemachines", get(get_system_statemachines))
             .route("/api/v1/connections", get(get_connections))
             .route("/rest/system/connections", get(get_connections))
 
@@ -202,6 +220,10 @@ impl ApiServer {
             .route("/api/v1/conflicts/:id/remote", get(get_conflict_remote))
             .route("/api/v1/conflicts/:id/diff", get(get_conflict_diff))
             .route("/api/v1/conflicts/:id/resolve", post(resolve_conflict))
+            .route("/api/v1/conflicts/:id/ignore", post(ignore_conflict))
+            .route("/rest/conflicts/:id/ignore", post(ignore_conflict))
+            .route("/api/v1/conflicts/:id/reopen", post(reopen_conflict))
+            .route("/rest/conflicts/:id/reopen", post(reopen_conflict))
 
             // WebSocket Events
             .route("/api/v1/events", get(websocket_events_handler))
@@ -231,11 +253,36 @@ async fn get_system_status(State(state): State<AppState>) -> impl IntoResponse {
     let peers = state.peer_count.load(std::sync::atomic::Ordering::Relaxed);
     let mem = get_resident_memory_bytes();
 
+    let mut is_scanning = false;
+    let mut is_syncing = false;
+    let mut all_paused = !folders.is_empty();
+
+    for f in &folders {
+        if !f.is_paused {
+            all_paused = false;
+        }
+        match state.sync_engine.get_folder_state(&f.folder_id) {
+            crate::state::FolderSyncState::Scanning => is_scanning = true,
+            crate::state::FolderSyncState::Syncing => is_syncing = true,
+            _ => {}
+        }
+    }
+
+    let sync_state = if is_scanning {
+        "SCANNING".to_string()
+    } else if is_syncing {
+        "SYNCING".to_string()
+    } else if all_paused {
+        "PAUSED".to_string()
+    } else {
+        "IDLE".to_string()
+    };
+
     Json(SystemStatusResponse {
         device_id: state.sync_engine.device_id().to_string(),
         uptime_seconds: uptime,
         peer_count: peers,
-        sync_state: "IDLE".into(),
+        sync_state,
         version: "1.0.0".into(),
         monitored_folders_count: folders.len(),
         pending_conflicts_count: conflicts.len(),
@@ -296,6 +343,10 @@ async fn get_connections(State(state): State<AppState>) -> impl IntoResponse {
     }
 
     Json(map)
+}
+
+async fn get_system_statemachines() -> impl IntoResponse {
+    Json(crate::state::get_all_state_machines())
 }
 
 // =============================================================================
@@ -417,7 +468,10 @@ async fn get_folder_status(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     match state.sync_engine.storage().get_folder_status(&id) {
-        Ok(st) => Json(st).into_response(),
+        Ok(mut st) => {
+            st.state = state.sync_engine.get_folder_state(&id).as_str().to_string();
+            Json(st).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -428,7 +482,10 @@ async fn get_folder_status_query(
 ) -> impl IntoResponse {
     if let Some(fid) = params.get("folder") {
         match state.sync_engine.storage().get_folder_status(fid) {
-            Ok(st) => Json(st).into_response(),
+            Ok(mut st) => {
+                st.state = state.sync_engine.get_folder_state(fid).as_str().to_string();
+                Json(st).into_response()
+            }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         }
     } else {
@@ -625,8 +682,17 @@ async fn accept_pending_device(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    let pending = state.sync_engine.storage().get_pending_device(&id).ok().flatten();
     match state.sync_engine.storage().accept_pending_device(&id) {
-        Ok(_) => StatusCode::OK.into_response(),
+        Ok(_) => {
+            if let Some(p) = pending {
+                let _ = state.sync_engine.event_sender().send(CoreEvent::DevicePaired {
+                    device_id: p.device_id,
+                    name: p.name,
+                });
+            }
+            StatusCode::OK.into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -697,7 +763,28 @@ async fn get_conflict_details(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     match state.sync_engine.storage().get_conflict(&id) {
-        Ok(Some(c)) => Json(c).into_response(),
+        Ok(Some(c)) => {
+            let status = c.parsed_status();
+            let dto = ConflictDetailsDto {
+                conflict_id: c.conflict_id,
+                folder_id: c.folder_id,
+                relative_path: c.relative_path,
+                base_revision: c.base_revision,
+                local_revision: c.local_revision,
+                remote_revision: c.remote_revision,
+                staged_payload_path: c.staged_payload_path,
+                status: c.status,
+                detected_at: c.detected_at,
+                available_actions: status
+                    .available_actions()
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                is_terminal: status.is_terminal(),
+                state_description: status.description().to_string(),
+            };
+            Json(dto).into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, "Conflict not found").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -823,6 +910,26 @@ async fn resolve_conflict(
     Json(payload): Json<ResolveRequest>,
 ) -> impl IntoResponse {
     match state.sync_engine.conflict_engine().resolve(&id, &payload) {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+async fn ignore_conflict(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match state.sync_engine.conflict_engine().ignore(&id) {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+async fn reopen_conflict(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match state.sync_engine.conflict_engine().reopen(&id) {
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }

@@ -75,6 +75,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: ConflictCommands,
     },
+    /// Manage cluster devices and pending pairing requests
+    Devices {
+        #[command(subcommand)]
+        cmd: DeviceCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -111,6 +116,35 @@ enum ConflictCommands {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum DeviceCommands {
+    /// Show this device's own ID and identity information
+    Id,
+    /// List all paired cluster devices
+    List,
+    /// List incoming pending device pairing requests
+    Pending,
+    /// Accept a pending device pairing request
+    Accept {
+        #[arg(short, long)]
+        id: String,
+    },
+    /// Reject a pending device pairing request
+    Reject {
+        #[arg(short, long)]
+        id: String,
+    },
+    /// Manually pair a remote device by its Device ID
+    Add {
+        #[arg(short, long)]
+        id: String,
+        #[arg(short, long)]
+        name: String,
+        #[arg(short, long, default_value = "dynamic")]
+        address: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let subscriber = FmtSubscriber::builder()
@@ -135,6 +169,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     if let Some(dev) = cli.device_name {
         config.device_name = dev;
+    }
+
+    if !matches!(cli.command, Some(Commands::Status { .. })) {
+        let _ = std::fs::create_dir_all(&config.home_dir);
     }
 
     match cli.command {
@@ -208,6 +246,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         merged_content: None,
                     })?;
                     println!("Conflict '{}' successfully resolved.", id);
+                }
+            }
+            Ok(())
+        }
+        Some(Commands::Devices { cmd }) => {
+            let storage = synapse_core::storage::StorageEngine::new(&config.home_dir)?;
+            match cmd {
+                DeviceCommands::Id => {
+                    let identity = synapse_core::p2p::NodeIdentity::load_or_generate(&config.home_dir)?;
+                    println!("Device Name:         {}", config.device_name);
+                    println!("Device ID:           {}", identity.formatted_id);
+                    println!("Raw Key Fingerprint: {}", identity.device_id);
+                }
+                DeviceCommands::List => {
+                    let list = storage.list_devices()?;
+                    if list.is_empty() {
+                        println!("No paired devices configured.");
+                    } else {
+                        println!("{:<35} {:<20} {:<10} {:<10}", "DEVICE ID", "NAME", "PAUSED", "TRUSTED");
+                        println!("{:-<80}", "");
+                        for d in list {
+                            println!("{:<35} {:<20} {:<10} {:<10}", d.device_id, d.name, d.is_paused, d.is_trusted);
+                        }
+                    }
+                }
+                DeviceCommands::Pending => {
+                    let list = storage.list_pending_devices()?;
+                    if list.is_empty() {
+                        println!("No pending device pairing requests.");
+                    } else {
+                        println!("{:<35} {:<20} {:<25}", "DEVICE ID", "NAME", "ADDRESS");
+                        println!("{:-<85}", "");
+                        for d in list {
+                            println!("{:<35} {:<20} {:<25}", d.device_id, d.name, d.address);
+                        }
+                        println!("\nTo accept a device: synapse-core devices accept --id <DEVICE_ID>");
+                    }
+                }
+                DeviceCommands::Accept { id } => {
+                    storage.accept_pending_device(&id)?;
+                    println!("Successfully accepted and paired device: {}", id);
+                }
+                DeviceCommands::Reject { id } => {
+                    storage.reject_pending_device(&id)?;
+                    println!("Rejected pending device: {}", id);
+                }
+                DeviceCommands::Add { id, name, address } => {
+                    let dev = synapse_core::storage::DeviceRecord {
+                        device_id: id.clone(),
+                        name,
+                        addresses: vec![address],
+                        is_paused: false,
+                        is_trusted: true,
+                        introducer: false,
+                        cert_name: None,
+                        created_at: chrono::Utc::now().timestamp(),
+                    };
+                    storage.add_device(&dev)?;
+                    println!("Successfully added and paired device: {}", id);
                 }
             }
             Ok(())

@@ -103,6 +103,12 @@ pub enum CoreEvent {
         device_id: String,
         name: String,
     },
+    #[serde(rename = "DEVICE_PENDING")]
+    DevicePending {
+        device_id: String,
+        name: String,
+        address: String,
+    },
     #[serde(rename = "REMOTE_INDEX_UPDATED")]
     RemoteIndexUpdated {
         device_id: String,
@@ -367,6 +373,28 @@ impl ConflictEngine {
             None => return Err(format!("Conflict ID not found: {}", conflict_id).into()),
         };
 
+        // State Machine Transition Guard: Enforces valid lifecycle transitions
+        let current_status = conflict.parsed_status();
+        if !current_status.can_transition_to(crate::state::ConflictStatus::Resolved) {
+            return Err(Box::new(crate::state::StateTransitionError {
+                entity: "conflict".to_string(),
+                entity_id: conflict_id.to_string(),
+                current_state: current_status.as_str().to_string(),
+                attempted_transition: crate::state::ConflictStatus::Resolved.as_str().to_string(),
+                allowed_transitions: current_status
+                    .allowed_transitions()
+                    .into_iter()
+                    .map(|s| s.as_str().to_string())
+                    .collect(),
+                available_actions: current_status
+                    .available_actions()
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                is_terminal: current_status.is_terminal(),
+            }));
+        }
+
         let folder = match self.storage.get_folder(&conflict.folder_id)? {
             Some(f) => f,
             None => return Err(format!("Folder not found: {}", conflict.folder_id).into()),
@@ -485,6 +513,70 @@ impl ConflictEngine {
             action: format!("{:?}", req.action),
         });
 
+        Ok(())
+    }
+
+    /// Ignores or dismisses a quarantined conflict.
+    pub fn ignore(&self, conflict_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conflict = match self.storage.get_conflict(conflict_id)? {
+            Some(c) => c,
+            None => return Err(format!("Conflict ID not found: {}", conflict_id).into()),
+        };
+
+        let current_status = conflict.parsed_status();
+        if !current_status.can_transition_to(crate::state::ConflictStatus::Ignored) {
+            return Err(Box::new(crate::state::StateTransitionError {
+                entity: "conflict".to_string(),
+                entity_id: conflict_id.to_string(),
+                current_state: current_status.as_str().to_string(),
+                attempted_transition: crate::state::ConflictStatus::Ignored.as_str().to_string(),
+                allowed_transitions: current_status
+                    .allowed_transitions()
+                    .into_iter()
+                    .map(|s| s.as_str().to_string())
+                    .collect(),
+                available_actions: current_status
+                    .available_actions()
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                is_terminal: current_status.is_terminal(),
+            }));
+        }
+
+        self.storage.ignore_conflict(conflict_id)?;
+        Ok(())
+    }
+
+    /// Reopens an ignored conflict back to PENDING.
+    pub fn reopen(&self, conflict_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conflict = match self.storage.get_conflict(conflict_id)? {
+            Some(c) => c,
+            None => return Err(format!("Conflict ID not found: {}", conflict_id).into()),
+        };
+
+        let current_status = conflict.parsed_status();
+        if !current_status.can_transition_to(crate::state::ConflictStatus::Pending) {
+            return Err(Box::new(crate::state::StateTransitionError {
+                entity: "conflict".to_string(),
+                entity_id: conflict_id.to_string(),
+                current_state: current_status.as_str().to_string(),
+                attempted_transition: crate::state::ConflictStatus::Pending.as_str().to_string(),
+                allowed_transitions: current_status
+                    .allowed_transitions()
+                    .into_iter()
+                    .map(|s| s.as_str().to_string())
+                    .collect(),
+                available_actions: current_status
+                    .available_actions()
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                is_terminal: current_status.is_terminal(),
+            }));
+        }
+
+        self.storage.reopen_conflict(conflict_id)?;
         Ok(())
     }
 }

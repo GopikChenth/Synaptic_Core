@@ -33,7 +33,7 @@ use tracing::{info, warn};
 use crate::conflict::CoreEvent;
 use crate::dag::RevisionNode;
 use crate::engine::SyncEngine;
-use crate::p2p::identity::NodeIdentity;
+pub use crate::p2p::identity::NodeIdentity;
 use crate::storage::{
     FileRecord, IntroducedDevice, IntroducerPropagationResult, PendingDeviceRecord, RevisionRecord,
 };
@@ -195,12 +195,27 @@ impl P2PManager {
                                 }
                                 Ok(None) => {
                                     // Unknown peer: record in pending pairing requests
+                                    let is_new_pending = storage_listener
+                                        .get_pending_device(&peer.device_id)
+                                        .map(|p| p.is_none())
+                                        .unwrap_or(true);
                                     let _ = storage_listener.add_pending_device(&PendingDeviceRecord {
                                         device_id: peer.device_id.clone(),
                                         name: peer.device_name.clone(),
                                         address: peer_addr.to_string(),
                                         received_at: chrono::Utc::now().timestamp_millis(),
                                     });
+                                    if is_new_pending {
+                                        info!(
+                                            "New incoming pairing request discovered from {} ({}) at {}",
+                                            peer.device_name, peer.device_id, peer_addr
+                                        );
+                                        let _ = event_sender.send(CoreEvent::DevicePending {
+                                            device_id: peer.device_id.clone(),
+                                            name: peer.device_name.clone(),
+                                            address: peer_addr.to_string(),
+                                        });
+                                    }
                                     false
                                 }
                                 Err(_) => false,
@@ -366,18 +381,59 @@ impl P2PManager {
                 if !cluster_devices.is_empty() {
                     let _ = self.handle_cluster_announcement(&device_id, &cluster_devices, false);
                 }
+                let storage = self.sync_engine.storage();
+                let is_paired = match storage.get_device(&device_id) {
+                    Ok(Some(dev)) => !dev.is_paused,
+                    _ => false,
+                };
+
+                if !is_paired {
+                    let peer_addr_str = peer_addr.map(|a| a.to_string()).unwrap_or_else(|| "dynamic".into());
+                    let is_new_pending = storage
+                        .get_pending_device(&device_id)
+                        .map(|p| p.is_none())
+                        .unwrap_or(true);
+
+                    let _ = storage.add_pending_device(&PendingDeviceRecord {
+                        device_id: device_id.clone(),
+                        name: device_name.clone(),
+                        address: peer_addr_str.clone(),
+                        received_at: chrono::Utc::now().timestamp_millis(),
+                    });
+
+                    if is_new_pending {
+                        info!(
+                            "Incoming QUIC Hello from unknown peer: staging pending pairing for {} ({}) at {}",
+                            device_name, device_id, peer_addr_str
+                        );
+                        let _ = self.event_sender.send(CoreEvent::DevicePending {
+                            device_id: device_id.clone(),
+                            name: device_name.clone(),
+                            address: peer_addr_str,
+                        });
+                    }
+                }
+
                 if let Some(addr) = peer_addr {
                     let mut map = self.peers.lock().await;
+                    let is_new = !map.contains_key(&device_id);
                     map.insert(
                         device_id.clone(),
                         PeerInfo {
-                            device_id,
-                            device_name,
+                            device_id: device_id.clone(),
+                            device_name: device_name.clone(),
                             addr,
                             last_seen: std::time::Instant::now(),
                         },
                     );
                     self.peer_count.store(map.len(), Ordering::Relaxed);
+
+                    if is_new && is_paired {
+                        let _ = self.event_sender.send(CoreEvent::PeerConnected {
+                            peer_id: device_id,
+                            addr: addr.to_string(),
+                        });
+                    }
                 }
                 Ok(None)
             }

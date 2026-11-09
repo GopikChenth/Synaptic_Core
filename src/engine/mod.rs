@@ -17,12 +17,16 @@ use tracing::{info, warn};
 
 use crate::chunker::Chunker;
 use crate::conflict::{ConflictEngine, CoreEvent};
+use std::collections::HashMap;
+use std::sync::RwLock;
+
 use crate::dag::{LcaResult, MerkleDag, RevisionNode};
 use crate::engine::fs_utils::{
     archive_file_version, atomic_write_file, ensure_folder_marker, sanitize_relative_path,
     verify_folder_marker,
 };
 use crate::engine::ignore::IgnoreEngine;
+use crate::state::FolderSyncState;
 use crate::storage::{FileRecord, RevisionRecord, StorageEngine};
 
 #[derive(Clone)]
@@ -32,6 +36,7 @@ pub struct SyncEngine {
     conflict_engine: Arc<ConflictEngine>,
     event_sender: broadcast::Sender<CoreEvent>,
     device_id: String,
+    folder_states: Arc<RwLock<HashMap<String, FolderSyncState>>>,
 }
 
 impl SyncEngine {
@@ -47,6 +52,29 @@ impl SyncEngine {
             conflict_engine,
             event_sender,
             device_id,
+            folder_states: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Queries the dynamic operational state of a folder.
+    pub fn get_folder_state(&self, folder_id: &str) -> FolderSyncState {
+        if let Ok(Some(folder)) = self.storage.get_folder(folder_id) {
+            if folder.is_paused {
+                return FolderSyncState::Paused;
+            }
+        }
+        if let Ok(states) = self.folder_states.read() {
+            if let Some(&state) = states.get(folder_id) {
+                return state;
+            }
+        }
+        FolderSyncState::Idle
+    }
+
+    /// Sets the dynamic operational state of a folder.
+    pub fn set_folder_state(&self, folder_id: &str, state: FolderSyncState) {
+        if let Ok(mut states) = self.folder_states.write() {
+            states.insert(folder_id.to_string(), state);
         }
     }
 
@@ -97,9 +125,12 @@ impl SyncEngine {
         };
 
         if folder.is_paused {
+            self.set_folder_state(folder_id, FolderSyncState::Paused);
             info!("Folder {} is paused; skipping indexing", folder_id);
             return Ok(0);
         }
+
+        self.set_folder_state(folder_id, FolderSyncState::Scanning);
 
         let base_path = PathBuf::from(&folder.local_path);
         if !base_path.exists() {
@@ -111,6 +142,7 @@ impl SyncEngine {
             let _ = ensure_folder_marker(&base_path, &folder.marker_name);
             if let Err(e2) = verify_folder_marker(&base_path, &folder.marker_name) {
                 warn!("Mount safety check failed for folder {}: {}", folder_id, e2);
+                self.set_folder_state(folder_id, FolderSyncState::Error);
                 return Err(Box::new(e2));
             }
         }
@@ -157,6 +189,7 @@ impl SyncEngine {
             }
         }
 
+        self.set_folder_state(folder_id, FolderSyncState::Idle);
         Ok(indexed_count)
     }
 
@@ -173,7 +206,7 @@ impl SyncEngine {
         };
 
         // If folder is ReceiveOnly, do NOT index or propagate local changes to peers
-        if folder.sync_mode.eq_ignore_ascii_case("ReceiveOnly") {
+        if !folder.parsed_sync_mode().can_send() {
             info!("Folder {} is ReceiveOnly; ignoring local changes in {}", folder_id, relative_path);
             return Ok(false);
         }
@@ -271,10 +304,12 @@ impl SyncEngine {
         };
 
         // If folder is SendOnly, reject incoming modifications from remote peers
-        if folder.sync_mode.eq_ignore_ascii_case("SendOnly") {
+        if !folder.parsed_sync_mode().can_receive() {
             warn!("Folder {} is SendOnly; rejecting incoming remote changes for {}", folder_id, relative_path);
             return Ok(());
         }
+
+        self.set_folder_state(folder_id, FolderSyncState::Syncing);
 
         let rel_clean = sanitize_relative_path(relative_path);
         let base_path = PathBuf::from(&folder.local_path);
@@ -396,6 +431,7 @@ impl SyncEngine {
             }
         }
 
+        self.set_folder_state(folder_id, FolderSyncState::Idle);
         Ok(())
     }
 

@@ -1386,3 +1386,330 @@ async fn test_websocket_realtime_event_streaming() {
     assert!(res_str_rest.contains("101 Switching Protocols"));
     assert!(res_str_rest.to_lowercase().contains("upgrade: websocket"));
 }
+
+// =============================================================================
+// TEST 9: FORMAL STATE MACHINE ARCHITECTURE (UX, DX, AX ELEVATION)
+// =============================================================================
+
+#[tokio::test]
+async fn test_state_machine_architecture_ux_dx_ax() {
+    let harness = TestHarness::new();
+    let router = ApiServer::create_router(harness.app_state.clone());
+
+    // -------------------------------------------------------------------------
+    // 1. AX Introspection Endpoint (/api/v1/system/statemachines & /rest/*)
+    // -------------------------------------------------------------------------
+    let req = Request::builder()
+        .uri("/api/v1/system/statemachines")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let machines: Vec<synapse_core::state::StateMachineDef> = serde_json::from_slice(&body).unwrap();
+
+    assert!(machines.len() >= 5);
+    let conflict_sm = machines.iter().find(|m| m.machine_id == "conflict_lifecycle").expect("conflict_lifecycle machine must exist");
+    assert_eq!(conflict_sm.initial_state, "PENDING");
+    assert!(conflict_sm.states.iter().any(|s| s.state == "PENDING" && !s.is_terminal && s.available_actions.contains(&"ACCEPT_LOCAL".to_string())));
+    assert!(conflict_sm.states.iter().any(|s| s.state == "RESOLVED" && s.is_terminal && s.available_actions.is_empty()));
+
+    // Verify alias route /rest/system/statemachines
+    let req_rest = Request::builder()
+        .uri("/rest/system/statemachines")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res_rest = router.clone().oneshot(req_rest).await.unwrap();
+    assert_eq!(res_rest.status(), StatusCode::OK);
+
+    // -------------------------------------------------------------------------
+    // 2. Conflict State Machine: Double-Resolution Guard & Affordance Metadata
+    // -------------------------------------------------------------------------
+    let folder_path = harness.temp_dir.join("sm_test_vault");
+    fs::create_dir_all(&folder_path).unwrap();
+    let folder_id = "sm_vault";
+    harness.storage.add_folder(&FolderRecord::new(folder_id, folder_path.to_string_lossy())).unwrap();
+
+    let cnf_id = harness.stage_conflict(
+        folder_id,
+        "guard_test.txt",
+        "base v1\n",
+        "local v2\n",
+        "remote v2\n",
+        "peer_author_x",
+    );
+
+    // Inspect conflict details - verify affordances (AX)
+    let req_det = Request::builder()
+        .uri(format!("/api/v1/conflicts/{}", cnf_id))
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res_det = router.clone().oneshot(req_det).await.unwrap();
+    assert_eq!(res_det.status(), StatusCode::OK);
+    let det_body = axum::body::to_bytes(res_det.into_body(), usize::MAX).await.unwrap();
+    let det_json: serde_json::Value = serde_json::from_slice(&det_body).unwrap();
+    assert_eq!(det_json["status"], "PENDING");
+    assert_eq!(det_json["is_terminal"], false);
+    let actions = det_json["available_actions"].as_array().unwrap();
+    assert!(actions.iter().any(|a| a == "ACCEPT_LOCAL"));
+    assert!(actions.iter().any(|a| a == "ACCEPT_REMOTE"));
+
+    // First resolution: ACCEPT_LOCAL (Legal transition: PENDING -> RESOLVED)
+    let resolve_req = ResolveRequest {
+        action: ResolveAction::AcceptLocal,
+        merged_content: None,
+    };
+    let req_res = Request::builder()
+        .uri(format!("/api/v1/conflicts/{}/resolve", cnf_id))
+        .method("POST")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&resolve_req).unwrap()))
+        .unwrap();
+    let res_res = router.clone().oneshot(req_res).await.unwrap();
+    assert_eq!(res_res.status(), StatusCode::OK);
+
+    // Verify conflict is now in terminal RESOLVED state
+    let req_det_after = Request::builder()
+        .uri(format!("/api/v1/conflicts/{}", cnf_id))
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res_det_after = router.clone().oneshot(req_det_after).await.unwrap();
+    assert_eq!(res_det_after.status(), StatusCode::OK);
+    let det_after_body = axum::body::to_bytes(res_det_after.into_body(), usize::MAX).await.unwrap();
+    let det_after_json: serde_json::Value = serde_json::from_slice(&det_after_body).unwrap();
+    assert_eq!(det_after_json["status"], "RESOLVED");
+    assert_eq!(det_after_json["is_terminal"], true);
+    assert_eq!(det_after_json["available_actions"].as_array().unwrap().len(), 0);
+
+    // Second resolution attempt: must be REJECTED by transition guard (UX & DX Safety)
+    let req_double_res = Request::builder()
+        .uri(format!("/api/v1/conflicts/{}/resolve", cnf_id))
+        .method("POST")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&resolve_req).unwrap()))
+        .unwrap();
+    let res_double = router.clone().oneshot(req_double_res).await.unwrap();
+    assert_eq!(res_double.status(), StatusCode::BAD_REQUEST);
+    let err_body = axum::body::to_bytes(res_double.into_body(), usize::MAX).await.unwrap();
+    let err_str = String::from_utf8_lossy(&err_body);
+    assert!(err_str.contains("Invalid state transition"));
+    assert!(err_str.contains("RESOLVED"));
+
+    // -------------------------------------------------------------------------
+    // 3. Conflict Ignore and Reopen Workflow
+    // -------------------------------------------------------------------------
+    let cnf_id_2 = harness.stage_conflict(
+        folder_id,
+        "ignore_test.txt",
+        "base orig\n",
+        "local mod\n",
+        "remote mod\n",
+        "peer_author_y",
+    );
+
+    // Ignore conflict
+    let req_ignore = Request::builder()
+        .uri(format!("/api/v1/conflicts/{}/ignore", cnf_id_2))
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    let res_ignore = router.clone().oneshot(req_ignore).await.unwrap();
+    assert_eq!(res_ignore.status(), StatusCode::OK);
+
+    let conflict_rec = harness.storage.get_conflict(&cnf_id_2).unwrap().unwrap();
+    assert_eq!(conflict_rec.status, "IGNORED");
+    assert_eq!(conflict_rec.parsed_status(), synapse_core::state::ConflictStatus::Ignored);
+
+    // Reopen conflict back to PENDING
+    let req_reopen = Request::builder()
+        .uri(format!("/api/v1/conflicts/{}/reopen", cnf_id_2))
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    let res_reopen = router.clone().oneshot(req_reopen).await.unwrap();
+    assert_eq!(res_reopen.status(), StatusCode::OK);
+
+    let conflict_reopened = harness.storage.get_conflict(&cnf_id_2).unwrap().unwrap();
+    assert_eq!(conflict_reopened.status, "PENDING");
+    assert_eq!(conflict_reopened.parsed_status(), synapse_core::state::ConflictStatus::Pending);
+
+    // -------------------------------------------------------------------------
+    // 4. Dynamic Folder & System Sync State
+    // -------------------------------------------------------------------------
+    let req_status = Request::builder()
+        .uri(format!("/api/v1/folders/{}/status", folder_id))
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res_status = router.clone().oneshot(req_status).await.unwrap();
+    assert_eq!(res_status.status(), StatusCode::OK);
+    let body_st = axum::body::to_bytes(res_status.into_body(), usize::MAX).await.unwrap();
+    let metrics: FolderStatusMetrics = serde_json::from_slice(&body_st).unwrap();
+    assert_eq!(metrics.state, "idle");
+
+    // Manually set folder to scanning
+    harness.sync_engine.set_folder_state(folder_id, synapse_core::state::FolderSyncState::Scanning);
+    let req_scanning = Request::builder()
+        .uri(format!("/api/v1/folders/{}/status", folder_id))
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res_scanning = router.clone().oneshot(req_scanning).await.unwrap();
+    let body_sc = axum::body::to_bytes(res_scanning.into_body(), usize::MAX).await.unwrap();
+    let metrics_sc: FolderStatusMetrics = serde_json::from_slice(&body_sc).unwrap();
+    assert_eq!(metrics_sc.state, "scanning");
+
+    // System status dynamically reflects scanning state
+    let req_sys = Request::builder()
+        .uri("/api/v1/system/status")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res_sys = router.clone().oneshot(req_sys).await.unwrap();
+    let sys_body = axum::body::to_bytes(res_sys.into_body(), usize::MAX).await.unwrap();
+    let sys_status: SystemStatusResponse = serde_json::from_slice(&sys_body).unwrap();
+    assert_eq!(sys_status.sync_state, "SCANNING");
+
+    // Reset back to idle
+    harness.sync_engine.set_folder_state(folder_id, synapse_core::state::FolderSyncState::Idle);
+
+    // -------------------------------------------------------------------------
+    // 5. Swarm Scheduler Chunk State Introspection
+    // -------------------------------------------------------------------------
+    let mut scheduler = synapse_core::p2p::SwarmScheduler::new(synapse_core::p2p::PullOrder::Alphabetical);
+    scheduler.register_peer("peer_alpha", vec!["chunk_001"]);
+    scheduler.queue_file("test", "f1.bin", 1024, 1, vec!["chunk_001".into()]);
+
+    // Initial state: Pending
+    let st1 = scheduler.get_chunk_state("chunk_001").expect("chunk_001 must exist");
+    assert_eq!(st1, synapse_core::state::ChunkDownloadState::Pending);
+
+    // Scheduled: InFlight
+    let assignment = scheduler.schedule_next().expect("assignment must exist");
+    assert_eq!(assignment.peer_id, "peer_alpha");
+    let st2 = scheduler.get_chunk_state("chunk_001").expect("chunk_001 must exist");
+    match st2 {
+        synapse_core::state::ChunkDownloadState::InFlight { peer_id, .. } => {
+            assert_eq!(peer_id, "peer_alpha");
+        }
+        other => panic!("Expected InFlight, got {:?}", other),
+    }
+
+    // Chunk received: Completed
+    scheduler.mark_completed("chunk_001");
+    let st3 = scheduler.get_chunk_state("chunk_001").expect("chunk_001 must exist");
+    assert_eq!(st3, synapse_core::state::ChunkDownloadState::Completed);
+
+    // -------------------------------------------------------------------------
+    // 6. Relay Session State Transition Verification
+    // -------------------------------------------------------------------------
+    let mut session = synapse_core::p2p::relay::RelaySession::new(
+        "sess_01".into(),
+        "dev_a".into(),
+        "dev_b".into(),
+        "127.0.0.1:443".into(),
+    );
+    assert_eq!(session.state, synapse_core::p2p::relay::RelaySessionState::Disconnected);
+
+    // Legal transition: Disconnected -> Connecting
+    assert!(session.transition_to(synapse_core::p2p::relay::RelaySessionState::Connecting).is_ok());
+    assert_eq!(session.state, synapse_core::p2p::relay::RelaySessionState::Connecting);
+
+    // Legal transition: Connecting -> Joined
+    assert!(session.transition_to(synapse_core::p2p::relay::RelaySessionState::Joined).is_ok());
+
+    // Illegal transition: Joined -> Disconnected (invalid jump without Closing)
+    assert!(session.transition_to(synapse_core::p2p::relay::RelaySessionState::Disconnected).is_err());
+    assert_eq!(session.state, synapse_core::p2p::relay::RelaySessionState::Joined);
+
+    // Legal transition: Joined -> Active -> Closed
+    assert!(session.transition_to(synapse_core::p2p::relay::RelaySessionState::Active).is_ok());
+    assert!(session.transition_to(synapse_core::p2p::relay::RelaySessionState::Closed).is_ok());
+    assert_eq!(session.state, synapse_core::p2p::relay::RelaySessionState::Closed);
+}
+
+// =============================================================================
+// TEST 10: MOBILE PAIRING DISCOVERY, EVENT BROADCAST & ACCEPTANCE WORKFLOW
+// =============================================================================
+
+#[tokio::test]
+async fn test_mobile_pairing_event_and_acceptance_workflow() {
+    let harness = TestHarness::new();
+    let router = ApiServer::create_router(harness.app_state.clone());
+    let mut rx_events = harness.sync_engine.event_sender().subscribe();
+
+    // 1. Simulate mobile peer connecting or broadcasting on local network
+    let mobile_id = "MOBILE-DEV-1234-5678";
+    let mobile_name = "Pixel 8 Pro";
+    let mobile_addr = "192.168.1.150:9190";
+
+    // Stage pending device into storage and broadcast DevicePending event
+    let pending_rec = PendingDeviceRecord {
+        device_id: mobile_id.into(),
+        name: mobile_name.into(),
+        address: mobile_addr.into(),
+        received_at: chrono::Utc::now().timestamp(),
+    };
+    harness.storage.add_pending_device(&pending_rec).unwrap();
+    let _ = harness.sync_engine.event_sender().send(synapse_core::conflict::CoreEvent::DevicePending {
+        device_id: mobile_id.into(),
+        name: mobile_name.into(),
+        address: mobile_addr.into(),
+    });
+
+    // 2. Verify WebSocket/event bus receives DevicePending event
+    let event1 = rx_events.recv().await.expect("Expected DevicePending event");
+    match event1 {
+        synapse_core::conflict::CoreEvent::DevicePending { device_id, name, address } => {
+            assert_eq!(device_id, mobile_id);
+            assert_eq!(name, mobile_name);
+            assert_eq!(address, mobile_addr);
+        }
+        other => panic!("Expected DevicePending, got {:?}", other),
+    }
+
+    // 3. Verify pending device is visible via GET /api/v1/cluster/pending/devices
+    let req_pending = Request::builder()
+        .uri("/api/v1/cluster/pending/devices")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res_pending = router.clone().oneshot(req_pending).await.unwrap();
+    assert_eq!(res_pending.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res_pending.into_body(), usize::MAX).await.unwrap();
+    let pending_list: Vec<PendingDeviceRecord> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(pending_list.len(), 1);
+    assert_eq!(pending_list[0].device_id, mobile_id);
+
+    // 4. Accept pending mobile device via POST /api/v1/cluster/pending/devices/:id/accept
+    let accept_uri = format!("/api/v1/cluster/pending/devices/{}/accept", mobile_id);
+    let req_accept = Request::builder()
+        .uri(&accept_uri)
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    let res_accept = router.clone().oneshot(req_accept).await.unwrap();
+    assert_eq!(res_accept.status(), StatusCode::OK);
+
+    // 5. Verify DevicePaired event is broadcasted over the event bus
+    let event2 = rx_events.recv().await.expect("Expected DevicePaired event");
+    match event2 {
+        synapse_core::conflict::CoreEvent::DevicePaired { device_id, name } => {
+            assert_eq!(device_id, mobile_id);
+            assert_eq!(name, mobile_name);
+        }
+        other => panic!("Expected DevicePaired, got {:?}", other),
+    }
+
+    // 6. Verify device is now active in storage and pending list is cleared
+    let devices = harness.storage.list_devices().unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].device_id, mobile_id);
+    assert_eq!(devices[0].name, mobile_name);
+    assert!(harness.storage.list_pending_devices().unwrap().is_empty());
+}
