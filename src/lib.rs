@@ -52,8 +52,8 @@ impl Default for SynapseConfig {
         Self {
             home_dir: home,
             api_addr: SocketAddr::from(([127, 0, 0, 1], 9090)),
-            p2p_port: 9190,
-            discovery_port: 21027,
+            p2p_port: crate::p2p::DEFAULT_P2P_PORT,
+            discovery_port: crate::p2p::DEFAULT_DISCOVERY_PORT,
             auth_token: None,
             device_name: get_default_device_name(),
         }
@@ -158,25 +158,23 @@ impl SynapseCore {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Starting Synapse Core engine...");
 
-        // 1. Start P2P local discovery
         self.p2p_manager.start_discovery(self.config.discovery_port);
 
-        // 2. Spawn watchers for existing folders
+        let mut _watchers = Vec::new();
         if let Ok(folders) = self.storage.list_folders() {
             for f in folders {
                 if !f.is_paused {
                     let engine = self.sync_engine.clone();
+                    let fid = f.folder_id.clone();
                     tokio::task::spawn_blocking(move || {
-                        let _ = engine.index_folder(&f.folder_id);
-                        let _watcher = engine.spawn_watcher(f.folder_id, f.local_path);
-                        // Keep watcher alive in background thread
-                        std::thread::park();
+                        let _ = engine.index_folder(&fid);
                     });
+                    let watcher = self.sync_engine.spawn_watcher(f.folder_id, f.local_path);
+                    _watchers.push(watcher);
                 }
             }
         }
 
-        // 3. Spawn QUIC server
         let p2p = self.p2p_manager.clone();
         tokio::spawn(async move {
             if let Err(e) = p2p.run_server().await {
@@ -184,7 +182,6 @@ impl SynapseCore {
             }
         });
 
-        // 4. Start local API server
         let api_server = ApiServer::new(
             self.sync_engine.clone(),
             self.config.api_addr,
@@ -202,8 +199,6 @@ impl SynapseCore {
 // =============================================================================
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
-#[allow(dead_code)]
-static mut RUNTIME: Option<Runtime> = None;
 
 /// Starts the Synapse Core daemon from C / JNI.
 ///
@@ -216,7 +211,7 @@ pub unsafe extern "C" fn synapse_start(
     p2p_port: c_int,
 ) -> c_int {
     if RUNNING.load(Ordering::SeqCst) {
-        return 0; // Already running
+        return 0;
     }
 
     if home_dir.is_null() {

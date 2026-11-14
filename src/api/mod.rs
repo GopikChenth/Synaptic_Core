@@ -435,15 +435,36 @@ async fn resume_folder(
     }
 }
 
+fn execute_folder_rescan(state: &AppState, folder_id: &str) {
+    let engine = state.sync_engine.clone();
+    let fid = folder_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _ = engine.index_folder(&fid);
+    });
+}
+
+fn fetch_folder_status(state: &AppState, folder_id: &str) -> axum::response::Response {
+    match state.sync_engine.storage().get_folder_status(folder_id) {
+        Ok(mut st) => {
+            st.state = state.sync_engine.get_folder_state(folder_id).as_str().to_string();
+            Json(st).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+fn fetch_folder_completion(state: &AppState, device_id: &str, folder_id: &str) -> axum::response::Response {
+    match state.sync_engine.storage().get_device_completion(device_id, folder_id) {
+        Ok(comp) => Json(comp).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 async fn rescan_folder(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let engine = state.sync_engine.clone();
-    let fid = id.clone();
-    tokio::task::spawn_blocking(move || {
-        let _ = engine.index_folder(&fid);
-    });
+    execute_folder_rescan(&state, &id);
     StatusCode::OK.into_response()
 }
 
@@ -452,11 +473,7 @@ async fn rescan_folder_query(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     if let Some(fid) = params.get("folder") {
-        let engine = state.sync_engine.clone();
-        let f = fid.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = engine.index_folder(&f);
-        });
+        execute_folder_rescan(&state, fid);
         StatusCode::OK.into_response()
     } else {
         (StatusCode::BAD_REQUEST, "Missing folder query parameter").into_response()
@@ -467,13 +484,7 @@ async fn get_folder_status(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    match state.sync_engine.storage().get_folder_status(&id) {
-        Ok(mut st) => {
-            st.state = state.sync_engine.get_folder_state(&id).as_str().to_string();
-            Json(st).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    fetch_folder_status(&state, &id)
 }
 
 async fn get_folder_status_query(
@@ -481,13 +492,7 @@ async fn get_folder_status_query(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     if let Some(fid) = params.get("folder") {
-        match state.sync_engine.storage().get_folder_status(fid) {
-            Ok(mut st) => {
-                st.state = state.sync_engine.get_folder_state(fid).as_str().to_string();
-                Json(st).into_response()
-            }
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        }
+        fetch_folder_status(&state, fid)
     } else {
         (StatusCode::BAD_REQUEST, "Missing folder query parameter").into_response()
     }
@@ -497,11 +502,7 @@ async fn get_folder_completion(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let dev_id = state.sync_engine.device_id();
-    match state.sync_engine.storage().get_device_completion(dev_id, &id) {
-        Ok(comp) => Json(comp).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    fetch_folder_completion(&state, state.sync_engine.device_id(), &id)
 }
 
 async fn get_folder_completion_query(
@@ -513,10 +514,7 @@ async fn get_folder_completion_query(
         None => return (StatusCode::BAD_REQUEST, "Missing folder parameter").into_response(),
     };
     let dev_id = params.get("device").cloned().unwrap_or_else(|| state.sync_engine.device_id().to_string());
-    match state.sync_engine.storage().get_device_completion(&dev_id, fid) {
-        Ok(comp) => Json(comp).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    fetch_folder_completion(&state, &dev_id, fid)
 }
 
 async fn list_folder_devices(
@@ -549,14 +547,25 @@ async fn unshare_folder_device(
     }
 }
 
+fn fetch_folder_ignores(state: &AppState, folder_id: &str) -> axum::response::Response {
+    match state.sync_engine.storage().get_folder_ignores(folder_id) {
+        Ok(patterns) => Json(IgnoresRequest { ignore: patterns }).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+fn save_folder_ignores(state: &AppState, folder_id: &str, patterns: &[String]) -> axum::response::Response {
+    match state.sync_engine.storage().set_folder_ignores(folder_id, patterns) {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 async fn get_folder_ignores(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    match state.sync_engine.storage().get_folder_ignores(&id) {
-        Ok(patterns) => Json(IgnoresRequest { ignore: patterns }).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    fetch_folder_ignores(&state, &id)
 }
 
 async fn set_folder_ignores(
@@ -564,10 +573,7 @@ async fn set_folder_ignores(
     State(state): State<AppState>,
     Json(payload): Json<IgnoresRequest>,
 ) -> impl IntoResponse {
-    match state.sync_engine.storage().set_folder_ignores(&id, &payload.ignore) {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    save_folder_ignores(&state, &id, &payload.ignore)
 }
 
 async fn get_folder_ignores_query(
@@ -575,10 +581,7 @@ async fn get_folder_ignores_query(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     if let Some(fid) = params.get("folder") {
-        match state.sync_engine.storage().get_folder_ignores(fid) {
-            Ok(patterns) => Json(IgnoresRequest { ignore: patterns }).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        }
+        fetch_folder_ignores(&state, fid)
     } else {
         (StatusCode::BAD_REQUEST, "Missing folder query parameter").into_response()
     }
@@ -590,10 +593,7 @@ async fn set_folder_ignores_query(
     Json(payload): Json<IgnoresRequest>,
 ) -> impl IntoResponse {
     if let Some(fid) = params.get("folder") {
-        match state.sync_engine.storage().set_folder_ignores(fid, &payload.ignore) {
-            Ok(_) => StatusCode::OK.into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        }
+        save_folder_ignores(&state, fid, &payload.ignore)
     } else {
         (StatusCode::BAD_REQUEST, "Missing folder query parameter").into_response()
     }

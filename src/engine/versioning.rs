@@ -523,22 +523,45 @@ pub fn cleanup_expired_versions_at(
         }
     }
 
-    // Remove empty directories left behind
     let _ = prune_empty_directories(&versions_dir);
 
     Ok(report)
 }
 
-/// Archives a file into `.synapse/versions/` respecting the folder's `VersioningPolicy`.
+/// Archives an existing file into `.synapse/versions/` respecting the folder's `VersioningPolicy`.
 pub fn archive_file(
     folder_root: &Path,
     relative_path: &str,
-    policy: &VersioningPolicy,
+    policy: Option<&VersioningPolicy>,
 ) -> Result<Option<PathBuf>, Box<dyn std::error::Error + Send + Sync>> {
-    if *policy == VersioningPolicy::None {
+    if let Some(p) = policy {
+        if *p == VersioningPolicy::None {
+            return Ok(None);
+        }
+    }
+    archive_file_version(folder_root, relative_path)
+}
+
+/// Archives an existing file into `.synapse/versions/` with a timestamp directory.
+pub fn archive_file_version(
+    folder_root: &Path,
+    relative_path: &str,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error + Send + Sync>> {
+    let source_path = folder_root.join(relative_path);
+    if !source_path.exists() {
         return Ok(None);
     }
-    crate::engine::fs_utils::archive_file_version(folder_root, relative_path)
+
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let versions_dir = folder_root.join(".synapse").join("versions").join(&timestamp);
+    let archive_path = versions_dir.join(relative_path);
+
+    if let Some(parent) = archive_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::copy(&source_path, &archive_path)?;
+    Ok(Some(archive_path))
 }
 
 #[cfg(test)]

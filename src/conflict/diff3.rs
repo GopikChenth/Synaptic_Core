@@ -127,14 +127,8 @@ pub fn merge3(base_str: &str, local_str: &str, remote_str: &str) -> MergeResult 
                 });
                 merged_output.extend(base_slice);
             }
-            (Some((ls, le, l_rep)), None) => {
-                // Local only modified
-                let l_slice = if *ls == b_start && *le == b_end {
-                    l_rep.clone()
-                } else {
-                    // Partial slice representation
-                    l_rep.clone()
-                };
+            (Some((_ls, _le, l_rep)), None) => {
+                let l_slice = l_rep.clone();
                 hunks.push(DiffHunk {
                     hunk_type: HunkType::LocalChange,
                     base_lines: base_slice.clone(),
@@ -143,13 +137,8 @@ pub fn merge3(base_str: &str, local_str: &str, remote_str: &str) -> MergeResult 
                 });
                 merged_output.extend(l_slice);
             }
-            (None, Some((rs, re, r_rep))) => {
-                // Remote only modified
-                let r_slice = if *rs == b_start && *re == b_end {
-                    r_rep.clone()
-                } else {
-                    r_rep.clone()
-                };
+            (None, Some((_rs, _re, r_rep))) => {
+                let r_slice = r_rep.clone();
                 hunks.push(DiffHunk {
                     hunk_type: HunkType::RemoteChange,
                     base_lines: base_slice.clone(),

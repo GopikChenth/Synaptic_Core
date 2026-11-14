@@ -24,10 +24,6 @@ struct Cli {
     #[arg(short = 'H', long, env = "SYNAPSE_HOME")]
     home: Option<PathBuf>,
 
-    /// Optional configuration file path
-    #[arg(short = 'c', long)]
-    config: Option<PathBuf>,
-
     /// Control plane HTTP & WebSocket API bind address
     #[arg(short = 'a', long, default_value = "127.0.0.1")]
     addr: String,
@@ -37,11 +33,11 @@ struct Cli {
     port: u16,
 
     /// P2P QUIC transport listening port
-    #[arg(long, default_value_t = 9190)]
+    #[arg(long, default_value_t = synapse_core::p2p::DEFAULT_P2P_PORT)]
     p2p_port: u16,
 
     /// Local UDP discovery broadcast port
-    #[arg(long, default_value_t = 21027)]
+    #[arg(long, default_value_t = synapse_core::p2p::DEFAULT_DISCOVERY_PORT)]
     discovery_port: u16,
 
     /// Security authentication token for API access
@@ -178,8 +174,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match cli.command {
         Some(Commands::Status { api }) => {
             println!("Querying Synapse Core status at {}", api);
-            // Quick client query
-            match reqwest_check(&api).await {
+            let url = format!("{}/api/v1/system/status", api);
+            match reqwest_minimal_get(url).await {
                 Ok(resp) => println!("{}", resp),
                 Err(e) => eprintln!("Unable to connect to daemon: {}", e),
             }
@@ -332,11 +328,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
     }
-}
-
-async fn reqwest_check(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let client = reqwest_minimal_get(format!("{}/api/v1/system/status", url)).await?;
-    Ok(client)
 }
 
 async fn reqwest_minimal_get(url: String) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {

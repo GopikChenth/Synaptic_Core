@@ -199,14 +199,6 @@ pub struct RevisionRecord {
     pub created_at: i64,
 }
 
-/// Content-Addressable Chunk metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkRecord {
-    pub chunk_hash: String,
-    pub size: usize,
-    pub ref_count: u64,
-}
-
 /// Staged quarantine conflict awaiting resolution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuarantineConflict {
@@ -1018,7 +1010,6 @@ impl StorageEngine {
             "INSERT OR IGNORE INTO folder_devices (folder_id, device_id) VALUES (?1, ?2)",
             params![folder_id, device_id],
         )?;
-        // Remove from pending
         conn.execute(
             "DELETE FROM pending_folders WHERE folder_id = ?1 AND device_id = ?2",
             params![folder_id, device_id],
@@ -1466,7 +1457,6 @@ impl StorageEngine {
     pub fn resolve_conflict(&self, conflict_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conflict = self.get_conflict(conflict_id)?;
         if let Some(c) = conflict {
-            // Delete staged quarantine file if present
             let path = PathBuf::from(&c.staged_payload_path);
             if path.exists() {
                 let _ = fs::remove_file(path);

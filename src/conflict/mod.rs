@@ -16,6 +16,7 @@ use tracing::{info, warn};
 
 use crate::chunker::Chunker;
 use crate::dag::RevisionNode;
+use crate::engine::fs_utils::atomic_write_file;
 use crate::storage::{FileRecord, RevisionRecord, StorageEngine};
 
 /// Event sent over WebSocket to UI clients.
@@ -256,12 +257,8 @@ impl ConflictEngine {
                         folder_id, relative_path
                     );
 
-                    // Write merged content atomically to disk
-                    let temp_file = full_local_path.with_extension("tmp_synapse");
-                    fs::write(&temp_file, merged_text.as_bytes())?;
-                    fs::rename(&temp_file, &full_local_path)?;
+                    atomic_write_file(&full_local_path, merged_text.as_bytes(), None, None)?;
 
-                    // Index the newly merged file with a 2-parent merge revision
                     let (chunks, manifest) = self.chunker.chunk_slice(merged_text.as_bytes());
                     for (info, data) in &chunks {
                         self.storage.put_chunk(&info.chunk_hash, data)?;
@@ -413,11 +410,8 @@ impl ConflictEngine {
                 let staged_path = PathBuf::from(&conflict.staged_payload_path);
                 if staged_path.exists() {
                     let remote_bytes = fs::read(&staged_path)?;
-                    let tmp = local_path.with_extension("tmp_synapse");
-                    fs::write(&tmp, &remote_bytes)?;
-                    fs::rename(&tmp, &local_path)?;
+                    atomic_write_file(&local_path, &remote_bytes, None, None)?;
 
-                    // Index newly accepted remote file
                     let (chunks, _manifest) = self.chunker.chunk_slice(&remote_bytes);
                     for (info, data) in &chunks {
                         self.storage.put_chunk(&info.chunk_hash, data)?;
@@ -441,9 +435,7 @@ impl ConflictEngine {
                     .as_ref()
                     .ok_or("merged_content required for CUSTOM_MERGE")?;
 
-                let tmp = local_path.with_extension("tmp_synapse");
-                fs::write(&tmp, content.as_bytes())?;
-                fs::rename(&tmp, &local_path)?;
+                atomic_write_file(&local_path, content.as_bytes(), None, None)?;
 
                 let (chunks, manifest) = self.chunker.chunk_slice(content.as_bytes());
                 for (info, data) in &chunks {

@@ -94,6 +94,15 @@ impl SyncEngine {
         &self.device_id
     }
 
+    /// Chunks a payload using FastCDC and commits all chunks into the CAS block store.
+    pub fn save_payload_chunks(&self, payload: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (chunks, _) = self.chunker.chunk_slice(payload);
+        for (info, data) in &chunks {
+            self.storage.put_chunk(&info.chunk_hash, data)?;
+        }
+        Ok(())
+    }
+
     /// Builds the IgnoreEngine for a folder by loading `.synapseignore`, `.stignore`, and DB rules.
     pub fn get_folder_ignore_engine(&self, folder_id: &str, local_path: &Path) -> IgnoreEngine {
         let mut engine = IgnoreEngine::new();
@@ -158,10 +167,8 @@ impl SyncEngine {
                 let file_name = entry.file_name();
                 let name_str = file_name.to_string_lossy();
 
-                // Skip internal metadata folders and hidden control files
                 if name_str.starts_with(".synapse")
                     || name_str.starts_with(".git")
-                    || name_str.ends_with(".tmp_synapse")
                     || name_str.starts_with(".stfolder")
                     || name_str == folder.marker_name
                 {
@@ -226,18 +233,16 @@ impl SyncEngine {
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
 
-        // Check if file is already up to date in database
         let existing = self.storage.get_file(folder_id, &rel_clean)?;
         if let Some(record) = &existing {
             if record.size == file_size && record.mtime_nanos == mtime_nanos && !record.is_deleted {
-                return Ok(false); // No changes detected
+                return Ok(false);
             }
         }
 
         let data = fs::read(&full_path)?;
         let (chunks, manifest_hash) = self.chunker.chunk_slice(&data);
 
-        // Store new chunks in CAS
         for (info, chunk_data) in &chunks {
             self.storage.put_chunk(&info.chunk_hash, chunk_data)?;
         }
@@ -338,14 +343,8 @@ impl SyncEngine {
 
         match local_file {
             None => {
-                // Completely new file remotely: fast-forward accept remote with atomic write
                 atomic_write_file(&local_path, remote_payload, Some(remote_rev.mtime_nanos), None)?;
-
-                // Save chunks in CAS
-                let (chunks, _) = self.chunker.chunk_slice(remote_payload);
-                for (info, data) in &chunks {
-                    self.storage.put_chunk(&info.chunk_hash, data)?;
-                }
+                self.save_payload_chunks(remote_payload)?;
 
                 self.storage.upsert_file(&FileRecord {
                     folder_id: folder_id.to_string(),
@@ -368,35 +367,27 @@ impl SyncEngine {
                 let lca = dag.find_lca(&existing.current_revision, &remote_rev.revision_hash);
 
                 match lca {
-                    LcaResult::Identical => {
-                        // Already identical; do nothing
-                    }
+                    LcaResult::Identical => {}
                     LcaResult::FastForwardLocal => {
-                        // Local has already superseded remote; keep local
                         info!(
                             "Local revision {} supersedes remote {}; keeping local",
                             existing.current_revision, remote_rev.revision_hash
                         );
                     }
                     LcaResult::FastForwardRemote => {
-                        // Remote is clean descendant of local; fast-forward remote
                         info!(
                             "Fast-forwarding remote revision {} over local {}",
                             remote_rev.revision_hash, existing.current_revision
                         );
 
-                        // File versioning archive if configured
                         if local_path.exists() && folder.versioning_type != "None" {
-                            let _ = archive_file_version(&base_path, &rel_clean);
+                            if let Err(e) = archive_file_version(&base_path, &rel_clean) {
+                                warn!("Failed to archive previous file version for {}/{}: {}", folder_id, rel_clean, e);
+                            }
                         }
 
-                        // Atomic staging write with timestamp preservation
                         atomic_write_file(&local_path, remote_payload, Some(remote_rev.mtime_nanos), None)?;
-
-                        let (chunks, _) = self.chunker.chunk_slice(remote_payload);
-                        for (info, data) in &chunks {
-                            self.storage.put_chunk(&info.chunk_hash, data)?;
-                        }
+                        self.save_payload_chunks(remote_payload)?;
 
                         self.storage.upsert_file(&FileRecord {
                             folder_id: folder_id.to_string(),
@@ -448,7 +439,7 @@ impl SyncEngine {
                         for path in event.paths {
                             if path.is_file() {
                                 let name = path.file_name().unwrap_or_default().to_string_lossy();
-                                if name.starts_with(".synapse") || name.ends_with(".tmp_synapse") {
+                                if name.starts_with(".synapse") {
                                     continue;
                                 }
                                 if let Ok(rel) = path.strip_prefix(&root_path) {

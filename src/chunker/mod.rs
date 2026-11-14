@@ -23,13 +23,6 @@ pub struct ChunkInfo {
     pub size: usize,
 }
 
-/// Result of chunking a byte payload: chunk metadata and raw payload slices.
-pub struct ChunkedFile {
-    pub chunks: Vec<ChunkInfo>,
-    pub total_size: u64,
-    pub manifest_hash: String,
-}
-
 /// Content-Defined Chunker utilizing FastCDC v2020 and BLAKE3.
 pub struct Chunker {
     min_size: usize,
@@ -57,7 +50,6 @@ impl Chunker {
         }
     }
 
-    /// Computes BLAKE3 cryptographic hash for a byte slice.
     pub fn hash_block(data: &[u8]) -> String {
         blake3::hash(data).to_hex().to_string()
     }

@@ -79,21 +79,18 @@ pub fn atomic_write_file(
     let temp_name = format!(".synapse.tmp.{}", uuid::Uuid::new_v4());
     let temp_path = parent.join(temp_name);
 
-    // 1. Write to temp file
     {
         let mut file = File::create(&temp_path)?;
         file.write_all(data)?;
         file.sync_all()?;
     }
 
-    // 2. Set POSIX permissions on Unix
     #[cfg(unix)]
     if let Some(mode) = _permissions {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&temp_path, fs::Permissions::from_mode(mode));
     }
 
-    // 3. Set modification timestamp if specified
     if let Some(nanos) = mtime_nanos {
         let secs = nanos / 1_000_000_000;
         let nsecs = (nanos % 1_000_000_000) as u32;
@@ -101,32 +98,11 @@ pub fn atomic_write_file(
         let _ = set_file_times(&temp_path, mtime, mtime);
     }
 
-    // 4. Atomic rename replaces destination in one atomic filesystem operation
     fs::rename(&temp_path, target_path)?;
     Ok(())
 }
 
-/// Archives an existing file to `.synapse/versions/` before overwriting or deleting it.
-pub fn archive_file_version(
-    folder_root: &Path,
-    relative_path: &str,
-) -> Result<Option<PathBuf>, Box<dyn std::error::Error + Send + Sync>> {
-    let source_path = folder_root.join(relative_path);
-    if !source_path.exists() {
-        return Ok(None);
-    }
-
-    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let versions_dir = folder_root.join(".synapse").join("versions").join(&timestamp);
-    let archive_path = versions_dir.join(relative_path);
-
-    if let Some(parent) = archive_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    fs::copy(&source_path, &archive_path)?;
-    Ok(Some(archive_path))
-}
+pub use crate::engine::versioning::archive_file_version;
 
 /// Sanitizes relative path to prevent directory traversal and strip Windows illegal characters.
 pub fn sanitize_relative_path(path_str: &str) -> String {
@@ -239,26 +215,19 @@ pub enum SpecialFileType {
     Hardlink { target: String },
 }
 
-/// Type alias for `SpecialFileType`.
-pub type SpecialFile = SpecialFileType;
-
 impl SpecialFileType {
-    /// Checks if this special file is a symlink.
     pub fn is_symlink(&self) -> bool {
         matches!(self, Self::Symlink { .. })
     }
 
-    /// Checks if this special file is a hardlink.
     pub fn is_hardlink(&self) -> bool {
         matches!(self, Self::Hardlink { .. })
     }
 
-    /// Checks if this is a standard regular file.
     pub fn is_regular(&self) -> bool {
         matches!(self, Self::Regular)
     }
 
-    /// Returns the link target, if any.
     pub fn target(&self) -> Option<&str> {
         match self {
             Self::Symlink { target } | Self::Hardlink { target } => Some(target.as_str()),
