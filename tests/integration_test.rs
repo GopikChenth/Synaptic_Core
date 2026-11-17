@@ -71,6 +71,7 @@ impl TestHarness {
             sync_engine: sync_engine.clone(),
             auth_token: None,
             peer_count: Arc::new(AtomicUsize::new(0)),
+            shutdown_tx: None,
         };
 
         Self {
@@ -465,6 +466,7 @@ async fn test_cluster_pairing_and_devices_all() {
         name: "MacBook Pro".into(),
         address: "192.168.1.50:9190".into(),
         received_at: 1000,
+        cert_pin: None,
     };
     harness.storage.add_pending_device(&pending_dev1).unwrap();
 
@@ -521,6 +523,7 @@ async fn test_cluster_pairing_and_devices_all() {
         name: "Unknown Node".into(),
         address: "10.10.10.10:9190".into(),
         received_at: 2000,
+        cert_pin: None,
     };
     harness.storage.add_pending_device(&pending_dev2).unwrap();
 
@@ -1287,7 +1290,11 @@ async fn test_websocket_realtime_event_streaming() {
     assert_eq!(res_ws_rest.status(), StatusCode::UPGRADE_REQUIRED);
 
     // 2. Live In-Process WebSocket Streaming Test over TCP
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("Bind WebSocket test listener: {error}"),
+    };
     let addr = listener.local_addr().unwrap();
     let app = ApiServer::create_router(harness.app_state.clone());
 
@@ -1654,6 +1661,7 @@ async fn test_mobile_pairing_event_and_acceptance_workflow() {
         name: mobile_name.into(),
         address: mobile_addr.into(),
         received_at: chrono::Utc::now().timestamp(),
+        cert_pin: None,
     };
     harness.storage.add_pending_device(&pending_rec).unwrap();
     let _ = harness.sync_engine.event_sender().send(synapse_core::conflict::CoreEvent::DevicePending {
@@ -1712,4 +1720,358 @@ async fn test_mobile_pairing_event_and_acceptance_workflow() {
     assert_eq!(devices[0].device_id, mobile_id);
     assert_eq!(devices[0].name, mobile_name);
     assert!(harness.storage.list_pending_devices().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_api_auth_token_cors_and_graceful_shutdown() {
+    let harness = TestHarness::new();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let mut secured_state = harness.app_state.clone();
+    secured_state.auth_token = Some("super-secret-token".to_string());
+    secured_state.shutdown_tx = Some(shutdown_tx);
+
+    let router = ApiServer::create_router(secured_state);
+
+    // 1. /api/v1/system/ping is exempt from auth for liveness checks
+    let res_ping = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/ping")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_ping.status(), StatusCode::OK);
+
+    // 2. Protected route without token -> 401 Unauthorized
+    let res_unauth = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/status")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_unauth.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. Protected route with wrong token -> 401 Unauthorized
+    let res_wrong = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/status")
+                .method("GET")
+                .header("Authorization", "Bearer wrong-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_wrong.status(), StatusCode::UNAUTHORIZED);
+
+    // 4. Protected route with Authorization: Bearer -> 200 OK
+    let res_bearer = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/status")
+                .method("GET")
+                .header("Authorization", "Bearer super-secret-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_bearer.status(), StatusCode::OK);
+
+    // 5. Protected route with X-API-Key -> 200 OK
+    let res_apikey = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/status")
+                .method("GET")
+                .header("X-API-Key", "super-secret-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_apikey.status(), StatusCode::OK);
+
+    // 6. Protected route with ?token= query param (WebSocket compatibility) -> 200 OK
+    let res_query = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/status?token=super-secret-token")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_query.status(), StatusCode::OK);
+
+    // 7. CORS allows localhost origin and blocks untrusted external origin
+    let res_cors_ok = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/ping")
+                .method("GET")
+                .header("Origin", "http://localhost:3000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res_cors_ok
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("http://localhost:3000")
+    );
+
+    let res_cors_blocked = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/ping")
+                .method("GET")
+                .header("Origin", "https://evil.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(res_cors_blocked
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
+
+    // 8. POST /api/v1/system/shutdown triggers graceful shutdown signal
+    assert!(!*shutdown_rx.borrow());
+    let res_shutdown = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/shutdown")
+                .method("POST")
+                .header("Authorization", "Bearer super-secret-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_shutdown.status(), StatusCode::OK);
+    assert!(*shutdown_rx.borrow());
+}
+
+#[tokio::test]
+async fn test_system_cas_garbage_collection_endpoints() {
+    let harness = TestHarness::new();
+    let router = ApiServer::create_router(harness.app_state.clone());
+
+    // 1. Put an orphan chunk directly with ref_count = 0
+    let orphan_hash = "dummy_orphan_chunk_001";
+    let orphan_data = b"unreferenced temporary block payload";
+    harness.storage.put_chunk(orphan_hash, orphan_data).unwrap();
+    assert!(harness.storage.get_chunk(orphan_hash).unwrap().is_some());
+
+    // 2. Call POST /api/v1/system/gc
+    let req = Request::builder()
+        .uri("/api/v1/system/gc")
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let gc_resp: synapse_core::api::GcResponse = serde_json::from_slice(&body).unwrap();
+    assert!(gc_resp.success);
+    assert!(gc_resp.collected_chunks >= 1);
+
+    // 3. Verify chunk removed from CAS
+    assert!(harness.storage.get_chunk(orphan_hash).unwrap().is_none());
+
+    // 4. Test alternate /rest/system/gc route
+    let req_rest = Request::builder()
+        .uri("/rest/system/gc")
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    let res_rest = router.oneshot(req_rest).await.unwrap();
+    assert_eq!(res_rest.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_end_to_end_peer_replication_and_deletion_tombstones() {
+    use synapse_core::p2p::{NodeIdentity, P2PManager, P2PMessage, TlsIdentity};
+
+    let temp_root = std::env::temp_dir().join(format!("synapse_e2e_{}", uuid::Uuid::new_v4()));
+    let home_a = temp_root.join("node_a");
+    let home_b = temp_root.join("node_b");
+    let sync_dir_a = home_a.join("synced");
+    let sync_dir_b = home_b.join("synced");
+    fs::create_dir_all(&sync_dir_a).unwrap();
+    fs::create_dir_all(&sync_dir_b).unwrap();
+    fs::create_dir_all(sync_dir_a.join(".synapse-folder")).unwrap();
+    fs::create_dir_all(sync_dir_b.join(".synapse-folder")).unwrap();
+
+    let storage_a = StorageEngine::new(&home_a).unwrap();
+    let storage_b = StorageEngine::new(&home_b).unwrap();
+
+    let identity_a = NodeIdentity::load_or_generate(&home_a).unwrap();
+    let tls_a = TlsIdentity::load_or_generate(&home_a).unwrap();
+    let identity_b = NodeIdentity::load_or_generate(&home_b).unwrap();
+    let tls_b = TlsIdentity::load_or_generate(&home_b).unwrap();
+
+    let (tx_a, _) = tokio::sync::broadcast::channel(64);
+    let (tx_b, _) = tokio::sync::broadcast::channel(64);
+
+    let conflict_a = Arc::new(ConflictEngine::new(storage_a.clone(), tx_a.clone(), identity_a.device_id.clone()));
+    let sync_engine_a = SyncEngine::new(storage_a.clone(), conflict_a, tx_a.clone(), identity_a.device_id.clone());
+
+    let conflict_b = Arc::new(ConflictEngine::new(storage_b.clone(), tx_b.clone(), identity_b.device_id.clone()));
+    let sync_engine_b = SyncEngine::new(storage_b.clone(), conflict_b, tx_b.clone(), identity_b.device_id.clone());
+
+    let p2p_a = P2PManager::new(
+        identity_a.clone(),
+        tls_a.clone(),
+        "Node-A".into(),
+        9871,
+        sync_engine_a.clone(),
+        Arc::new(AtomicUsize::new(0)),
+        tx_a,
+    );
+
+    let p2p_b = P2PManager::new(
+        identity_b.clone(),
+        tls_b.clone(),
+        "Node-B".into(),
+        9872,
+        sync_engine_b.clone(),
+        Arc::new(AtomicUsize::new(0)),
+        tx_b,
+    );
+
+    let folder_id = "test-folder-sync";
+    let folder_rec_a = FolderRecord::new(folder_id, sync_dir_a.to_string_lossy());
+    let folder_rec_b = FolderRecord::new(folder_id, sync_dir_b.to_string_lossy());
+    storage_a.add_folder(&folder_rec_a).unwrap();
+    storage_b.add_folder(&folder_rec_b).unwrap();
+
+    // 1. Pair Node A and Node B with certificate pins
+    let dev_b_on_a = DeviceRecord {
+        device_id: identity_b.device_id.clone(),
+        name: "Node-B".into(),
+        addresses: vec!["127.0.0.1:9872".into()],
+        is_paused: false,
+        is_trusted: true,
+        introducer: false,
+        cert_name: Some(tls_b.certificate_pin()),
+        created_at: 100,
+    };
+    storage_a.add_device(&dev_b_on_a).unwrap();
+
+    let dev_a_on_b = DeviceRecord {
+        device_id: identity_a.device_id.clone(),
+        name: "Node-A".into(),
+        addresses: vec!["127.0.0.1:9871".into()],
+        is_paused: false,
+        is_trusted: true,
+        introducer: false,
+        cert_name: Some(tls_a.certificate_pin()),
+        created_at: 100,
+    };
+    storage_b.add_device(&dev_a_on_b).unwrap();
+
+    // 2. Node A creates and indexes a file
+    let file_rel = "notes.txt";
+    let content = b"Cross-device replication via Synapse Core Merkle DAG!\n";
+    fs::write(sync_dir_a.join(file_rel), content).unwrap();
+    sync_engine_a.index_folder(folder_id).unwrap();
+
+    // 3. Node B requests Index from Node A
+    let index_req = P2PMessage::IndexRequest {
+        folder_id: folder_id.into(),
+    };
+    let index_resp = p2p_a.handle_p2p_message(index_req, None).await.unwrap().unwrap();
+
+    match index_resp {
+        P2PMessage::IndexResponse { folder_id: fid, files, revisions, chunk_lists } => {
+            assert_eq!(fid, folder_id);
+            assert_eq!(files.len(), 1);
+            assert_eq!(revisions.len(), 1);
+
+            // Replicate chunks from Node A's CAS into Node B's CAS
+            for chunks in chunk_lists.values() {
+                for ch in chunks {
+                    let chunk_data = storage_a.get_chunk(ch).unwrap().unwrap();
+                    storage_b.put_chunk(ch, &chunk_data).unwrap();
+                }
+            }
+
+            // Apply remote index to Node B
+            p2p_b.apply_remote_index(
+                folder_id,
+                &files,
+                &revisions,
+                &chunk_lists,
+                None,
+                Some(&identity_a.device_id),
+                None,
+            ).await.unwrap();
+        }
+        _ => panic!("Expected IndexResponse"),
+    }
+
+    // 4. Verify file exists on Node B's disk and in SQLite
+    let target_path_b = sync_dir_b.join(file_rel);
+    assert!(target_path_b.exists());
+    assert_eq!(fs::read(&target_path_b).unwrap(), content);
+    let rec_b = storage_b.get_file(folder_id, file_rel).unwrap().unwrap();
+    assert!(!rec_b.is_deleted);
+    assert_eq!(rec_b.size, content.len() as u64);
+
+    // 5. Node A deletes the file
+    fs::remove_file(sync_dir_a.join(file_rel)).unwrap();
+    sync_engine_a.index_folder(folder_id).unwrap();
+    let rec_a_del = storage_a.get_file(folder_id, file_rel).unwrap().unwrap();
+    assert!(rec_a_del.is_deleted, "Node A should mark file as deleted tombstone");
+
+    // 6. Node B syncs the deletion tombstone
+    let index_req_2 = P2PMessage::IndexRequest {
+        folder_id: folder_id.into(),
+    };
+    let index_resp_2 = p2p_a.handle_p2p_message(index_req_2, None).await.unwrap().unwrap();
+
+    match index_resp_2 {
+        P2PMessage::IndexResponse { files, revisions, chunk_lists, .. } => {
+            p2p_b.apply_remote_index(
+                folder_id,
+                &files,
+                &revisions,
+                &chunk_lists,
+                None,
+                Some(&identity_a.device_id),
+                None,
+            ).await.unwrap();
+        }
+        _ => panic!("Expected IndexResponse for deletion"),
+    }
+
+    // 7. Verify deletion propagated to Node B: file removed from disk, tombstone in DB
+    assert!(!target_path_b.exists(), "Target file should be deleted from Node B's disk");
+    let rec_b_del = storage_b.get_file(folder_id, file_rel).unwrap().unwrap();
+    assert!(rec_b_del.is_deleted, "Node B should record deletion tombstone in SQLite");
 }

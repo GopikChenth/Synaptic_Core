@@ -148,7 +148,6 @@ mod tests {
     #[test]
     fn test_cdc_boundary_shift_resilience() {
         let chunker = Chunker::new(1024, 4096, 8192);
-        // Realistic pseudo-random data
         let mut original_data = Vec::with_capacity(60_000);
         let mut state: u32 = 123456789;
         for _ in 0..60_000 {
@@ -157,7 +156,6 @@ mod tests {
         }
         let (orig_chunks, _) = chunker.chunk_metadata_only(&original_data);
 
-        // Prepend 100 bytes
         let mut modified_data = vec![0xAA; 100];
         modified_data.extend_from_slice(&original_data);
         let (mod_chunks, _) = chunker.chunk_metadata_only(&modified_data);

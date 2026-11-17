@@ -59,7 +59,6 @@ pub fn ensure_folder_marker(folder_root: &Path, marker_name: &str) -> std::io::R
         if let Some(parent) = marker_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        // Create marker as a hidden directory or empty file
         fs::create_dir_all(&marker_path)?;
     }
     Ok(())
@@ -132,6 +131,46 @@ pub fn sanitize_relative_path(path_str: &str) -> String {
     }
 
     parts.join("/")
+}
+
+/// Joins a protocol-supplied relative path to a sync root without following an
+/// existing symlink in any parent component.  Sanitising text alone is not
+/// enough: `folder/link/file` can otherwise escape the configured folder when
+/// `link` points elsewhere on the local filesystem.
+pub fn safe_join(folder_root: &Path, relative_path: &str) -> Result<PathBuf, FsSafetyError> {
+    let normalized = relative_path.replace('\\', "/");
+    let raw = Path::new(&normalized);
+    if raw.is_absolute()
+        || raw.components().any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(FsSafetyError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path must be a relative path without parent components",
+        )));
+    }
+
+    let clean = sanitize_relative_path(&normalized);
+    if clean.is_empty() {
+        return Err(FsSafetyError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path must not be empty",
+        )));
+    }
+
+    let mut current = folder_root.to_path_buf();
+    let parts: Vec<_> = Path::new(&clean).components().collect();
+    for component in &parts[..parts.len().saturating_sub(1)] {
+        current.push(component.as_os_str());
+        if let Ok(metadata) = fs::symlink_metadata(&current) {
+            if metadata.file_type().is_symlink() {
+                return Err(FsSafetyError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("refusing path through symlink: {}", current.display()),
+                )));
+            }
+        }
+    }
+    Ok(folder_root.join(clean))
 }
 
 /// Checks if an existing file or directory under `folder_root` matches `rel_path`
@@ -643,5 +682,15 @@ mod tests {
 
         // Whitespace trimming in path segments
         assert_eq!(sanitize_relative_path(" foo / bar / file.txt "), "foo/bar/file.txt");
+    }
+
+    #[test]
+    fn test_safe_join_rejects_parent_paths() {
+        let root = std::env::temp_dir().join(format!("synapse_safe_join_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        assert!(safe_join(&root, "nested/file.txt").unwrap().starts_with(&root));
+        assert!(safe_join(&root, "../outside.txt").is_err());
+        assert!(safe_join(&root, "/outside.txt").is_err());
+        let _ = fs::remove_dir_all(root);
     }
 }

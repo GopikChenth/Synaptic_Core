@@ -76,6 +76,8 @@ enum Commands {
         #[command(subcommand)]
         cmd: DeviceCommands,
     },
+    /// Trigger garbage collection of orphaned CAS blocks
+    Gc,
 }
 
 #[derive(Subcommand, Debug)]
@@ -156,7 +158,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(h) = cli.home {
         config.home_dir = h;
     }
-    let ip = cli.addr.parse().unwrap_or([127, 0, 0, 1].into());
+    let ip = cli
+        .addr
+        .parse()
+        .map_err(|_| format!("Invalid API bind address: {}", cli.addr))?;
     config.api_addr = SocketAddr::new(ip, cli.port);
     config.p2p_port = cli.p2p_port;
     config.discovery_port = cli.discovery_port;
@@ -175,7 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Some(Commands::Status { api }) => {
             println!("Querying Synapse Core status at {}", api);
             let url = format!("{}/api/v1/system/status", api);
-            match reqwest_minimal_get(url).await {
+            match reqwest_minimal_get(url, config.auth_token.as_deref()).await {
                 Ok(resp) => println!("{}", resp),
                 Err(e) => eprintln!("Unable to connect to daemon: {}", e),
             }
@@ -305,6 +310,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             Ok(())
         }
+        Some(Commands::Gc) => {
+            let storage = synapse_core::storage::StorageEngine::new(&config.home_dir)?;
+            let _ = storage.rebuild_chunk_ref_counts();
+            let collected = storage.garbage_collect_orphaned_chunks()?;
+            println!("CAS Garbage Collection complete. Removed {} orphaned chunk(s).", collected);
+            Ok(())
+        }
         Some(Commands::Run) | None => {
             info!("Synapse Core v1.0.0 starting...");
             info!("Home Directory: {}", config.home_dir.display());
@@ -313,16 +325,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             info!("Discovery Port: {}", config.discovery_port);
 
             let core = SynapseCore::init(config)?;
-
-            tokio::select! {
-                res = core.run() => {
-                    if let Err(e) = res {
-                        error!("Synapse Core exited with error: {}", e);
-                    }
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received shutdown signal. Stopping Synapse Core gracefully...");
-                }
+            if let Err(e) = core.run().await {
+                error!("Synapse Core exited with error: {}", e);
             }
 
             Ok(())
@@ -330,7 +334,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 }
 
-async fn reqwest_minimal_get(url: String) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+async fn reqwest_minimal_get(
+    url: String,
+    token: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let parsed = url.strip_prefix("http://").unwrap_or(&url);
     let mut parts = parsed.split('/');
     let host_port = parts.next().unwrap_or("127.0.0.1:9090");
@@ -340,7 +347,14 @@ async fn reqwest_minimal_get(url: String) -> Result<String, Box<dyn std::error::
     let (mut rd, mut wr) = tokio::io::split(stream);
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let req = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, host_port);
+    let auth_header = match token {
+        Some(t) => format!("Authorization: Bearer {}\r\n", t),
+        None => String::new(),
+    };
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\n{}Connection: close\r\n\r\n",
+        path, host_port, auth_header
+    );
     wr.write_all(req.as_bytes()).await?;
 
     let mut response = String::new();

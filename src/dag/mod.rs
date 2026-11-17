@@ -217,6 +217,8 @@ mod tests {
             parent_2: None,
             manifest_hash: "m0".into(),
             author_device: "devA".into(),
+            sequence_number: 0,
+            file_size: 0,
             created_at: 100,
         };
         let rev1 = RevisionRecord {
@@ -225,6 +227,8 @@ mod tests {
             parent_2: None,
             manifest_hash: "m1".into(),
             author_device: "devA".into(),
+            sequence_number: 1,
+            file_size: 0,
             created_at: 101,
         };
         let rev2 = RevisionRecord {
@@ -233,6 +237,8 @@ mod tests {
             parent_2: None,
             manifest_hash: "m2".into(),
             author_device: "devB".into(),
+            sequence_number: 1,
+            file_size: 0,
             created_at: 102,
         };
         let rev3 = RevisionRecord {
@@ -241,6 +247,8 @@ mod tests {
             parent_2: None,
             manifest_hash: "m3".into(),
             author_device: "devA".into(),
+            sequence_number: 2,
+            file_size: 0,
             created_at: 103,
         };
 

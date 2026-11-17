@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use crate::chunker::Chunker;
 use crate::dag::RevisionNode;
-use crate::engine::fs_utils::atomic_write_file;
+use crate::engine::fs_utils::{atomic_write_file, safe_join};
 use crate::storage::{FileRecord, RevisionRecord, StorageEngine};
 
 /// Event sent over WebSocket to UI clients.
@@ -155,6 +155,60 @@ impl ConflictEngine {
         }
     }
 
+    pub fn storage(&self) -> &StorageEngine {
+        &self.storage
+    }
+
+    /// Chunks payload, persists blocks into CAS, creates RevisionNode, and updates database records.
+    pub fn commit_revision(
+        &self,
+        folder_id: &str,
+        relative_path: &str,
+        payload: &[u8],
+        parent_hashes: Vec<String>,
+        mtime_nanos: i64,
+    ) -> Result<RevisionNode, Box<dyn std::error::Error + Send + Sync>> {
+        let (chunks, manifest) = self.chunker.chunk_slice(payload);
+        for (info, data) in &chunks {
+            self.storage.put_chunk(&info.chunk_hash, data)?;
+        }
+
+        let chunk_hashes: Vec<String> = chunks.into_iter().map(|(c, _)| c.chunk_hash).collect();
+        let rev_node = RevisionNode::new(
+            parent_hashes.clone(),
+            manifest.clone(),
+            self.device_id.clone(),
+            chrono::Utc::now().timestamp_millis() as u64,
+            mtime_nanos,
+            payload.len() as u64,
+        );
+
+        self.storage.insert_revision(
+            &RevisionRecord {
+                revision_hash: rev_node.revision_hash.clone(),
+                parent_1: parent_hashes.get(0).cloned(),
+                parent_2: parent_hashes.get(1).cloned(),
+                manifest_hash: manifest,
+                author_device: self.device_id.clone(),
+                sequence_number: rev_node.sequence_number,
+                file_size: rev_node.file_size,
+                created_at: mtime_nanos,
+            },
+            &chunk_hashes,
+        )?;
+
+        self.storage.upsert_file(&FileRecord {
+            folder_id: folder_id.to_string(),
+            relative_path: relative_path.to_string(),
+            size: payload.len() as u64,
+            mtime_nanos,
+            current_revision: rev_node.revision_hash.clone(),
+            is_deleted: false,
+        })?;
+
+        Ok(rev_node)
+    }
+
     /// Determines if a file is text (mergeable via diff3) or binary.
     pub fn is_text_file(path: &str, sample_bytes: &[u8]) -> bool {
         // Null byte check
@@ -225,14 +279,52 @@ impl ConflictEngine {
             None => return Err(format!("Folder not found: {}", folder_id).into()),
         };
 
-        let full_local_path = PathBuf::from(&folder.local_path).join(relative_path);
+        let full_local_path = safe_join(Path::new(&folder.local_path), relative_path)?;
         let local_payload = if full_local_path.exists() {
             fs::read(&full_local_path)?
         } else {
             Vec::new()
         };
 
-        let is_text = Self::is_text_file(relative_path, &local_payload)
+        let policy = folder.parsed_conflict_policy();
+
+        if policy == crate::state::ConflictPolicy::Lww {
+            let local_meta = fs::metadata(&full_local_path).ok();
+            let local_mtime = local_meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+
+            let (chosen_payload, chosen_mtime) = if remote_mtime >= local_mtime {
+                info!("LWW policy: accepting newer remote version for {}/{}", folder_id, relative_path);
+                atomic_write_file(&full_local_path, remote_payload, None, None)?;
+                (remote_payload, remote_mtime)
+            } else {
+                info!("LWW policy: keeping newer local version for {}/{}", folder_id, relative_path);
+                (&local_payload[..], local_mtime)
+            };
+
+            let rev = self.commit_revision(
+                folder_id,
+                relative_path,
+                chosen_payload,
+                vec![local_rev.to_string(), remote_rev.to_string()],
+                chosen_mtime,
+            )?;
+
+            let _ = self.event_sender.send(CoreEvent::FileChanged {
+                folder_id: folder_id.to_string(),
+                relative_path: relative_path.to_string(),
+                revision: rev.revision_hash,
+            });
+
+            return Ok(true);
+        }
+
+        let is_text = policy == crate::state::ConflictPolicy::ThreeWayAuto
+            && Self::is_text_file(relative_path, &local_payload)
             && Self::is_text_file(relative_path, remote_payload);
 
         let mut auto_merge_attempted = false;
@@ -259,41 +351,13 @@ impl ConflictEngine {
 
                     atomic_write_file(&full_local_path, merged_text.as_bytes(), None, None)?;
 
-                    let (chunks, manifest) = self.chunker.chunk_slice(merged_text.as_bytes());
-                    for (info, data) in &chunks {
-                        self.storage.put_chunk(&info.chunk_hash, data)?;
-                    }
-
-                    let chunk_hashes: Vec<String> = chunks.into_iter().map(|(c, _)| c.chunk_hash).collect();
-                    let merge_rev = RevisionNode::new(
+                    let merge_rev = self.commit_revision(
+                        folder_id,
+                        relative_path,
+                        merged_text.as_bytes(),
                         vec![local_rev.to_string(), remote_rev.to_string()],
-                        manifest,
-                        self.device_id.clone(),
-                        chrono::Utc::now().timestamp_millis() as u64,
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                        merged_text.len() as u64,
-                    );
-
-                    self.storage.insert_revision(
-                        &RevisionRecord {
-                            revision_hash: merge_rev.revision_hash.clone(),
-                            parent_1: Some(local_rev.to_string()),
-                            parent_2: Some(remote_rev.to_string()),
-                            manifest_hash: merge_rev.manifest_hash.clone(),
-                            author_device: self.device_id.clone(),
-                            created_at: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                        },
-                        &chunk_hashes,
                     )?;
-
-                    self.storage.upsert_file(&FileRecord {
-                        folder_id: folder_id.to_string(),
-                        relative_path: relative_path.to_string(),
-                        size: merged_text.len() as u64,
-                        mtime_nanos: merge_rev.mtime_nanos,
-                        current_revision: merge_rev.revision_hash.clone(),
-                        is_deleted: false,
-                    })?;
 
                     let _ = self.event_sender.send(CoreEvent::FileChanged {
                         folder_id: folder_id.to_string(),
@@ -332,7 +396,7 @@ impl ConflictEngine {
             .as_ref()
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
+            .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
         let local_size = local_meta.map(|m| m.len()).unwrap_or(local_payload.len() as u64);
 
@@ -397,13 +461,40 @@ impl ConflictEngine {
             None => return Err(format!("Folder not found: {}", conflict.folder_id).into()),
         };
 
-        let local_path = PathBuf::from(&folder.local_path).join(&conflict.relative_path);
+        let local_path = safe_join(Path::new(&folder.local_path), &conflict.relative_path)?;
 
         match req.action {
             ResolveAction::AcceptLocal => {
                 info!("Resolving conflict {} with ACCEPT_LOCAL", conflict_id);
-                // Keep disk file untouched, mark conflict resolved
+                let local_meta = fs::metadata(&local_path).ok();
+                let mtime_nanos = local_meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+
+                let local_bytes = if local_path.exists() {
+                    fs::read(&local_path)?
+                } else {
+                    Vec::new()
+                };
+
+                let merge_rev = self.commit_revision(
+                    &conflict.folder_id,
+                    &conflict.relative_path,
+                    &local_bytes,
+                    vec![conflict.local_revision.clone(), conflict.remote_revision.clone()],
+                    mtime_nanos,
+                )?;
+
                 self.storage.resolve_conflict(conflict_id)?;
+
+                let _ = self.event_sender.send(CoreEvent::FileChanged {
+                    folder_id: conflict.folder_id.clone(),
+                    relative_path: conflict.relative_path.clone(),
+                    revision: merge_rev.revision_hash,
+                });
             }
             ResolveAction::AcceptRemote => {
                 info!("Resolving conflict {} with ACCEPT_REMOTE", conflict_id);
@@ -412,19 +503,19 @@ impl ConflictEngine {
                     let remote_bytes = fs::read(&staged_path)?;
                     atomic_write_file(&local_path, &remote_bytes, None, None)?;
 
-                    let (chunks, _manifest) = self.chunker.chunk_slice(&remote_bytes);
-                    for (info, data) in &chunks {
-                        self.storage.put_chunk(&info.chunk_hash, data)?;
-                    }
+                    let rev = self.commit_revision(
+                        &conflict.folder_id,
+                        &conflict.relative_path,
+                        &remote_bytes,
+                        vec![conflict.remote_revision.clone()],
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                    )?;
 
-                    self.storage.upsert_file(&FileRecord {
+                    let _ = self.event_sender.send(CoreEvent::FileChanged {
                         folder_id: conflict.folder_id.clone(),
                         relative_path: conflict.relative_path.clone(),
-                        size: remote_bytes.len() as u64,
-                        mtime_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                        current_revision: conflict.remote_revision.clone(),
-                        is_deleted: false,
-                    })?;
+                        revision: rev.revision_hash,
+                    });
                 }
                 self.storage.resolve_conflict(conflict_id)?;
             }
@@ -437,43 +528,21 @@ impl ConflictEngine {
 
                 atomic_write_file(&local_path, content.as_bytes(), None, None)?;
 
-                let (chunks, manifest) = self.chunker.chunk_slice(content.as_bytes());
-                for (info, data) in &chunks {
-                    self.storage.put_chunk(&info.chunk_hash, data)?;
-                }
-
-                let chunk_hashes: Vec<String> = chunks.into_iter().map(|(c, _)| c.chunk_hash).collect();
-                let merge_rev = RevisionNode::new(
+                let merge_rev = self.commit_revision(
+                    &conflict.folder_id,
+                    &conflict.relative_path,
+                    content.as_bytes(),
                     vec![conflict.local_revision.clone(), conflict.remote_revision.clone()],
-                    manifest,
-                    self.device_id.clone(),
-                    chrono::Utc::now().timestamp_millis() as u64,
                     chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                    content.len() as u64,
-                );
-
-                self.storage.insert_revision(
-                    &RevisionRecord {
-                        revision_hash: merge_rev.revision_hash.clone(),
-                        parent_1: Some(conflict.local_revision.clone()),
-                        parent_2: Some(conflict.remote_revision.clone()),
-                        manifest_hash: merge_rev.manifest_hash.clone(),
-                        author_device: self.device_id.clone(),
-                        created_at: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                    },
-                    &chunk_hashes,
                 )?;
 
-                self.storage.upsert_file(&FileRecord {
+                self.storage.resolve_conflict(conflict_id)?;
+
+                let _ = self.event_sender.send(CoreEvent::FileChanged {
                     folder_id: conflict.folder_id.clone(),
                     relative_path: conflict.relative_path.clone(),
-                    size: content.len() as u64,
-                    mtime_nanos: merge_rev.mtime_nanos,
-                    current_revision: merge_rev.revision_hash,
-                    is_deleted: false,
-                })?;
-
-                self.storage.resolve_conflict(conflict_id)?;
+                    revision: merge_rev.revision_hash,
+                });
             }
             ResolveAction::KeepBoth => {
                 info!("Resolving conflict {} with KEEP_BOTH", conflict_id);
@@ -496,7 +565,36 @@ impl ConflictEngine {
                     let sidecar_path = parent.join(&sidecar_name);
                     fs::copy(&staged_path, &sidecar_path)?;
                 }
+
+                let local_meta = fs::metadata(&local_path).ok();
+                let mtime_nanos = local_meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+
+                let local_bytes = if local_path.exists() {
+                    fs::read(&local_path)?
+                } else {
+                    Vec::new()
+                };
+
+                let merge_rev = self.commit_revision(
+                    &conflict.folder_id,
+                    &conflict.relative_path,
+                    &local_bytes,
+                    vec![conflict.local_revision.clone(), conflict.remote_revision.clone()],
+                    mtime_nanos,
+                )?;
+
                 self.storage.resolve_conflict(conflict_id)?;
+
+                let _ = self.event_sender.send(CoreEvent::FileChanged {
+                    folder_id: conflict.folder_id.clone(),
+                    relative_path: conflict.relative_path.clone(),
+                    revision: merge_rev.revision_hash,
+                });
             }
         }
 

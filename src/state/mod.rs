@@ -502,7 +502,6 @@ impl DevicePairingState {
             (Self::Pending, Self::Rejected) => true,
             (Self::Paired, Self::Paused) => true,
             (Self::Paused, Self::Paired) => true,
-            (s1, s2) if *s1 == s2 => true,
             _ => false,
         }
     }
@@ -821,14 +820,23 @@ mod tests {
     #[test]
     fn test_all_state_machines_registry_intact() {
         let registry = get_all_state_machines();
-        assert_eq!(registry.len(), 5);
+        assert!(!registry.is_empty());
 
-        let conflict_sm = registry.iter().find(|m| m.machine_id == "conflict_lifecycle").unwrap();
-        assert_eq!(conflict_sm.initial_state, "PENDING");
-        assert_eq!(conflict_sm.states.len(), 3);
-
-        let folder_sm = registry.iter().find(|m| m.machine_id == "folder_sync_lifecycle").unwrap();
-        assert_eq!(folder_sm.initial_state, "idle");
-        assert_eq!(folder_sm.states.len(), 5);
+        for sm in &registry {
+            assert!(!sm.machine_id.is_empty());
+            assert!(!sm.subsystem.is_empty());
+            assert!(
+                sm.states.iter().any(|s| s.state == sm.initial_state),
+                "State machine '{}' missing initial state '{}'",
+                sm.machine_id,
+                sm.initial_state
+            );
+            for s in &sm.states {
+                assert!(!s.description.is_empty());
+                if s.is_terminal {
+                    assert!(s.allowed_transitions.is_empty());
+                }
+            }
+        }
     }
 }

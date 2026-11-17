@@ -20,6 +20,44 @@ pub struct NodeIdentity {
     pub formatted_id: String,
 }
 
+/// Persistent TLS material used by QUIC.  It is deliberately stored alongside
+/// the node identity so paired peers can pin a stable certificate instead of
+/// accepting a newly generated self-signed certificate after every restart.
+#[derive(Clone)]
+pub struct TlsIdentity {
+    pub certificate_der: Vec<u8>,
+    pub private_key_der: Vec<u8>,
+}
+
+impl TlsIdentity {
+    pub fn load_or_generate(home_dir: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let certificate_path = home_dir.join("p2p_certificate.der");
+        let private_key_path = home_dir.join("p2p_private_key.der");
+
+        if certificate_path.exists() && private_key_path.exists() {
+            return Ok(Self {
+                certificate_der: fs::read(certificate_path)?,
+                private_key_der: fs::read(private_key_path)?,
+            });
+        }
+
+        let certificate = rcgen::generate_simple_self_signed(vec!["synapse.p2p".into()])?;
+        let identity = Self {
+            certificate_der: certificate.cert.der().to_vec(),
+            private_key_der: certificate.key_pair.serialize_der(),
+        };
+        fs::write(&certificate_path, &identity.certificate_der)?;
+        fs::write(&private_key_path, &identity.private_key_der)?;
+        Ok(identity)
+    }
+
+    /// Hex is used for storage in the existing device metadata field without
+    /// introducing another text encoding dependency.
+    pub fn certificate_pin(&self) -> String {
+        hex::encode(&self.certificate_der)
+    }
+}
+
 impl NodeIdentity {
     /// Loads or creates an Ed25519 node identity keypair.
     pub fn load_or_generate(home_dir: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -329,7 +367,6 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("synapse_node_id_test_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
 
-        // 1. Generate identity
         let id1 = NodeIdentity::load_or_generate(&temp_dir).unwrap();
         assert_eq!(id1.device_id.len(), 64);
         assert!(id1.formatted_id.contains('-'));
@@ -338,19 +375,16 @@ mod tests {
             id1.formatted_id
         );
 
-        // 2. Reload from same directory - keys must be identical
         let id2 = NodeIdentity::load_or_generate(&temp_dir).unwrap();
         assert_eq!(id1.device_id, id2.device_id);
         assert_eq!(id1.formatted_id, id2.formatted_id);
         assert_eq!(id1.signing_key.to_bytes(), id2.signing_key.to_bytes());
 
-        // 3. Ed25519 signing and verification
         use ed25519_dalek::Signer;
         let message = b"Synapse cluster node pairing verification message 2026";
         let signature = id1.signing_key.sign(message);
         assert!(id1.verifying_key.verify_strict(message, &signature).is_ok());
 
-        // Verification fails if message is tampered
         let tampered_message = b"Synapse cluster node pairing verification message 2027";
         assert!(id1.verifying_key.verify_strict(tampered_message, &signature).is_err());
 

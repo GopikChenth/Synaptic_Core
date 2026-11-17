@@ -17,16 +17,16 @@ use std::net::SocketAddr;
 use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Runtime;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tracing::{error, info};
 
 use crate::api::ApiServer;
 use crate::conflict::{ConflictEngine, CoreEvent};
 use crate::engine::SyncEngine;
-use crate::p2p::identity::NodeIdentity;
+use crate::p2p::identity::{NodeIdentity, TlsIdentity};
 use crate::p2p::P2PManager;
 use crate::storage::StorageEngine;
 
@@ -104,14 +104,22 @@ pub struct SynapseCore {
     p2p_manager: Arc<P2PManager>,
     event_sender: broadcast::Sender<CoreEvent>,
     peer_count: Arc<AtomicUsize>,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 }
 
 impl SynapseCore {
     /// Initializes and prepares the Synapse Core environment.
     pub fn init(config: SynapseConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        if !config.api_addr.ip().is_loopback()
+            && config.auth_token.as_deref().map_or(true, str::is_empty)
+        {
+            return Err("Refusing to expose the control-plane API off localhost without --token".into());
+        }
         std::fs::create_dir_all(&config.home_dir)?;
 
         let identity = NodeIdentity::load_or_generate(&config.home_dir)?;
+        let tls_identity = TlsIdentity::load_or_generate(&config.home_dir)?;
         info!("Synapse Core Device ID: {}", identity.device_id);
 
         let storage = StorageEngine::new(&config.home_dir)?;
@@ -133,12 +141,15 @@ impl SynapseCore {
 
         let p2p_manager = Arc::new(P2PManager::new(
             identity,
+            tls_identity,
             config.device_name.clone(),
             config.p2p_port,
             sync_engine.clone(),
             peer_count.clone(),
             event_sender.clone(),
         ));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         Ok(Self {
             config,
@@ -147,11 +158,18 @@ impl SynapseCore {
             p2p_manager,
             event_sender,
             peer_count,
+            shutdown_tx,
+            shutdown_rx,
         })
     }
 
     pub fn event_sender(&self) -> &broadcast::Sender<CoreEvent> {
         &self.event_sender
+    }
+
+    /// Returns a handle that can be used to trigger a graceful shutdown (`tx.send(true)`).
+    pub fn shutdown_handle(&self) -> watch::Sender<bool> {
+        self.shutdown_tx.clone()
     }
 
     /// Spawns API server, discovery, watchers, and QUIC listener on Tokio runtime.
@@ -160,7 +178,7 @@ impl SynapseCore {
 
         self.p2p_manager.start_discovery(self.config.discovery_port);
 
-        let mut _watchers = Vec::new();
+        let mut watchers = Vec::new();
         if let Ok(folders) = self.storage.list_folders() {
             for f in folders {
                 if !f.is_paused {
@@ -170,16 +188,23 @@ impl SynapseCore {
                         let _ = engine.index_folder(&fid);
                     });
                     let watcher = self.sync_engine.spawn_watcher(f.folder_id, f.local_path);
-                    _watchers.push(watcher);
+                    watchers.push(watcher);
                 }
             }
         }
 
         let p2p = self.p2p_manager.clone();
-        tokio::spawn(async move {
+        let p2p_handle = tokio::spawn(async move {
             if let Err(e) = p2p.run_server().await {
                 error!("QUIC P2P error: {}", e);
             }
+        });
+
+        let signal_tx = self.shutdown_tx.clone();
+        let signal_handle = tokio::spawn(async move {
+            wait_for_os_shutdown_signal().await;
+            info!("OS shutdown signal received");
+            let _ = signal_tx.send(true);
         });
 
         let api_server = ApiServer::new(
@@ -187,10 +212,43 @@ impl SynapseCore {
             self.config.api_addr,
             self.config.auth_token.clone(),
             self.peer_count.clone(),
-        );
+        )
+        .with_shutdown_tx(self.shutdown_tx.clone());
 
-        api_server.run().await?;
+        let api_result = api_server.run_with_shutdown(self.shutdown_rx).await;
+
+        signal_handle.abort();
+        p2p_handle.abort();
+        drop(watchers);
+        info!("Synapse Core engine stopped.");
+
+        api_result?;
         Ok(())
+    }
+}
+
+async fn wait_for_os_shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
     }
 }
 
@@ -199,6 +257,7 @@ impl SynapseCore {
 // =============================================================================
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
+static SHUTDOWN_TX: Mutex<Option<watch::Sender<bool>>> = Mutex::new(None);
 
 /// Starts the Synapse Core daemon from C / JNI.
 ///
@@ -239,9 +298,15 @@ pub unsafe extern "C" fn synapse_start(
 
     match SynapseCore::init(config) {
         Ok(core) => {
+            if let Ok(mut guard) = SHUTDOWN_TX.lock() {
+                *guard = Some(core.shutdown_handle());
+            }
             RUNNING.store(true, Ordering::SeqCst);
             std::thread::spawn(move || {
                 let _ = rt.block_on(core.run());
+                if let Ok(mut guard) = SHUTDOWN_TX.lock() {
+                    *guard = None;
+                }
                 RUNNING.store(false, Ordering::SeqCst);
             });
             0
@@ -263,6 +328,11 @@ pub extern "C" fn synapse_is_running() -> c_int {
 /// Stops the Synapse Core daemon.
 #[no_mangle]
 pub extern "C" fn synapse_stop() -> c_int {
+    if let Ok(mut guard) = SHUTDOWN_TX.lock() {
+        if let Some(tx) = guard.take() {
+            let _ = tx.send(true);
+        }
+    }
     RUNNING.store(false, Ordering::SeqCst);
     0
 }

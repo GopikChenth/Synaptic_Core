@@ -79,6 +79,24 @@ pub fn merge3(base_str: &str, local_str: &str, remote_str: &str) -> MergeResult 
         }
     }
 
+    // Insertions have an empty base interval.  The range-based merge loop below
+    // deliberately operates on non-empty base slices, so accepting them there
+    // would silently discard inserted text.  Until insertions are represented
+    // as first-class merge regions, fail safely into the quarantine path.
+    if local_edits.iter().any(|(start, end, _)| start == end)
+        || remote_edits.iter().any(|(start, end, _)| start == end)
+    {
+        return MergeResult::Conflict {
+            overlapping_lines_count: 1,
+            hunks: vec![DiffHunk {
+                hunk_type: HunkType::Conflict,
+                base_lines: base_lines.iter().map(|line| (*line).to_string()).collect(),
+                local_lines: local_lines.iter().map(|line| (*line).to_string()).collect(),
+                remote_lines: remote_lines.iter().map(|line| (*line).to_string()).collect(),
+            }],
+        };
+    }
+
     // Collect all critical boundary line numbers on the base sequence
     let mut cut_points = std::collections::BTreeSet::new();
     cut_points.insert(0);
@@ -118,7 +136,6 @@ pub fn merge3(base_str: &str, local_str: &str, remote_str: &str) -> MergeResult 
 
         match (local_mod, remote_mod) {
             (None, None) => {
-                // Neither modified this slice: keep base
                 hunks.push(DiffHunk {
                     hunk_type: HunkType::Unchanged,
                     base_lines: base_slice.clone(),
@@ -148,9 +165,7 @@ pub fn merge3(base_str: &str, local_str: &str, remote_str: &str) -> MergeResult 
                 merged_output.extend(r_slice);
             }
             (Some((_, _, l_rep)), Some((_, _, r_rep))) => {
-                // Both modified
                 if l_rep == r_rep {
-                    // Identical change
                     hunks.push(DiffHunk {
                         hunk_type: HunkType::IdenticalChange,
                         base_lines: base_slice,
@@ -159,7 +174,6 @@ pub fn merge3(base_str: &str, local_str: &str, remote_str: &str) -> MergeResult 
                     });
                     merged_output.extend(l_rep.clone());
                 } else {
-                    // Overlapping conflicting change!
                     has_conflict = true;
                     let overlap = l_rep.len().max(r_rep.len()).max(1);
                     total_overlapping_lines += overlap;
@@ -181,9 +195,11 @@ pub fn merge3(base_str: &str, local_str: &str, remote_str: &str) -> MergeResult 
             hunks,
         }
     } else {
-        let mut final_text = merged_output.join("\n");
+        let use_crlf = local_str.contains("\r\n") || remote_str.contains("\r\n") || base_str.contains("\r\n");
+        let line_ending = if use_crlf { "\r\n" } else { "\n" };
+        let mut final_text = merged_output.join(line_ending);
         if (local_str.ends_with('\n') || remote_str.ends_with('\n')) && !final_text.is_empty() {
-            final_text.push('\n');
+            final_text.push_str(line_ending);
         }
         MergeResult::Clean(final_text)
     }
@@ -224,6 +240,81 @@ mod tests {
                 assert!(conflict_hunk.is_some());
             }
             MergeResult::Clean(_) => panic!("Expected conflict for overlapping edit"),
+        }
+    }
+
+    #[test]
+    fn test_insertion_never_silently_drops_content() {
+        let base = "one\ntwo\n";
+        let local = "zero\none\ntwo\n";
+        let remote = "one\ntwo\nthree\n";
+
+        assert!(matches!(merge3(base, local, remote), MergeResult::Conflict { .. }));
+    }
+
+    #[test]
+    fn test_crlf_line_ending_preservation() {
+        let base = "Line 1\r\nLine 2\r\nLine 3\r\nLine 4\r\nLine 5\r\n";
+        let local = "Line 1 modified by local\r\nLine 2\r\nLine 3\r\nLine 4\r\nLine 5\r\n";
+        let remote = "Line 1\r\nLine 2\r\nLine 3\r\nLine 4\r\nLine 5 modified by remote\r\n";
+
+        match merge3(base, local, remote) {
+            MergeResult::Clean(merged) => {
+                assert!(merged.contains("\r\n"), "CRLF line endings should be preserved");
+                assert!(merged.contains("Line 1 modified by local\r\n"));
+                assert!(merged.contains("Line 5 modified by remote\r\n"));
+            }
+            MergeResult::Conflict { .. } => panic!("Expected clean merge with CRLF"),
+        }
+    }
+
+    #[test]
+    fn test_empty_base_identical_additions() {
+        let base = "";
+        let local = "new content\n";
+        let remote = "new content\n";
+
+        match merge3(base, local, remote) {
+            MergeResult::Clean(merged) => assert_eq!(merged, "new content\n"),
+            MergeResult::Conflict { .. } => panic!("Expected clean merge for identical additions on empty base"),
+        }
+    }
+
+    #[test]
+    fn test_empty_base_different_additions() {
+        let base = "";
+        let local = "alice content\n";
+        let remote = "bob content\n";
+
+        assert!(matches!(merge3(base, local, remote), MergeResult::Conflict { .. }));
+    }
+
+    #[test]
+    fn test_repeated_lines_handling() {
+        let base = "item\nitem\nitem\nitem\n";
+        let local = "item modified\nitem\nitem\nitem\n";
+        let remote = "item\nitem\nitem\nitem modified\n";
+
+        match merge3(base, local, remote) {
+            MergeResult::Clean(merged) => {
+                assert!(merged.contains("item modified"));
+            }
+            MergeResult::Conflict { .. } => panic!("Expected clean merge for repeated lines non-overlapping"),
+        }
+    }
+
+    #[test]
+    fn test_adjacent_non_overlapping_edits() {
+        let base = "line 1\nline 2\nline 3\nline 4\n";
+        let local = "line 1 edited\nline 2\nline 3\nline 4\n";
+        let remote = "line 1\nline 2\nline 3 edited\nline 4\n";
+
+        match merge3(base, local, remote) {
+            MergeResult::Clean(merged) => {
+                assert!(merged.contains("line 1 edited"));
+                assert!(merged.contains("line 3 edited"));
+            }
+            MergeResult::Conflict { .. } => panic!("Expected clean merge"),
         }
     }
 }

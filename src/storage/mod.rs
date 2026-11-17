@@ -19,19 +19,19 @@ pub struct FolderRecord {
     #[serde(alias = "path")]
     pub local_path: String,
     #[serde(default = "default_policy")]
-    pub conflict_policy: String, // THREE_WAY_AUTO, LWW, MANUAL
+    pub conflict_policy: String,
     #[serde(default, alias = "paused")]
     pub is_paused: bool,
     #[serde(default = "default_sync_mode", alias = "type")]
-    pub sync_mode: String, // SendReceive, SendOnly, ReceiveOnly
+    pub sync_mode: String,
     #[serde(default = "default_pull_order")]
-    pub pull_order: String, // Alphabetical, SmallestFirst, LargestFirst, NewestFirst, OldestFirst
+    pub pull_order: String,
     #[serde(default = "default_versioning_type")]
-    pub versioning_type: String, // None, TrashCan, Simple, Staggered
+    pub versioning_type: String,
     #[serde(default = "default_versioning_keep_days")]
     pub versioning_keep_days: i64,
     #[serde(default = "default_marker_name")]
-    pub marker_name: String, // .synapse-folder
+    pub marker_name: String,
 }
 
 fn default_policy() -> String { "THREE_WAY_AUTO".to_string() }
@@ -91,6 +91,8 @@ pub struct PendingDeviceRecord {
     pub name: String,
     pub address: String,
     pub received_at: i64,
+    #[serde(default)]
+    pub cert_pin: Option<String>,
 }
 
 /// Introduced device payload announced by an introducer peer.
@@ -196,6 +198,8 @@ pub struct RevisionRecord {
     pub parent_2: Option<String>,
     pub manifest_hash: String,
     pub author_device: String,
+    pub sequence_number: u64,
+    pub file_size: u64,
     pub created_at: i64,
 }
 
@@ -209,7 +213,7 @@ pub struct QuarantineConflict {
     pub local_revision: String,
     pub remote_revision: String,
     pub staged_payload_path: String,
-    pub status: String, // PENDING, RESOLVED, IGNORED
+    pub status: String,
     pub detected_at: i64,
 }
 
@@ -239,12 +243,12 @@ impl StorageEngine {
 
         let conn = Connection::open(&db_path)?;
         
-        // Performance pragmas for embedded database
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
-             PRAGMA cache_size = -64000;", // 64MB cache
+             PRAGMA busy_timeout = 5000;
+             PRAGMA cache_size = -64000;",
         )?;
 
         let engine = Self {
@@ -254,7 +258,22 @@ impl StorageEngine {
         };
 
         engine.init_schema()?;
+        engine.rebuild_chunk_ref_counts()?;
         Ok(engine)
+    }
+
+    /// Repairs historical reference counts from the authoritative revision map.
+    /// This also makes upgrades from older versions, which incremented counts on
+    /// every write, deterministic.
+    pub fn rebuild_chunk_ref_counts(&self) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "UPDATE chunks
+             SET ref_count = (
+                 SELECT COUNT(*) FROM file_chunks
+                 WHERE file_chunks.chunk_hash = chunks.chunk_hash
+             );",
+        )
     }
 
     /// Creates an in-memory storage engine for unit testing.
@@ -318,7 +337,9 @@ impl StorageEngine {
                 parent_2 TEXT,
                 manifest_hash TEXT NOT NULL,
                 author_device TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                sequence_number INTEGER NOT NULL DEFAULT 0,
+                file_size INTEGER NOT NULL DEFAULT 0
             );
 
             -- Content-Addressable Chunks (Deduplication store)
@@ -367,7 +388,8 @@ impl StorageEngine {
                 device_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 address TEXT NOT NULL,
-                received_at INTEGER NOT NULL
+                received_at INTEGER NOT NULL,
+                cert_pin TEXT
             );
 
             -- Folder Sharing Matrix (Which folders are shared with which devices)
@@ -421,6 +443,9 @@ impl StorageEngine {
         let _ = conn.execute("ALTER TABLE folders ADD COLUMN versioning_keep_days INTEGER NOT NULL DEFAULT 30", []);
         let _ = conn.execute("ALTER TABLE folders ADD COLUMN marker_name TEXT NOT NULL DEFAULT '.synapse-folder'", []);
 
+        let _ = conn.execute("ALTER TABLE revisions ADD COLUMN sequence_number INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE revisions ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE pending_devices ADD COLUMN cert_pin TEXT", []);
         Ok(())
     }
 
@@ -822,6 +847,7 @@ impl StorageEngine {
                     name: dev.name.clone(),
                     address,
                     received_at: now,
+                    cert_pin: dev.cert_name.clone(),
                 };
                 self.add_pending_device(&pending)?;
                 result.added_pending.push(dev.device_id.clone());
@@ -840,13 +866,14 @@ impl StorageEngine {
     pub fn add_pending_device(&self, rec: &PendingDeviceRecord) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO pending_devices (device_id, name, address, received_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO pending_devices (device_id, name, address, received_at, cert_pin)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(device_id) DO UPDATE SET
                 name = excluded.name,
                 address = excluded.address,
-                received_at = excluded.received_at",
-            params![rec.device_id, rec.name, rec.address, rec.received_at],
+                received_at = excluded.received_at,
+                cert_pin = coalesce(excluded.cert_pin, pending_devices.cert_pin)",
+            params![rec.device_id, rec.name, rec.address, rec.received_at, rec.cert_pin],
         )?;
         Ok(())
     }
@@ -854,7 +881,7 @@ impl StorageEngine {
     pub fn list_pending_devices(&self) -> SqlResult<Vec<PendingDeviceRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT device_id, name, address, received_at FROM pending_devices ORDER BY received_at DESC",
+            "SELECT device_id, name, address, received_at, cert_pin FROM pending_devices ORDER BY received_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(PendingDeviceRecord {
@@ -862,6 +889,7 @@ impl StorageEngine {
                 name: row.get(1)?,
                 address: row.get(2)?,
                 received_at: row.get(3)?,
+                cert_pin: row.get(4)?,
             })
         })?;
 
@@ -875,7 +903,7 @@ impl StorageEngine {
     pub fn get_pending_device(&self, device_id: &str) -> SqlResult<Option<PendingDeviceRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT device_id, name, address, received_at FROM pending_devices WHERE device_id = ?1",
+            "SELECT device_id, name, address, received_at, cert_pin FROM pending_devices WHERE device_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![device_id], |row| {
             Ok(PendingDeviceRecord {
@@ -883,6 +911,7 @@ impl StorageEngine {
                 name: row.get(1)?,
                 address: row.get(2)?,
                 received_at: row.get(3)?,
+                cert_pin: row.get(4)?,
             })
         })?;
 
@@ -895,7 +924,7 @@ impl StorageEngine {
     pub fn accept_pending_device(&self, device_id: &str) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT device_id, name, address, received_at FROM pending_devices WHERE device_id = ?1",
+            "SELECT device_id, name, address, received_at, cert_pin FROM pending_devices WHERE device_id = ?1",
         )?;
         let pending = stmt.query_row(params![device_id], |row| {
             Ok(PendingDeviceRecord {
@@ -903,6 +932,7 @@ impl StorageEngine {
                 name: row.get(1)?,
                 address: row.get(2)?,
                 received_at: row.get(3)?,
+                cert_pin: row.get(4)?,
             })
         })?;
 
@@ -911,9 +941,11 @@ impl StorageEngine {
 
         conn.execute(
             "INSERT INTO devices (device_id, name, addresses, is_paused, is_trusted, introducer, cert_name, created_at)
-             VALUES (?1, ?2, ?3, 0, 1, 0, NULL, ?4)
-             ON CONFLICT(device_id) DO UPDATE SET name = excluded.name",
-            params![pending.device_id, pending.name, addrs_json, pending.received_at],
+             VALUES (?1, ?2, ?3, 0, 1, 0, ?4, ?5)
+             ON CONFLICT(device_id) DO UPDATE SET
+                name = excluded.name,
+                cert_name = coalesce(excluded.cert_name, devices.cert_name)",
+            params![pending.device_id, pending.name, addrs_json, pending.cert_pin, pending.received_at],
         )?;
 
         conn.execute("DELETE FROM pending_devices WHERE device_id = ?1", params![device_id])?;
@@ -1164,12 +1196,26 @@ impl StorageEngine {
         }
     }
 
-    pub fn list_files_in_folder(&self, folder_id: &str) -> SqlResult<Vec<FileRecord>> {
+    /// Records a locally deleted path while retaining its last revision as a
+    /// tombstone for peer reconciliation.
+    pub fn mark_file_deleted(&self, folder_id: &str, relative_path: &str) -> SqlResult<bool> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        Ok(conn.execute(
+            "UPDATE files SET is_deleted = 1 WHERE folder_id = ?1 AND relative_path = ?2 AND is_deleted = 0",
+            params![folder_id, relative_path],
+        )? > 0)
+    }
+
+    pub fn list_all_files_in_folder(&self, folder_id: &str, include_deleted: bool) -> SqlResult<Vec<FileRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let query = if include_deleted {
             "SELECT folder_id, relative_path, size, mtime_nanos, current_revision, is_deleted
-             FROM files WHERE folder_id = ?1 AND is_deleted = 0",
-        )?;
+             FROM files WHERE folder_id = ?1"
+        } else {
+            "SELECT folder_id, relative_path, size, mtime_nanos, current_revision, is_deleted
+             FROM files WHERE folder_id = ?1 AND is_deleted = 0"
+        };
+        let mut stmt = conn.prepare(query)?;
         let rows = stmt.query_map(params![folder_id], |row| {
             Ok(FileRecord {
                 folder_id: row.get(0)?,
@@ -1188,6 +1234,10 @@ impl StorageEngine {
         Ok(list)
     }
 
+    pub fn list_files_in_folder(&self, folder_id: &str) -> SqlResult<Vec<FileRecord>> {
+        self.list_all_files_in_folder(folder_id, false)
+    }
+
     // =========================================================================
     // REVISION OPERATIONS
     // =========================================================================
@@ -1197,8 +1247,8 @@ impl StorageEngine {
         let tx = conn.transaction()?;
 
         tx.execute(
-            "INSERT INTO revisions (revision_hash, parent_1, parent_2, manifest_hash, author_device, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO revisions (revision_hash, parent_1, parent_2, manifest_hash, author_device, created_at, sequence_number, file_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(revision_hash) DO NOTHING",
             params![
                 rev.revision_hash,
@@ -1207,6 +1257,8 @@ impl StorageEngine {
                 rev.manifest_hash,
                 rev.author_device,
                 rev.created_at,
+                rev.sequence_number as i64,
+                rev.file_size as i64,
             ],
         )?;
 
@@ -1217,6 +1269,12 @@ impl StorageEngine {
                  ON CONFLICT(revision_hash, chunk_index) DO NOTHING",
                 params![rev.revision_hash, idx as i64, hash],
             )?;
+            if tx.changes() > 0 {
+                tx.execute(
+                    "UPDATE chunks SET ref_count = ref_count + 1 WHERE chunk_hash = ?1",
+                    params![hash],
+                )?;
+            }
         }
 
         tx.commit()?;
@@ -1226,7 +1284,7 @@ impl StorageEngine {
     pub fn get_revision(&self, revision_hash: &str) -> SqlResult<Option<RevisionRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT revision_hash, parent_1, parent_2, manifest_hash, author_device, created_at
+            "SELECT revision_hash, parent_1, parent_2, manifest_hash, author_device, created_at, sequence_number, file_size
              FROM revisions WHERE revision_hash = ?1",
         )?;
         let mut rows = stmt.query_map(params![revision_hash], |row| {
@@ -1237,6 +1295,8 @@ impl StorageEngine {
                 manifest_hash: row.get(3)?,
                 author_device: row.get(4)?,
                 created_at: row.get(5)?,
+                sequence_number: row.get::<_, i64>(6)? as u64,
+                file_size: row.get::<_, i64>(7)? as u64,
             })
         })?;
 
@@ -1286,12 +1346,35 @@ impl StorageEngine {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO chunks (chunk_hash, size, ref_count)
-             VALUES (?1, ?2, 1)
-             ON CONFLICT(chunk_hash) DO UPDATE SET ref_count = ref_count + 1",
+             VALUES (?1, ?2, 0)
+             ON CONFLICT(chunk_hash) DO NOTHING",
             params![chunk_hash, data.len() as i64],
         )?;
 
         Ok(())
+    }
+
+    /// Removes orphaned CAS blocks.  Revisions own references through
+    /// `file_chunks`; standalone received blocks remain at ref_count zero until
+    /// they are attached to a verified revision.
+    pub fn garbage_collect_orphaned_chunks(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let candidates: Vec<String> = {
+            let conn = self.conn.lock().unwrap();
+            let mut statement = conn.prepare("SELECT chunk_hash FROM chunks WHERE ref_count <= 0")?;
+            let hashes = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<SqlResult<Vec<String>>>()?;
+            hashes
+        };
+        for hash in &candidates {
+            let path = self.get_chunk_file_path(hash);
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM chunks WHERE ref_count <= 0", [])?;
+        Ok(candidates.len())
     }
 
     /// Reads chunk payload bytes from the CAS block store.
@@ -1332,8 +1415,13 @@ impl StorageEngine {
     /// Assembles an entire file from its ordered chunk list.
     pub fn read_file_from_revision(&self, revision_hash: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let chunk_hashes = self.get_revision_chunks(revision_hash)?;
+        self.read_chunks_payload(&chunk_hashes)
+    }
+
+    /// Assembles file payload bytes directly from an ordered sequence of chunk hashes.
+    pub fn read_chunks_payload(&self, chunk_hashes: &[String]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let mut payload = Vec::new();
-        for hash in &chunk_hashes {
+        for hash in chunk_hashes {
             match self.get_chunk(hash)? {
                 Some(chunk_bytes) => payload.extend_from_slice(&chunk_bytes),
                 None => {
@@ -1572,12 +1660,14 @@ mod tests {
             name: "Alice's Android Phone".into(),
             address: "tcp://192.168.1.150:9190".into(),
             received_at: 1000,
+            cert_pin: None,
         };
         let dev2 = PendingDeviceRecord {
             device_id: "DEV-LAPTOP-002".into(),
             name: "Bob's Work Laptop".into(),
             address: "tcp://192.168.1.151:9190".into(),
             received_at: 2000,
+            cert_pin: None,
         };
         engine.add_pending_device(&dev1).unwrap();
         engine.add_pending_device(&dev2).unwrap();

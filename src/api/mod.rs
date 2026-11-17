@@ -21,17 +21,18 @@ use axum::{
     extract::{
         path::Path as AxumPath,
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        Query, Request, State,
     },
-    http::StatusCode,
+    http::{header, HeaderName, Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
-use tower_http::cors::{Any, CorsLayer};
+use tokio::sync::{broadcast, watch};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{info, warn};
 
 use crate::conflict::diff3::{self, DiffHunk};
@@ -48,6 +49,7 @@ pub struct AppState {
     pub sync_engine: SyncEngine,
     pub auth_token: Option<String>,
     pub peer_count: Arc<std::sync::atomic::AtomicUsize>,
+    pub shutdown_tx: Option<watch::Sender<bool>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -143,20 +145,47 @@ impl ApiServer {
                 sync_engine,
                 auth_token,
                 peer_count,
+                shutdown_tx: None,
             },
             bind_addr,
         }
     }
 
+    pub fn with_shutdown_tx(mut self, shutdown_tx: watch::Sender<bool>) -> Self {
+        self.state.shutdown_tx = Some(shutdown_tx);
+        self
+    }
+
     /// Builds Axum router with security, CORS, and endpoint handlers.
     pub fn create_router(state: AppState) -> Router {
         let cors = CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any);
+            .allow_origin(AllowOrigin::predicate(|origin, _req_parts| {
+                let s = origin.as_bytes();
+                s.starts_with(b"http://localhost:")
+                    || s == b"http://localhost"
+                    || s.starts_with(b"https://localhost:")
+                    || s == b"https://localhost"
+                    || s.starts_with(b"http://127.0.0.1:")
+                    || s == b"http://127.0.0.1"
+                    || s.starts_with(b"https://127.0.0.1:")
+                    || s == b"https://127.0.0.1"
+                    || s == b"tauri://localhost"
+                    || s == b"app://localhost"
+            }))
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                HeaderName::from_static("x-api-key"),
+            ]);
 
         Router::new()
-            // System
             .route("/api/v1/system/status", get(get_system_status))
             .route("/rest/system/status", get(get_system_status))
             .route("/api/v1/system/version", get(get_system_version))
@@ -167,12 +196,13 @@ impl ApiServer {
             .route("/rest/system/shutdown", post(system_shutdown))
             .route("/api/v1/system/restart", post(system_restart))
             .route("/rest/system/restart", post(system_restart))
+            .route("/api/v1/system/gc", post(run_system_gc))
+            .route("/rest/system/gc", post(run_system_gc))
             .route("/api/v1/system/statemachines", get(get_system_statemachines))
             .route("/rest/system/statemachines", get(get_system_statemachines))
             .route("/api/v1/connections", get(get_connections))
             .route("/rest/system/connections", get(get_connections))
 
-            // Folders
             .route("/api/v1/folders", get(list_folders).post(register_folder))
             .route("/rest/system/folders", get(list_folders).post(register_folder))
             .route("/api/v1/folders/:id", delete(delete_folder))
@@ -189,14 +219,12 @@ impl ApiServer {
             .route("/api/v1/folders/:id/ignores", get(get_folder_ignores).post(set_folder_ignores))
             .route("/rest/db/ignores", get(get_folder_ignores_query).post(set_folder_ignores_query))
 
-            // Devices & Clustering
             .route("/api/v1/devices", get(list_devices).post(add_device))
             .route("/rest/system/devices", get(list_devices).post(add_device))
             .route("/api/v1/devices/:id", get(get_device).delete(remove_device))
             .route("/api/v1/devices/:id/pause", post(pause_device))
             .route("/api/v1/devices/:id/resume", post(resume_device))
 
-            // Mutual Pairing Handshake
             .route("/api/v1/cluster/pending/devices", get(list_pending_devices))
             .route("/rest/cluster/pending/devices", get(list_pending_devices))
             .route("/api/v1/cluster/pending/devices/:id/accept", post(accept_pending_device))
@@ -204,7 +232,6 @@ impl ApiServer {
             .route("/api/v1/cluster/pending/devices/:id/reject", post(reject_pending_device))
             .route("/rest/cluster/pending/devices/:id/reject", post(reject_pending_device))
 
-            // Pending Folders
             .route("/api/v1/cluster/pending/folders", get(list_pending_folders))
             .route("/rest/cluster/pending/folders", get(list_pending_folders))
             .route("/api/v1/cluster/pending/folders/:id/accept", post(accept_pending_folder))
@@ -212,7 +239,6 @@ impl ApiServer {
             .route("/api/v1/cluster/pending/folders/:id/reject", post(reject_pending_folder))
             .route("/rest/cluster/pending/folders/:id/reject", post(reject_pending_folder))
 
-            // Conflicts
             .route("/api/v1/conflicts", get(list_conflicts))
             .route("/api/v1/conflicts/:id", get(get_conflict_details))
             .route("/api/v1/conflicts/:id/base", get(get_conflict_base))
@@ -225,21 +251,124 @@ impl ApiServer {
             .route("/api/v1/conflicts/:id/reopen", post(reopen_conflict))
             .route("/rest/conflicts/:id/reopen", post(reopen_conflict))
 
-            // WebSocket Events
             .route("/api/v1/events", get(websocket_events_handler))
             .route("/rest/events", get(websocket_events_handler))
+            .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
             .layer(cors)
             .with_state(state)
     }
 
-    /// Runs the Axum server asynchronously.
+    /// Runs the Axum server asynchronously until an OS shutdown signal is received.
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_tx, rx) = watch::channel(false);
+        self.run_with_shutdown(rx).await
+    }
+
+    /// Runs the Axum server asynchronously with an external graceful shutdown signal.
+    pub async fn run_with_shutdown(
+        self,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let app = Self::create_router(self.state);
         info!("Synapse Core REST & WebSocket API listening on http://{}", self.bind_addr);
         let listener = tokio::net::TcpListener::bind(&self.bind_addr).await?;
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                while !*shutdown_rx.borrow() {
+                    if shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+                info!("API server shutting down gracefully...");
+            })
+            .await?;
         Ok(())
     }
+}
+
+/// Constant-time API token authentication middleware.
+///
+/// When `AppState.auth_token` is configured (`Some(token)`), all endpoints except
+/// `/api/v1/system/ping` and `/rest/system/ping` require a matching token via:
+/// - `Authorization: Bearer <token>`
+/// - `X-API-Key: <token>`
+/// - `?token=<token>` query parameter (for WebSocket clients)
+async fn auth_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = state.auth_token.as_deref().filter(|t| !t.is_empty()) else {
+        return next.run(req).await;
+    };
+
+    let path = req.uri().path();
+    if path == "/api/v1/system/ping" || path == "/rest/system/ping" {
+        return next.run(req).await;
+    }
+
+    let provided = extract_token_from_request(&req);
+    let is_valid = provided
+        .as_deref()
+        .map(|candidate| constant_time_eq(candidate.as_bytes(), expected.as_bytes()))
+        .unwrap_or(false);
+
+    if is_valid {
+        next.run(req).await
+    } else {
+        warn!("Rejected unauthorized API request to {}", path);
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Unauthorized" })),
+        )
+            .into_response()
+    }
+}
+
+fn extract_token_from_request(req: &Request) -> Option<String> {
+    if let Some(auth_header) = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(bearer) = auth_header
+            .strip_prefix("Bearer ")
+            .or_else(|| auth_header.strip_prefix("bearer "))
+        {
+            return Some(bearer.trim().to_string());
+        }
+    }
+
+    if let Some(api_key) = req
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+    {
+        return Some(api_key.trim().to_string());
+    }
+
+    if let Some(query) = req.uri().query() {
+        for pair in query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == "token" && !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
 }
 
 // =============================================================================
@@ -311,14 +440,45 @@ async fn get_system_ping() -> impl IntoResponse {
     Json(serde_json::json!({ "ping": "pong" }))
 }
 
-async fn system_shutdown() -> impl IntoResponse {
+async fn system_shutdown(State(state): State<AppState>) -> impl IntoResponse {
     info!("System shutdown requested via API");
+    if let Some(tx) = &state.shutdown_tx {
+        let _ = tx.send(true);
+    }
     StatusCode::OK.into_response()
 }
 
 async fn system_restart() -> impl IntoResponse {
     info!("System restart requested via API");
     StatusCode::OK.into_response()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcResponse {
+    pub success: bool,
+    pub collected_chunks: usize,
+}
+
+async fn run_system_gc(State(state): State<AppState>) -> impl IntoResponse {
+    let _ = state.sync_engine.storage().rebuild_chunk_ref_counts();
+    match state.sync_engine.storage().garbage_collect_orphaned_chunks() {
+        Ok(collected) => (
+            StatusCode::OK,
+            Json(GcResponse {
+                success: true,
+                collected_chunks: collected,
+            }),
+        )
+            .into_response(),
+        Err(_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(GcResponse {
+                success: false,
+                collected_chunks: 0,
+            }),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_connections(State(state): State<AppState>) -> impl IntoResponse {
@@ -394,6 +554,11 @@ async fn register_folder(
     if let Err(e) = state.sync_engine.storage().add_folder(&folder) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
+
+    let _ = crate::engine::fs_utils::ensure_folder_marker(
+        std::path::Path::new(&payload.local_path),
+        &folder.marker_name,
+    );
 
     // Trigger initial index scan
     let engine = state.sync_engine.clone();
