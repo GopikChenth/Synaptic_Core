@@ -9,8 +9,8 @@
 [![FastCDC: v2020](https://img.shields.io/badge/Chunking-FastCDC%20v2020-00E5FF.svg?style=flat-square)](https://ieeexplore.ieee.org/document/9055082)
 [![Hashing: BLAKE3](https://img.shields.io/badge/Hasher-BLAKE3%20(~7GB%2Fs)-00E676.svg?style=flat-square)](https://github.com/BLAKE3-team/BLAKE3)
 [![Transport: QUIC](https://img.shields.io/badge/Transport-Quinn%20QUIC%20(TLS%201.3)-8B5CF6.svg?style=flat-square)](https://github.com/quinn-rs/quinn)
-[![Android: libsynapse.so](https://img.shields.io/badge/Android-libsynapse.so%20(W%5EX%20Bypass)-3DDC84.svg?style=flat-square&logo=android)](https://developer.android.com/)
-[![Binary Size](https://img.shields.io/badge/Binary%20Size-7.48%20MB%20stripped-F59E0B.svg?style=flat-square)](#building--cross-compilation)
+[![Android: libsynapse.so](https://img.shields.io/badge/Android-libsynapse.so%20(W%5EX%20Bypass)-3DDC84.svg?style=flat-square&logo=android)](docs/android.md)
+[![Binary Size](https://img.shields.io/badge/Binary%20Size-~9%20MB%20stripped-F59E0B.svg?style=flat-square)](#building--cross-compilation)
 
 </div>
 
@@ -340,33 +340,53 @@ Build the stripped, standalone executable:
 ```bash
 ./scripts/build-desktop.sh
 ```
-* **Output:** [`bin/synapse-core`](bin/synapse-core) (**7.48 MB**, stripped and optimized).
+* **Output:** [`bin/synapse-core`](bin/synapse-core) (**~9 MB** on x86_64 Linux; stripped, thin-LTO).
 * **Execution in Kotlin Desktop:**
   ```kotlin
-  val process = ProcessBuilder("./bin/synapse-core", "--home", configDir.absolutePath)
-      .redirectErrorStream(true)
-      .start()
+  val process = ProcessBuilder(
+      "./bin/synapse-core", "--home", configDir.absolutePath,
+      "--port", "0", "--log-dir", File(configDir, "logs").absolutePath, "--quiet",
+      "--exit-on-stdin-close",   // daemon stops if this app dies
+  ).start()
+  // Ready when <configDir>/runtime.json appears; it contains the bound API URL.
   ```
 
-### Android Execution Mechanics (`libsynapse.so`)
-Since Android 10, executing raw binaries located in standard app storage (`/data/data/`) is blocked by SELinux **W^X** (Write XOR Execute) policies.
+### Android (`libsynapse.so`)
+Since Android 10, apps may only execute files the installer extracted into
+`nativeLibraryDir` (SELinux W^X). The engine is therefore shipped as
+`jniLibs/<abi>/libsynapse.so`. The app spawns it and talks to its HTTP API.
 
-**The Solution:**
-1. Cross-compile for Android ABIs (`arm64-v8a`, `armeabi-v7a`, `x86_64`) via `scripts/build-android.sh`.
-2. Rename the binary artifact to `libsynapse.so` and copy it into:
-   ```text
-   app/androidApp/src/main/jniLibs/arm64-v8a/libsynapse.so
-   ```
-3. During APK installation, Android extracts `libsynapse.so` into the application's `nativeLibraryDir` with executable permissions (`+x`).
-4. An Android foreground service spawns the daemon via `ProcessBuilder`:
-   ```kotlin
-   val nativeLibDir = context.applicationInfo.nativeLibraryDir
-   val binary = File(nativeLibDir, "libsynapse.so")
-   val process = ProcessBuilder(binary.absolutePath, "--home", appFilesDir.absolutePath)
-       .redirectErrorStream(true)
-       .start()
-   ```
-*(In addition, C ABI entrypoints [`synapse_start`](src/lib.rs#L210), [`synapse_stop`](src/lib.rs#L273), and [`synapse_is_running`](src/lib.rs#L263) are exported in `src/lib.rs` for in-memory JNI invocation if desired).*
+```bash
+export ANDROID_NDK_HOME=/path/to/ndk/27.2.12479018   # NDK r27c+
+./scripts/build-android.sh                            # -> dist/android/jniLibs/<abi>/
+```
+
+The script builds with the NDK toolchain directly, enforces **16 KiB page alignment**
+(Android 15+ / Google Play), and verifies every binary (ABI, bionic interpreter, PIE,
+alignment) before reporting success. In your app module, `useLegacyPackaging = true` is
+required so the executable is extracted at install time.
+
+See **[docs/android.md](docs/android.md)** for integration, the process contract (exit
+codes, flags, `runtime.json`), and a symptom → fix troubleshooting table. App-side example
+Kotlin is in [`docs/examples/android/`](docs/examples/android/).
+
+### API & state machines
+The full REST/WebSocket contract is in **[docs/api-endpoints.md](docs/api-endpoints.md)**.
+Folder activity, peer presence, conflicts, pairing and relay sessions are explicit state
+machines. Their states, transitions and actions are served at
+`GET /api/v1/system/statemachines`, and every folder transition is pushed as a
+`FOLDER_STATE_CHANGED` event. Inventory and design rules:
+**[docs/state-machines.md](docs/state-machines.md)**.
+
+### Release pipeline
+Every push builds and tests the engine for Linux (static musl, x86_64 + arm64), Windows
+x64, macOS universal, and Android (arm64-v8a, armeabi-v7a, x86_64). Each binary has its
+HTTP API exercised on its own platform, including Android emulators, before release.
+Releasing is one click: **Actions → Prepare Release → version**. It bumps and tags the
+version, and the pipeline then publishes a GitHub Release with archives, `SHA256SUMS.txt`,
+a machine-readable `manifest.json` for your app, and build-provenance attestations.
+Pushing a `vX.Y.Z` tag yourself works too.
+Details: **[docs/release-pipeline.md](docs/release-pipeline.md)**.
 
 ---
 

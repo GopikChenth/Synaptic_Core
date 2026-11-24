@@ -108,7 +108,8 @@ impl RateLimiter {
             } else {
                 if state.rate_bytes_per_sec > 0.0 {
                     let elapsed = (now - state.last_replenish).as_secs_f64();
-                    state.tokens = (state.tokens + elapsed * state.rate_bytes_per_sec).min(state.burst_capacity);
+                    state.tokens = (state.tokens + elapsed * state.rate_bytes_per_sec)
+                        .min(state.burst_capacity);
                 }
                 state.last_replenish = now;
             }
@@ -117,7 +118,10 @@ impl RateLimiter {
             state.burst_capacity = new_burst;
             state.tokens = state.tokens.min(new_burst);
         }
-        debug!("Bandwidth rate limit updated to {} KiB/s", limit_kib_per_sec);
+        debug!(
+            "Bandwidth rate limit updated to {} KiB/s",
+            limit_kib_per_sec
+        );
     }
 
     /// Returns the current number of available tokens in bytes.
@@ -155,7 +159,8 @@ impl RateLimiter {
         }
 
         let elapsed = (now - state.last_replenish).as_secs_f64();
-        state.tokens = (state.tokens + elapsed * state.rate_bytes_per_sec).min(state.burst_capacity);
+        state.tokens =
+            (state.tokens + elapsed * state.rate_bytes_per_sec).min(state.burst_capacity);
         state.last_replenish = now;
 
         if state.tokens >= bytes as f64 {
@@ -185,7 +190,8 @@ impl RateLimiter {
 
             if now >= state.last_replenish {
                 let elapsed = (now - state.last_replenish).as_secs_f64();
-                state.tokens = (state.tokens + elapsed * state.rate_bytes_per_sec).min(state.burst_capacity);
+                state.tokens =
+                    (state.tokens + elapsed * state.rate_bytes_per_sec).min(state.burst_capacity);
                 state.last_replenish = now;
 
                 if state.tokens >= bytes as f64 {
@@ -240,8 +246,14 @@ impl BandwidthLimiter {
         download_burst_bytes: usize,
     ) -> Self {
         Self {
-            upload: Arc::new(RateLimiter::with_burst(upload_kib_per_sec, upload_burst_bytes)),
-            download: Arc::new(RateLimiter::with_burst(download_kib_per_sec, download_burst_bytes)),
+            upload: Arc::new(RateLimiter::with_burst(
+                upload_kib_per_sec,
+                upload_burst_bytes,
+            )),
+            download: Arc::new(RateLimiter::with_burst(
+                download_kib_per_sec,
+                download_burst_bytes,
+            )),
         }
     }
 
@@ -289,11 +301,7 @@ mod tests {
     use super::*;
 
     fn assert_approx_duration(actual: Duration, expected: Duration, tolerance: Duration) {
-        let diff = if actual >= expected {
-            actual - expected
-        } else {
-            expected - actual
-        };
+        let diff = actual.abs_diff(expected);
         assert!(
             diff <= tolerance,
             "actual {:?} was not within {:?} of expected {:?}",
@@ -327,13 +335,21 @@ mod tests {
         let start = tokio::time::Instant::now();
         limiter.acquire(5120).await;
         let elapsed = start.elapsed();
-        assert_approx_duration(elapsed, Duration::from_millis(500), Duration::from_millis(10));
+        assert_approx_duration(
+            elapsed,
+            Duration::from_millis(500),
+            Duration::from_millis(10),
+        );
 
         // Acquiring another 5 KiB should take another ~500ms
         let start2 = tokio::time::Instant::now();
         limiter.acquire(5120).await;
         let elapsed2 = start2.elapsed();
-        assert_approx_duration(elapsed2, Duration::from_millis(500), Duration::from_millis(10));
+        assert_approx_duration(
+            elapsed2,
+            Duration::from_millis(500),
+            Duration::from_millis(10),
+        );
     }
 
     #[tokio::test]
@@ -351,7 +367,11 @@ mod tests {
         // Subsequent 10 KiB must sleep for 1 second
         let start2 = tokio::time::Instant::now();
         limiter.acquire(10240).await;
-        assert_approx_duration(start2.elapsed(), Duration::from_secs(1), Duration::from_millis(10));
+        assert_approx_duration(
+            start2.elapsed(),
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        );
     }
 
     #[tokio::test]
@@ -387,7 +407,11 @@ mod tests {
         let limiter = RateLimiter::with_burst(10, 0);
         let start = tokio::time::Instant::now();
         limiter.acquire(5120).await; // 500ms at 10 KiB/s
-        assert_approx_duration(start.elapsed(), Duration::from_millis(500), Duration::from_millis(10));
+        assert_approx_duration(
+            start.elapsed(),
+            Duration::from_millis(500),
+            Duration::from_millis(10),
+        );
 
         // Double speed to 20 KiB/s
         limiter.set_rate_limit(20).await;
@@ -395,7 +419,11 @@ mod tests {
 
         let start2 = tokio::time::Instant::now();
         limiter.acquire(5120).await; // 250ms at 20 KiB/s
-        assert_approx_duration(start2.elapsed(), Duration::from_millis(250), Duration::from_millis(10));
+        assert_approx_duration(
+            start2.elapsed(),
+            Duration::from_millis(250),
+            Duration::from_millis(10),
+        );
 
         // Disable limit (unlimited)
         limiter.set_rate_limit(0).await;
@@ -444,7 +472,11 @@ mod tests {
         // Concurrent execution:
         // Download: 10 KiB at 20 KiB/s = 500ms
         // Upload: 10 KiB at 10 KiB/s = 1000ms
-        assert_approx_duration(dl_dur, Duration::from_millis(500), Duration::from_millis(15));
+        assert_approx_duration(
+            dl_dur,
+            Duration::from_millis(500),
+            Duration::from_millis(15),
+        );
         assert_approx_duration(up_dur, Duration::from_secs(1), Duration::from_millis(15));
     }
 
@@ -532,7 +564,11 @@ mod tests {
         // Another 10 KiB must now sleep for 500ms (10 KiB / 20 KiB/s = 0.5s)
         let start2 = tokio::time::Instant::now();
         limiter.acquire(10240).await;
-        assert_approx_duration(start2.elapsed(), Duration::from_millis(500), Duration::from_millis(15));
+        assert_approx_duration(
+            start2.elapsed(),
+            Duration::from_millis(500),
+            Duration::from_millis(15),
+        );
     }
 
     #[tokio::test]
@@ -656,7 +692,11 @@ mod tests {
         // Initial throttled acquire
         let start = tokio::time::Instant::now();
         limiter.acquire(10240).await;
-        assert_approx_duration(start.elapsed(), Duration::from_secs(1), Duration::from_millis(15));
+        assert_approx_duration(
+            start.elapsed(),
+            Duration::from_secs(1),
+            Duration::from_millis(15),
+        );
 
         // Switch to unlimited (0 KiB/s)
         limiter.set_rate_limit(0).await;
@@ -675,7 +715,11 @@ mod tests {
         // Acquiring 25 KiB at 50 KiB/s takes 500ms
         let start3 = tokio::time::Instant::now();
         limiter.acquire(25600).await;
-        assert_approx_duration(start3.elapsed(), Duration::from_millis(500), Duration::from_millis(15));
+        assert_approx_duration(
+            start3.elapsed(),
+            Duration::from_millis(500),
+            Duration::from_millis(15),
+        );
     }
 
     #[tokio::test]
@@ -746,7 +790,15 @@ mod tests {
                 start.elapsed()
             }
         );
-        assert_approx_duration(up_dur, Duration::from_millis(500), Duration::from_millis(15));
-        assert_approx_duration(dl_dur, Duration::from_millis(500), Duration::from_millis(15));
+        assert_approx_duration(
+            up_dur,
+            Duration::from_millis(500),
+            Duration::from_millis(15),
+        );
+        assert_approx_duration(
+            dl_dur,
+            Duration::from_millis(500),
+            Duration::from_millis(15),
+        );
     }
 }

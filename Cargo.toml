@@ -6,6 +6,9 @@ authors = ["Synapse Team"]
 license = "MIT"
 readme = "README.md"
 description = "Decentralized File Synchronization & Conflict Resolution Engine"
+repository = "https://github.com/GopikChenth/Synaptic_Core"
+# File::try_lock (single-instance guard) was stabilised in 1.89.
+rust-version = "1.89"
 
 [[bin]]
 name = "synapse-core"
@@ -14,7 +17,6 @@ path = "src/main.rs"
 [lib]
 name = "synapse_core"
 path = "src/lib.rs"
-crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 # Async Runtime
@@ -57,11 +59,23 @@ ring = "0.17"
 
 # Networking & QUIC Transport
 socket2 = "0.6"
-quinn = "0.11"
+# Default features pull in rustls-platform-verifier, which needs JVM initialisation on
+# Android and is never used here (peers are pinned by certificate). Opt in explicitly.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"
 
 # Logging & Observability
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# Strips the static symbol table only; exported JNI/C symbols live in .dynsym and survive.
+strip = "symbols"
+debug = false
+panic = "unwind"

@@ -12,9 +12,11 @@
 //!   (HATEOAS / capabilities), self-healing transition error diagnostics, and a runtime
 //!   introspection schema endpoint (`/api/v1/system/statemachines`).
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
-use serde::{Deserialize, Serialize};
+
+pub mod runtime;
 
 // =============================================================================
 // 1. CORE INTROSPECTION & ERROR TYPES
@@ -119,7 +121,9 @@ impl ConflictStatus {
     pub fn description(&self) -> &'static str {
         match self {
             Self::Pending => "Conflict is actively quarantined awaiting resolution decision",
-            Self::Resolved => "Conflict has been reconciled and applied; working copy is up to date",
+            Self::Resolved => {
+                "Conflict has been reconciled and applied; working copy is up to date"
+            }
             Self::Ignored => "Conflict resolution was postponed or dismissed",
         }
     }
@@ -191,7 +195,20 @@ impl ConflictStatus {
 
 impl fmt::Display for ConflictStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+        f.pad(self.as_str())
+    }
+}
+
+/// Lets callers compare against the wire value directly (`status == "PENDING"`).
+impl PartialEq<&str> for ConflictStatus {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<str> for ConflictStatus {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
     }
 }
 
@@ -251,10 +268,16 @@ impl FolderSyncState {
     pub fn description(&self) -> &'static str {
         match self {
             Self::Idle => "Folder is synchronized and actively monitoring filesystem events",
-            Self::Scanning => "Folder is scanning directory structure and hashing local file deltas",
-            Self::Syncing => "Folder is transferring blocks or reconciling incoming remote revisions",
+            Self::Scanning => {
+                "Folder is scanning directory structure and hashing local file deltas"
+            }
+            Self::Syncing => {
+                "Folder is transferring blocks or reconciling incoming remote revisions"
+            }
             Self::Paused => "Folder synchronization is paused; no watcher or sync tasks run",
-            Self::Error => "Folder encountered a filesystem error or mount safety marker check failure",
+            Self::Error => {
+                "Folder encountered a filesystem error or mount safety marker check failure"
+            }
         }
     }
 
@@ -282,13 +305,19 @@ impl FolderSyncState {
             (Self::Syncing, Self::Paused) => true,
             (Self::Syncing, Self::Error) => true,
 
-            // From Paused: can only be resumed to Idle or Scanning
+            // From Paused: resuming lands in whatever the folder is doing underneath
+            // (idle, a scan or sync still in flight, or an unresolved error)
             (Self::Paused, Self::Idle) => true,
             (Self::Paused, Self::Scanning) => true,
+            (Self::Paused, Self::Syncing) => true,
+            (Self::Paused, Self::Error) => true,
 
-            // From Error: can be recovered to Idle or rescanned
+            // From Error: recovered by a successful rescan; incoming syncs and pausing
+            // still apply while the error is outstanding
             (Self::Error, Self::Idle) => true,
             (Self::Error, Self::Scanning) => true,
+            (Self::Error, Self::Syncing) => true,
+            (Self::Error, Self::Paused) => true,
 
             (s1, s2) if *s1 == s2 => true,
             _ => false,
@@ -452,6 +481,107 @@ impl FromStr for ConflictPolicy {
 }
 
 // =============================================================================
+// 5b. FOLDER CONFIGURATION VALIDATION
+// =============================================================================
+
+/// `400 Bad Request` body for a configuration value the engine doesn't understand.
+/// Lists the accepted values so a UI can show a picker and an agent can self-correct.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvalidFieldError {
+    /// Always `"invalid_field"`.
+    pub error: String,
+    pub field: String,
+    pub value: String,
+    /// Canonical accepted values (matching is case-insensitive; `_` is optional).
+    pub allowed: Vec<String>,
+    pub message: String,
+}
+
+impl InvalidFieldError {
+    fn new(field: &str, value: &str, allowed: &[&str]) -> Self {
+        Self {
+            error: "invalid_field".into(),
+            field: field.into(),
+            value: value.into(),
+            allowed: allowed.iter().map(|s| s.to_string()).collect(),
+            message: format!(
+                "Unsupported {field} '{value}'. Accepted values: {}",
+                allowed.join(", ")
+            ),
+        }
+    }
+}
+
+impl fmt::Display for InvalidFieldError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for InvalidFieldError {}
+
+pub const SYNC_MODES: &[&str] = &["SendReceive", "SendOnly", "ReceiveOnly"];
+pub const CONFLICT_POLICIES: &[&str] = &["THREE_WAY_AUTO", "LWW", "MANUAL"];
+/// `random` is Syncthing's default; it is accepted for compatibility and pulls in
+/// alphabetical order.
+pub const PULL_ORDERS: &[&str] = &[
+    "alphabetical",
+    "smallestFirst",
+    "largestFirst",
+    "newestFirst",
+    "oldestFirst",
+    "random",
+];
+pub const VERSIONING_TYPES: &[&str] = &["None", "TrashCan", "Simple", "Staggered"];
+
+/// Validates folder policy strings before they are persisted.
+///
+/// Previously any string was stored and later silently replaced by a default when
+/// parsed (e.g. a typo in `sync_mode` meant "send and receive"). Only values the
+/// engine actually understands are accepted now; every spelling that worked before is
+/// still accepted.
+pub fn validate_folder_config(
+    conflict_policy: &str,
+    sync_mode: Option<&str>,
+    pull_order: Option<&str>,
+    versioning_type: Option<&str>,
+) -> Result<(), InvalidFieldError> {
+    if conflict_policy.parse::<ConflictPolicy>().is_err() {
+        return Err(InvalidFieldError::new(
+            "conflict_policy",
+            conflict_policy,
+            CONFLICT_POLICIES,
+        ));
+    }
+    if let Some(v) = sync_mode {
+        if v.parse::<SyncMode>().is_err() {
+            return Err(InvalidFieldError::new("sync_mode", v, SYNC_MODES));
+        }
+    }
+    if let Some(v) = pull_order {
+        let ok =
+            v.trim().eq_ignore_ascii_case("random") || v.parse::<crate::p2p::PullOrder>().is_ok();
+        if !ok {
+            return Err(InvalidFieldError::new("pull_order", v, PULL_ORDERS));
+        }
+    }
+    if let Some(v) = versioning_type {
+        let norm = v.trim().to_ascii_lowercase().replace('_', "");
+        if !matches!(
+            norm.as_str(),
+            "" | "none" | "trashcan" | "trash" | "simple" | "staggered"
+        ) {
+            return Err(InvalidFieldError::new(
+                "versioning_type",
+                v,
+                VERSIONING_TYPES,
+            ));
+        }
+    }
+    Ok(())
+}
+
+// =============================================================================
 // 6. CLUSTER DEVICE PAIRING STATE MACHINE
 // =============================================================================
 
@@ -492,18 +622,18 @@ impl DevicePairingState {
             Self::Pending => "Device pairing request is pending user or agent confirmation",
             Self::Paired => "Device is mutually paired and participating in the cluster",
             Self::Paused => "Device communication is temporarily paused",
-            Self::Rejected => "Device pairing request was rejected",
+            Self::Rejected => "Pairing request was rejected and is remembered: the device is not re-staged as pending on later discovery. FORGET (DELETE /api/v1/cluster/rejected/devices/:id) clears it; adding the device explicitly overrides it",
         }
     }
 
     pub fn can_transition_to(&self, next: DevicePairingState) -> bool {
-        match (self, next) {
-            (Self::Pending, Self::Paired) => true,
-            (Self::Pending, Self::Rejected) => true,
-            (Self::Paired, Self::Paused) => true,
-            (Self::Paused, Self::Paired) => true,
-            _ => false,
-        }
+        matches!(
+            (self, next),
+            (Self::Pending, Self::Paired)
+                | (Self::Pending, Self::Rejected)
+                | (Self::Paired, Self::Paused)
+                | (Self::Paused, Self::Paired)
+        )
     }
 
     pub fn allowed_transitions(&self) -> Vec<DevicePairingState> {
@@ -519,7 +649,7 @@ impl DevicePairingState {
             Self::Pending => vec!["ACCEPT", "REJECT"],
             Self::Paired => vec!["PAUSE", "REMOVE", "SHARE_FOLDER", "UNSHARE_FOLDER"],
             Self::Paused => vec!["RESUME", "REMOVE"],
-            Self::Rejected => vec![],
+            Self::Rejected => vec!["FORGET"],
         }
     }
 
@@ -563,6 +693,83 @@ impl FromStr for DevicePairingState {
 }
 
 // =============================================================================
+// 6b. REMOTE FOLDER OFFER STATE MACHINE
+// =============================================================================
+
+/// Lifecycle of a folder that a paired device offered to share with us.
+/// Keyed by `(folder_id, offering device_id)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FolderOfferState {
+    /// Offer received; waiting for the user to accept (with a local path) or reject.
+    #[default]
+    Pending,
+    /// Accepted: the folder exists locally and is shared with the offering device.
+    Accepted,
+    /// Rejected and remembered, so the same offer doesn't come back.
+    Rejected,
+}
+
+impl FolderOfferState {
+    pub const ALL: [FolderOfferState; 3] = [Self::Pending, Self::Accepted, Self::Rejected];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Pending => "A paired device offered this folder; accept with a local path or reject",
+            Self::Accepted => "The folder is registered locally and shared with the offering device",
+            Self::Rejected => "The offer was rejected and is remembered so it is not shown again. FORGET (DELETE /api/v1/cluster/rejected/folders/:id?device_id=…) clears it",
+        }
+    }
+
+    pub fn can_transition_to(&self, next: FolderOfferState) -> bool {
+        matches!(
+            (self, next),
+            (Self::Pending, Self::Accepted) | (Self::Pending, Self::Rejected)
+        )
+    }
+
+    pub fn available_actions(&self) -> Vec<&'static str> {
+        match self {
+            Self::Pending => vec!["ACCEPT", "REJECT"],
+            Self::Accepted => vec![],
+            Self::Rejected => vec!["FORGET"],
+        }
+    }
+
+    pub fn metadata(&self) -> StateMetadata {
+        StateMetadata {
+            state: self.as_str().to_string(),
+            description: self.description().to_string(),
+            is_terminal: !matches!(self, Self::Pending),
+            allowed_transitions: Self::ALL
+                .iter()
+                .filter(|s| self.can_transition_to(**s))
+                .map(|s| s.as_str().to_string())
+                .collect(),
+            available_actions: self
+                .available_actions()
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        }
+    }
+}
+
+impl fmt::Display for FolderOfferState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+// =============================================================================
 // 7. SWARM CHUNK REPLICATION STATE MACHINE
 // =============================================================================
 
@@ -580,10 +787,7 @@ pub enum ChunkDownloadState {
     /// Chunk has been fetched, verified by BLAKE3 hash, and committed to CAS block store.
     Completed,
     /// Chunk download failed or timed out; eligible for requeueing or terminal failure.
-    Failed {
-        reason: String,
-        attempts: usize,
-    },
+    Failed { reason: String, attempts: usize },
 }
 
 impl ChunkDownloadState {
@@ -656,7 +860,7 @@ pub fn get_all_state_machines() -> Vec<StateMachineDef> {
             machine_id: "folder_sync_lifecycle".to_string(),
             display_name: "Folder Synchronization Lifecycle State Machine".to_string(),
             subsystem: "engine".to_string(),
-            description: "Monitors the continuous indexing, delta chunking, and block transfer phases for registered synchronization roots.".to_string(),
+            description: "Runtime state of a synchronization root, derived from in-flight work: paused (persisted) > scanning > syncing > error > idle. Every change is broadcast as a FOLDER_STATE_CHANGED event; entering/leaving syncing also emits SYNC_STARTED/SYNC_COMPLETED. An error carries a reason (GET /api/v1/folders/:id/status -> error) and is cleared by the next successful rescan.".to_string(),
             initial_state: FolderSyncState::Idle.as_str().to_string(),
             states: FolderSyncState::ALL.iter().map(|s| s.metadata()).collect(),
         },
@@ -667,6 +871,36 @@ pub fn get_all_state_machines() -> Vec<StateMachineDef> {
             description: "Governs node discovery, mutual cryptographic handshake, trust verification, and cluster participation.".to_string(),
             initial_state: DevicePairingState::Pending.as_str().to_string(),
             states: DevicePairingState::ALL.iter().map(|s| s.metadata()).collect(),
+        },
+        StateMachineDef {
+            machine_id: "folder_offer_lifecycle".to_string(),
+            display_name: "Remote Folder Offer State Machine".to_string(),
+            subsystem: "cluster".to_string(),
+            description: "A folder offered by a paired device, keyed by (folder_id, device_id). Accepting registers it locally (mount marker created, initial scan started) and shares it back; rejecting is remembered. Invalid actions return 409 with the allowed transitions.".to_string(),
+            initial_state: FolderOfferState::Pending.as_str().to_string(),
+            states: FolderOfferState::ALL.iter().map(|s| s.metadata()).collect(),
+        },
+        StateMachineDef {
+            machine_id: "engine_lifecycle".to_string(),
+            display_name: "Engine Lifecycle State Machine".to_string(),
+            subsystem: "system".to_string(),
+            description: "Lifecycle of the engine process. Reported as `lifecycle` in GET /api/v1/system/status. POST /api/v1/system/restart moves ready -> restarting: the engine stops and starts again in-process (same PID, same API address, storage reloaded). POST /api/v1/system/shutdown, SIGTERM, a dead parent or closed stdin move to stopping.".to_string(),
+            initial_state: runtime::EngineLifecycleState::Starting.as_str().to_string(),
+            states: runtime::EngineLifecycleState::ALL
+                .iter()
+                .map(|s| s.metadata())
+                .collect(),
+        },
+        StateMachineDef {
+            machine_id: "peer_presence".to_string(),
+            display_name: "Peer Presence State Machine".to_string(),
+            subsystem: "p2p".to_string(),
+            description: "Heartbeat-based liveness of a known peer. Any discovery announcement or protocol message marks it online (PEER_CONNECTED); 30 s of silence marks it offline (PEER_DISCONNECTED). Drives peer_count, /api/v1/connections is_connected, and device 'online'. Offline peers are still contacted for sync.".to_string(),
+            initial_state: runtime::PeerPresenceState::Offline.as_str().to_string(),
+            states: runtime::PeerPresenceState::ALL
+                .iter()
+                .map(|s| s.metadata())
+                .collect(),
         },
         StateMachineDef {
             machine_id: "relay_session_lifecycle".to_string(),
@@ -787,9 +1021,18 @@ mod tests {
         assert_eq!(ConflictStatus::Resolved.to_string(), "RESOLVED");
         assert_eq!(ConflictStatus::Ignored.to_string(), "IGNORED");
 
-        assert_eq!(ConflictStatus::from_str("pending").unwrap(), ConflictStatus::Pending);
-        assert_eq!(ConflictStatus::from_str("RESOLVED").unwrap(), ConflictStatus::Resolved);
-        assert_eq!(ConflictStatus::from_str("ignored").unwrap(), ConflictStatus::Ignored);
+        assert_eq!(
+            ConflictStatus::from_str("pending").unwrap(),
+            ConflictStatus::Pending
+        );
+        assert_eq!(
+            ConflictStatus::from_str("RESOLVED").unwrap(),
+            ConflictStatus::Resolved
+        );
+        assert_eq!(
+            ConflictStatus::from_str("ignored").unwrap(),
+            ConflictStatus::Ignored
+        );
 
         let json = serde_json::to_string(&ConflictStatus::Pending).unwrap();
         assert_eq!(json, "\"PENDING\"");
@@ -811,10 +1054,56 @@ mod tests {
 
         let paused = FolderSyncState::Paused;
         assert!(paused.can_transition_to(FolderSyncState::Idle));
-        assert!(!paused.can_transition_to(FolderSyncState::Syncing));
+        // Resuming while a remote sync is still in flight lands directly in syncing
+        // (state is derived from running work; see state::runtime).
+        assert!(paused.can_transition_to(FolderSyncState::Syncing));
+        assert!(FolderSyncState::Error.can_transition_to(FolderSyncState::Scanning));
 
         let json = serde_json::to_string(&FolderSyncState::Scanning).unwrap();
         assert_eq!(json, "\"scanning\"");
+    }
+
+    #[test]
+    fn folder_config_validation_accepts_every_known_spelling() {
+        for (cp, sm, po, vt) in [
+            ("THREE_WAY_AUTO", "SEND_RECEIVE", "ALPHABETICAL", "SIMPLE"),
+            ("three_way_auto", "SendReceive", "Alphabetical", "None"),
+            ("LWW", "sendonly", "smallestFirst", "trashcan"),
+            ("MANUAL", "receive_only", "random", "staggered"),
+            ("auto", "ReceiveOnly", "newest", "TrashCan"),
+        ] {
+            assert!(
+                validate_folder_config(cp, Some(sm), Some(po), Some(vt)).is_ok(),
+                "{cp} {sm} {po} {vt}"
+            );
+        }
+        assert!(validate_folder_config("THREE_WAY_AUTO", None, None, None).is_ok());
+    }
+
+    #[test]
+    fn folder_config_validation_rejects_unknown_values_with_choices() {
+        let err = validate_folder_config("THREE_WAY_AUTO", Some("mirror"), None, None).unwrap_err();
+        assert_eq!(err.field, "sync_mode");
+        assert_eq!(err.value, "mirror");
+        assert_eq!(err.allowed, SYNC_MODES);
+        assert_eq!(
+            validate_folder_config("NEWEST_WINS", None, None, None)
+                .unwrap_err()
+                .field,
+            "conflict_policy"
+        );
+        assert_eq!(
+            validate_folder_config("LWW", None, Some("biggest"), None)
+                .unwrap_err()
+                .field,
+            "pull_order"
+        );
+        assert_eq!(
+            validate_folder_config("LWW", None, None, Some("external"))
+                .unwrap_err()
+                .field,
+            "versioning_type"
+        );
     }
 
     #[test]

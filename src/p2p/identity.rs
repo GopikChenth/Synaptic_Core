@@ -3,10 +3,10 @@
 //! Provides Ed25519 key generation, public key fingerprinting, and
 //! canonical Syncthing-compatible formatted Device IDs with Luhn check digits.
 
-use std::fs;
-use std::path::Path;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
+use std::fs;
+use std::path::Path;
 
 pub const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
@@ -30,7 +30,9 @@ pub struct TlsIdentity {
 }
 
 impl TlsIdentity {
-    pub fn load_or_generate(home_dir: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn load_or_generate(
+        home_dir: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let certificate_path = home_dir.join("p2p_certificate.der");
         let private_key_path = home_dir.join("p2p_private_key.der");
 
@@ -60,7 +62,9 @@ impl TlsIdentity {
 
 impl NodeIdentity {
     /// Loads or creates an Ed25519 node identity keypair.
-    pub fn load_or_generate(home_dir: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn load_or_generate(
+        home_dir: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let key_path = home_dir.join("node_identity.key");
 
         let signing_key = if key_path.exists() {
@@ -196,11 +200,17 @@ pub fn normalize_device_id(input: &str) -> Result<String, String> {
     // Validate each group: characters must be in BASE32_ALPHABET and check digit must match
     for group in &groups {
         if group.len() < 2 {
-            return Err(format!("Group '{}' too short to contain payload and check digit", group));
+            return Err(format!(
+                "Group '{}' too short to contain payload and check digit",
+                group
+            ));
         }
         for c in group.chars() {
             if !BASE32_ALPHABET.contains(&(c as u8)) {
-                return Err(format!("Invalid character '{}' in device ID: not in Base32 alphabet", c));
+                return Err(format!(
+                    "Invalid character '{}' in device ID: not in Base32 alphabet",
+                    c
+                ));
             }
         }
 
@@ -252,7 +262,10 @@ mod tests {
         let f3 = format_device_id(&bytes2);
 
         assert_eq!(f1, f2, "Formatting must be deterministic");
-        assert_ne!(f1, f3, "Different public keys must produce distinct device IDs");
+        assert_ne!(
+            f1, f3,
+            "Different public keys must produce distinct device IDs"
+        );
     }
 
     #[test]
@@ -274,7 +287,10 @@ mod tests {
         assert_eq!(normalize_device_id(&formatted).unwrap(), formatted);
 
         // Lowercase Base32 should normalize to uppercase canonical
-        assert_eq!(normalize_device_id(&formatted.to_lowercase()).unwrap(), formatted);
+        assert_eq!(
+            normalize_device_id(&formatted.to_lowercase()).unwrap(),
+            formatted
+        );
 
         // Space-separated Base32 groups should normalize to hyphen-separated
         let space_formatted = formatted.replace('-', " ");
@@ -364,7 +380,8 @@ mod tests {
 
     #[test]
     fn test_node_identity_persistence_and_signing() {
-        let temp_dir = std::env::temp_dir().join(format!("synapse_node_id_test_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("synapse_node_id_test_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let id1 = NodeIdentity::load_or_generate(&temp_dir).unwrap();
@@ -386,7 +403,10 @@ mod tests {
         assert!(id1.verifying_key.verify_strict(message, &signature).is_ok());
 
         let tampered_message = b"Synapse cluster node pairing verification message 2027";
-        assert!(id1.verifying_key.verify_strict(tampered_message, &signature).is_err());
+        assert!(id1
+            .verifying_key
+            .verify_strict(tampered_message, &signature)
+            .is_err());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

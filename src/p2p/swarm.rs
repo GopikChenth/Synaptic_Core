@@ -477,7 +477,11 @@ impl SwarmScheduler {
             let (min_file_idx, chunk_idx_in_file) = self
                 .chunk_to_files
                 .get(chunk)
-                .and_then(|list| list.iter().min_by_key(|(f_idx, c_idx)| (*f_idx, *c_idx)).copied())
+                .and_then(|list| {
+                    list.iter()
+                        .min_by_key(|(f_idx, c_idx)| (*f_idx, *c_idx))
+                        .copied()
+                })
                 .unwrap_or((usize::MAX, usize::MAX));
 
             let score = match self.strategy {
@@ -507,30 +511,38 @@ impl SwarmScheduler {
 
         if let Some((_score, chunk_hash, peer_id)) = best_candidate {
             self.pending_chunks.remove(&chunk_hash);
-            self.in_flight
-                .insert(chunk_hash.clone(), (peer_id.clone(), tokio::time::Instant::now()));
+            self.in_flight.insert(
+                chunk_hash.clone(),
+                (peer_id.clone(), tokio::time::Instant::now()),
+            );
 
             if let Some(peer) = self.peers.get_mut(&peer_id) {
                 peer.in_flight_chunks.insert(chunk_hash.clone());
             }
 
-            let (folder_id, relative_path) = if let Some(indices) = self.chunk_to_files.get(&chunk_hash) {
-                if let Some(&(idx, _)) = indices.first() {
-                    if let Some(file) = self.files.get(idx) {
-                        (Some(file.folder_id.clone()), Some(file.relative_path.clone()))
+            let (folder_id, relative_path) =
+                if let Some(indices) = self.chunk_to_files.get(&chunk_hash) {
+                    if let Some(&(idx, _)) = indices.first() {
+                        if let Some(file) = self.files.get(idx) {
+                            (
+                                Some(file.folder_id.clone()),
+                                Some(file.relative_path.clone()),
+                            )
+                        } else {
+                            (None, None)
+                        }
                     } else {
                         (None, None)
                     }
                 } else {
                     (None, None)
-                }
-            } else {
-                (None, None)
-            };
+                };
 
             debug!(
                 "SwarmScheduler assigned chunk {} to peer {} (in-flight: {})",
-                chunk_hash, peer_id, self.in_flight.len()
+                chunk_hash,
+                peer_id,
+                self.in_flight.len()
             );
 
             Some(ChunkAssignment {
@@ -611,7 +623,10 @@ impl SwarmScheduler {
             if !self.completed_chunks.contains(&chunk) {
                 self.pending_chunks.insert(chunk.clone());
             }
-            warn!("Chunk request {} on peer {} timed out and re-queued", chunk, peer_id);
+            warn!(
+                "Chunk request {} on peer {} timed out and re-queued",
+                chunk, peer_id
+            );
             result.push(chunk);
         }
         result
@@ -699,11 +714,26 @@ mod tests {
 
     #[test]
     fn test_pull_order_string_parsing() {
-        assert_eq!("alphabetical".parse::<PullOrder>().unwrap(), PullOrder::Alphabetical);
-        assert_eq!("smallestFirst".parse::<PullOrder>().unwrap(), PullOrder::SmallestFirst);
-        assert_eq!("largestfirst".parse::<PullOrder>().unwrap(), PullOrder::LargestFirst);
-        assert_eq!("newestFirst".parse::<PullOrder>().unwrap(), PullOrder::NewestFirst);
-        assert_eq!("oldest".parse::<PullOrder>().unwrap(), PullOrder::OldestFirst);
+        assert_eq!(
+            "alphabetical".parse::<PullOrder>().unwrap(),
+            PullOrder::Alphabetical
+        );
+        assert_eq!(
+            "smallestFirst".parse::<PullOrder>().unwrap(),
+            PullOrder::SmallestFirst
+        );
+        assert_eq!(
+            "largestfirst".parse::<PullOrder>().unwrap(),
+            PullOrder::LargestFirst
+        );
+        assert_eq!(
+            "newestFirst".parse::<PullOrder>().unwrap(),
+            PullOrder::NewestFirst
+        );
+        assert_eq!(
+            "oldest".parse::<PullOrder>().unwrap(),
+            PullOrder::OldestFirst
+        );
         assert!("invalid".parse::<PullOrder>().is_err());
 
         assert_eq!(PullOrder::Alphabetical.to_string(), "alphabetical");
@@ -872,7 +902,11 @@ mod tests {
         assert_eq!(scheduler.pending_count(), 1);
 
         // Next schedule must assign to the remaining connected peer
-        let other_peer = if assigned_peer == "node_1" { "node_2" } else { "node_1" };
+        let other_peer = if assigned_peer == "node_1" {
+            "node_2"
+        } else {
+            "node_1"
+        };
         let a2 = scheduler.schedule_next().expect("re-assigned");
         assert_eq!(a2.chunk_hash, "chunk_x");
         assert_eq!(a2.peer_id, other_peer);
@@ -949,7 +983,13 @@ mod tests {
     fn test_file_progress_tracking() {
         let mut scheduler = SwarmScheduler::new(PullOrder::Alphabetical);
         scheduler.register_peer("peer_1", vec!["c1", "c2", "c3"]);
-        scheduler.queue_file("f", "doc.pdf", 300, 1, vec!["c1".into(), "c2".into(), "c3".into()]);
+        scheduler.queue_file(
+            "f",
+            "doc.pdf",
+            300,
+            1,
+            vec!["c1".into(), "c2".into(), "c3".into()],
+        );
 
         assert_eq!(scheduler.file_progress("f", "doc.pdf"), Some((0, 3)));
 
@@ -980,7 +1020,10 @@ mod tests {
         // c_med1, c_med2: 2 peers (node_1, node_2)
         // c_med3: 3 peers (node_2, node_3, node_4)
         // c_com: 5 peers (all)
-        scheduler.register_peer("node_1", vec!["c_rare1", "c_rare2", "c_med1", "c_med2", "c_com"]);
+        scheduler.register_peer(
+            "node_1",
+            vec!["c_rare1", "c_rare2", "c_med1", "c_med2", "c_com"],
+        );
         scheduler.register_peer("node_2", vec!["c_med1", "c_med2", "c_med3", "c_com"]);
         scheduler.register_peer("node_3", vec!["c_med3", "c_com"]);
         scheduler.register_peer("node_4", vec!["c_med3", "c_com"]);
@@ -993,7 +1036,9 @@ mod tests {
         assert_eq!(scheduler.rarity_of("c_med3"), 3);
         assert_eq!(scheduler.rarity_of("c_com"), 5);
 
-        scheduler.queue_chunks(vec!["c_com", "c_med3", "c_med2", "c_med1", "c_rare2", "c_rare1"]);
+        scheduler.queue_chunks(vec![
+            "c_com", "c_med3", "c_med2", "c_med1", "c_rare2", "c_rare1",
+        ]);
 
         // First two scheduled must be rarity 1 (c_rare1 and c_rare2), assigned to node_1
         let a1 = scheduler.schedule_next().unwrap();
@@ -1097,7 +1142,8 @@ mod tests {
     #[test]
     fn test_all_five_pull_ordering_policies_in_scheduler() {
         let make_scheduler = |order: PullOrder| {
-            let mut s = SwarmScheduler::with_strategy(order, SchedulingStrategy::FilePriorityRarest);
+            let mut s =
+                SwarmScheduler::with_strategy(order, SchedulingStrategy::FilePriorityRarest);
             s.register_peer("seed", vec!["c_a", "c_b", "c_c", "c_d", "c_e"]);
 
             // File items:
@@ -1116,27 +1162,47 @@ mod tests {
 
         // 1. Alphabetical: a -> b -> c -> d -> e
         let mut s = make_scheduler(PullOrder::Alphabetical);
-        let order: Vec<String> = s.schedule_batch(5).into_iter().map(|a| a.chunk_hash).collect();
+        let order: Vec<String> = s
+            .schedule_batch(5)
+            .into_iter()
+            .map(|a| a.chunk_hash)
+            .collect();
         assert_eq!(order, vec!["c_a", "c_b", "c_c", "c_d", "c_e"]);
 
         // 2. SmallestFirst: b (10k) -> d (20k) -> c (30k) -> e (40k) -> a (50k)
         let mut s = make_scheduler(PullOrder::SmallestFirst);
-        let order: Vec<String> = s.schedule_batch(5).into_iter().map(|a| a.chunk_hash).collect();
+        let order: Vec<String> = s
+            .schedule_batch(5)
+            .into_iter()
+            .map(|a| a.chunk_hash)
+            .collect();
         assert_eq!(order, vec!["c_b", "c_d", "c_c", "c_e", "c_a"]);
 
         // 3. LargestFirst: a (50k) -> e (40k) -> c (30k) -> d (20k) -> b (10k)
         let mut s = make_scheduler(PullOrder::LargestFirst);
-        let order: Vec<String> = s.schedule_batch(5).into_iter().map(|a| a.chunk_hash).collect();
+        let order: Vec<String> = s
+            .schedule_batch(5)
+            .into_iter()
+            .map(|a| a.chunk_hash)
+            .collect();
         assert_eq!(order, vec!["c_a", "c_e", "c_c", "c_d", "c_b"]);
 
         // 4. NewestFirst: b (500) -> e (400) -> c (300) -> d (200) -> a (100)
         let mut s = make_scheduler(PullOrder::NewestFirst);
-        let order: Vec<String> = s.schedule_batch(5).into_iter().map(|a| a.chunk_hash).collect();
+        let order: Vec<String> = s
+            .schedule_batch(5)
+            .into_iter()
+            .map(|a| a.chunk_hash)
+            .collect();
         assert_eq!(order, vec!["c_b", "c_e", "c_c", "c_d", "c_a"]);
 
         // 5. OldestFirst: a (100) -> d (200) -> c (300) -> e (400) -> b (500)
         let mut s = make_scheduler(PullOrder::OldestFirst);
-        let order: Vec<String> = s.schedule_batch(5).into_iter().map(|a| a.chunk_hash).collect();
+        let order: Vec<String> = s
+            .schedule_batch(5)
+            .into_iter()
+            .map(|a| a.chunk_hash)
+            .collect();
         assert_eq!(order, vec!["c_a", "c_d", "c_c", "c_e", "c_b"]);
     }
 
@@ -1272,8 +1338,20 @@ mod tests {
 
         // 3 files totaling 8 blocks
         scheduler.queue_file("docs", "readme.txt", 100, 1, vec!["b1".into(), "b2".into()]);
-        scheduler.queue_file("docs", "data.csv", 500, 2, vec!["b3".into(), "b4".into(), "b5".into()]);
-        scheduler.queue_file("docs", "archive.tar", 1000, 3, vec!["b6".into(), "b7".into(), "b8".into()]);
+        scheduler.queue_file(
+            "docs",
+            "data.csv",
+            500,
+            2,
+            vec!["b3".into(), "b4".into(), "b5".into()],
+        );
+        scheduler.queue_file(
+            "docs",
+            "archive.tar",
+            1000,
+            3,
+            vec!["b6".into(), "b7".into(), "b8".into()],
+        );
 
         assert_eq!(scheduler.pending_count(), 8);
         assert_eq!(scheduler.completed_count(), 0);

@@ -30,11 +30,12 @@ use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{info, warn};
 
-use crate::conflict::CoreEvent;
 use crate::chunker::Chunker;
+use crate::conflict::CoreEvent;
 use crate::dag::RevisionNode;
 use crate::engine::SyncEngine;
 pub use crate::p2p::identity::{NodeIdentity, TlsIdentity};
+use crate::state::runtime::PeerPresence;
 use crate::storage::{
     FileRecord, IntroducedDevice, IntroducerPropagationResult, PendingDeviceRecord, RevisionRecord,
 };
@@ -187,13 +188,19 @@ impl P2PManager {
             .map(|p| p.is_none())
             .unwrap_or(true);
 
-        let _ = storage.add_pending_device(&PendingDeviceRecord {
-            device_id: device_id.to_string(),
-            name: device_name.to_string(),
-            address: address.to_string(),
-            received_at: chrono::Utc::now().timestamp_millis(),
-            cert_pin,
-        });
+        let staged = storage
+            .add_pending_device(&PendingDeviceRecord {
+                device_id: device_id.to_string(),
+                name: device_name.to_string(),
+                address: address.to_string(),
+                received_at: chrono::Utc::now().timestamp_millis(),
+                cert_pin,
+            })
+            .unwrap_or(false);
+        if !staged {
+            // Previously rejected: stay silent instead of re-prompting the user.
+            return;
+        }
 
         if is_new {
             info!(
@@ -208,16 +215,19 @@ impl P2PManager {
         }
     }
 
-    /// Records or updates an active peer in the memory table and atomic counter.
+    /// Records a heartbeat from a peer: refreshes the routing table entry and marks it
+    /// online in the presence state machine. Returns `true` when the peer just came
+    /// online (first contact or back from offline), i.e. when `PEER_CONNECTED` is due.
     pub async fn update_peer_info(
         peers: &Arc<Mutex<HashMap<String, PeerInfo>>>,
         peer_count: &Arc<AtomicUsize>,
+        presence: &PeerPresence,
         device_id: String,
         device_name: String,
         addr: SocketAddr,
     ) -> bool {
+        let came_online = presence.heard_from(&device_id).is_some();
         let mut map = peers.lock().await;
-        let is_new = !map.contains_key(&device_id);
         map.insert(
             device_id.clone(),
             PeerInfo {
@@ -227,8 +237,41 @@ impl P2PManager {
                 last_seen: std::time::Instant::now(),
             },
         );
-        peer_count.store(map.len(), Ordering::Relaxed);
-        is_new
+        peer_count.store(presence.online_count(), Ordering::Relaxed);
+        came_online
+    }
+
+    /// Periodically moves silent peers offline and emits `PEER_DISCONNECTED` for paired
+    /// devices. The routing table is left intact so sync still reaches peers that are
+    /// reachable but quiet (e.g. outside LAN discovery).
+    pub fn start_presence_monitor(&self) {
+        let presence = self.sync_engine.peer_presence().clone();
+        let peer_count = self.peer_count.clone();
+        let event_sender = self.event_sender.clone();
+        let storage = self.sync_engine.storage().clone();
+        let period = (presence.ttl() / 6).max(Duration::from_secs(1));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let gone = presence.sweep();
+                if gone.is_empty() {
+                    continue;
+                }
+                peer_count.store(presence.online_count(), Ordering::Relaxed);
+                for peer_id in gone {
+                    if matches!(storage.get_device(&peer_id), Ok(Some(_))) {
+                        info!(
+                            "Peer {} went offline (no contact for {:?})",
+                            peer_id,
+                            presence.ttl()
+                        );
+                        let _ = event_sender.send(CoreEvent::PeerDisconnected { peer_id });
+                    }
+                }
+            }
+        });
     }
 
     /// Spawns UDP broadcast discovery listener and periodic announcer.
@@ -240,12 +283,16 @@ impl P2PManager {
         let event_sender = self.event_sender.clone();
         let storage_listener = self.sync_engine.storage().clone();
         let storage_announcer = self.sync_engine.storage().clone();
+        let presence = self.sync_engine.peer_presence().clone();
 
         tokio::spawn(async move {
             let socket = match bind_discovery_socket(discovery_port) {
                 Ok(s) => s,
                 Err(e) => {
-                    warn!("Failed to bind UDP discovery listener on port {}: {}", discovery_port, e);
+                    warn!(
+                        "Failed to bind UDP discovery listener on port {}: {}",
+                        discovery_port, e
+                    );
                     return;
                 }
             };
@@ -282,15 +329,19 @@ impl P2PManager {
                             let is_new = Self::update_peer_info(
                                 &peers,
                                 &peer_count,
+                                &presence,
                                 peer.device_id.clone(),
                                 peer.device_name.clone(),
                                 peer_addr,
-                            ).await;
+                            )
+                            .await;
 
                             // Introducer propagation via UDP broadcast discovery:
                             // If discovered peer is marked as an introducer (introducer = 1) in SQLite
                             // and announced introduced cluster peers, automatically propagate them
-                            if storage_listener.is_device_introducer(&peer.device_id).unwrap_or(false)
+                            if storage_listener
+                                .is_device_introducer(&peer.device_id)
+                                .unwrap_or(false)
                                 && !peer.introduced_devices.is_empty()
                             {
                                 let report = storage_listener.propagate_introducer_devices(
@@ -349,15 +400,23 @@ impl P2PManager {
                     .map(|list| list.into_iter().map(|f| f.folder_id).collect())
                     .unwrap_or_default();
 
-                let introduced_devices = if storage_announcer.is_device_introducer(&dev_id).unwrap_or(false) {
-                    storage_announcer.list_devices()
-                        .map(|list| list.into_iter().map(|d| IntroducedDevice {
-                            device_id: d.device_id,
-                            name: d.name,
-                            addresses: d.addresses,
-                            is_trusted: d.is_trusted,
-                            cert_name: d.cert_name,
-                        }).collect())
+                let introduced_devices = if storage_announcer
+                    .is_device_introducer(&dev_id)
+                    .unwrap_or(false)
+                {
+                    storage_announcer
+                        .list_devices()
+                        .map(|list| {
+                            list.into_iter()
+                                .map(|d| IntroducedDevice {
+                                    device_id: d.device_id,
+                                    name: d.name,
+                                    addresses: d.addresses,
+                                    is_trusted: d.is_trusted,
+                                    cert_name: d.cert_name,
+                                })
+                                .collect()
+                        })
                         .unwrap_or_default()
                 } else {
                     Vec::new()
@@ -385,8 +444,15 @@ impl P2PManager {
         let mut file_event_rx = self.event_sender.subscribe();
         tokio::spawn(async move {
             while let Ok(event) = file_event_rx.recv().await {
-                if let CoreEvent::FileChanged { folder_id, relative_path, revision } = event {
-                    let _ = replication_manager.broadcast_file_notice(&folder_id, &relative_path, &revision).await;
+                if let CoreEvent::FileChanged {
+                    folder_id,
+                    relative_path,
+                    revision,
+                } = event
+                {
+                    let _ = replication_manager
+                        .broadcast_file_notice(&folder_id, &relative_path, &revision)
+                        .await;
                 }
             }
         });
@@ -428,7 +494,8 @@ impl P2PManager {
                 devices,
                 auto_trust,
             } => {
-                let report = self.handle_cluster_announcement(&introducer_id, &devices, auto_trust)?;
+                let report =
+                    self.handle_cluster_announcement(&introducer_id, &devices, auto_trust)?;
                 info!(
                     "Introducer {} announced {} cluster devices: added {} trusted, {} pending",
                     introducer_id,
@@ -455,7 +522,9 @@ impl P2PManager {
                 };
 
                 if !is_paired {
-                    let peer_addr_str = peer_addr.map(|a| a.to_string()).unwrap_or_else(|| "dynamic".into());
+                    let peer_addr_str = peer_addr
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "dynamic".into());
                     Self::stage_pending_peer(
                         storage,
                         &self.event_sender,
@@ -470,10 +539,12 @@ impl P2PManager {
                     let is_new = Self::update_peer_info(
                         &self.peers,
                         &self.peer_count,
+                        self.sync_engine.peer_presence(),
                         device_id.clone(),
                         device_name.clone(),
                         addr,
-                    ).await;
+                    )
+                    .await;
 
                     if is_new && is_paired {
                         let _ = self.event_sender.send(CoreEvent::PeerConnected {
@@ -499,13 +570,23 @@ impl P2PManager {
                 Ok(None)
             }
             P2PMessage::EncryptedChunkRequest { chunk_hash } => {
-                if let Some(envelope) = self.sync_engine.storage().get_encrypted_chunk(&chunk_hash)? {
-                    Ok(Some(P2PMessage::EncryptedChunkResponse { chunk_hash, envelope }))
+                if let Some(envelope) = self
+                    .sync_engine
+                    .storage()
+                    .get_encrypted_chunk(&chunk_hash)?
+                {
+                    Ok(Some(P2PMessage::EncryptedChunkResponse {
+                        chunk_hash,
+                        envelope,
+                    }))
                 } else {
                     Ok(None)
                 }
             }
-            P2PMessage::EncryptedChunkResponse { chunk_hash, envelope } => {
+            P2PMessage::EncryptedChunkResponse {
+                chunk_hash,
+                envelope,
+            } => {
                 if envelope.chunk_hash != chunk_hash {
                     return Err("Rejected encrypted chunk with a mismatched envelope hash".into());
                 }
@@ -513,34 +594,59 @@ impl P2PManager {
                 Ok(None)
             }
             P2PMessage::IndexRequest { folder_id } => {
-                let files = self.sync_engine.storage().list_all_files_in_folder(&folder_id, true)?;
+                let files = self
+                    .sync_engine
+                    .storage()
+                    .list_all_files_in_folder(&folder_id, true)?;
                 let mut revisions = Vec::with_capacity(files.len());
                 let mut chunk_lists = HashMap::new();
                 for file in &files {
-                    if let Some(revision) = self.sync_engine.storage().get_revision(&file.current_revision)? {
-                        if let Ok(chunks) = self.sync_engine.storage().get_revision_chunks(&revision.revision_hash) {
+                    if let Some(revision) = self
+                        .sync_engine
+                        .storage()
+                        .get_revision(&file.current_revision)?
+                    {
+                        if let Ok(chunks) = self
+                            .sync_engine
+                            .storage()
+                            .get_revision_chunks(&revision.revision_hash)
+                        {
                             chunk_lists.insert(revision.revision_hash.clone(), chunks);
                         }
                         revisions.push(revision);
                     }
                 }
-                Ok(Some(P2PMessage::IndexResponse { folder_id, files, revisions, chunk_lists }))
+                Ok(Some(P2PMessage::IndexResponse {
+                    folder_id,
+                    files,
+                    revisions,
+                    chunk_lists,
+                }))
             }
-            P2PMessage::IndexResponse { folder_id, files, revisions, chunk_lists } => {
+            P2PMessage::IndexResponse {
+                folder_id,
+                files,
+                revisions,
+                chunk_lists,
+            } => {
                 let _ = self.event_sender.send(CoreEvent::RemoteIndexUpdated {
-                    device_id: peer_addr.map(|addr| addr.to_string()).unwrap_or_else(|| "unknown".into()),
+                    device_id: peer_addr
+                        .map(|addr| addr.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
                     folder_id: folder_id.clone(),
                     file_count: files.len(),
                 });
-                let _ = self.apply_remote_index(
-                    &folder_id,
-                    &files,
-                    &revisions,
-                    &chunk_lists,
-                    None,
-                    None,
-                    peer_addr,
-                ).await;
+                let _ = self
+                    .apply_remote_index(
+                        &folder_id,
+                        &files,
+                        &revisions,
+                        &chunk_lists,
+                        None,
+                        None,
+                        peer_addr,
+                    )
+                    .await;
                 Ok(None)
             }
             P2PMessage::FileNotice {
@@ -552,18 +658,22 @@ impl P2PManager {
             } => {
                 if let Ok(Some(_)) = self.sync_engine.storage().get_folder(&folder_id) {
                     if is_deleted {
-                        let _ = self.sync_engine.mark_local_deleted(&folder_id, &relative_path);
+                        let _ = self
+                            .sync_engine
+                            .mark_local_deleted(&folder_id, &relative_path);
                     } else {
                         let author_id = revision.author_device_id.clone();
-                        let _ = self.fetch_chunks_and_reconcile(
-                            &folder_id,
-                            &relative_path,
-                            &revision,
-                            &chunk_hashes,
-                            None,
-                            Some(&author_id),
-                            peer_addr,
-                        ).await;
+                        let _ = self
+                            .fetch_chunks_and_reconcile(
+                                &folder_id,
+                                &relative_path,
+                                &revision,
+                                &chunk_hashes,
+                                None,
+                                Some(&author_id),
+                                peer_addr,
+                            )
+                            .await;
                     }
                 }
                 Ok(None)
@@ -580,9 +690,8 @@ impl P2PManager {
         let cert_der = CertificateDer::from(self.tls_identity.certificate_der.clone());
         let priv_key = PrivatePkcs8KeyDer::from(self.tls_identity.private_key_der.clone());
 
-        let mut server_config =
-            ServerConfig::with_single_cert(vec![cert_der], priv_key.into())?;
-        
+        let mut server_config = ServerConfig::with_single_cert(vec![cert_der], priv_key.into())?;
+
         // Transport settings
         let transport = Arc::get_mut(&mut server_config.transport).unwrap();
         transport.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
@@ -688,10 +797,18 @@ impl P2PManager {
                 data,
             }) => {
                 if resp_hash != chunk_hash {
-                    return Err(format!("Chunk hash mismatch: expected {}, got {}", chunk_hash, resp_hash).into());
+                    return Err(format!(
+                        "Chunk hash mismatch: expected {}, got {}",
+                        chunk_hash, resp_hash
+                    )
+                    .into());
                 }
                 if Chunker::hash_block(&data) != chunk_hash {
-                    return Err(format!("Corrupt chunk content: hash does not match {}", chunk_hash).into());
+                    return Err(format!(
+                        "Corrupt chunk content: hash does not match {}",
+                        chunk_hash
+                    )
+                    .into());
                 }
                 Ok(data)
             }
@@ -702,6 +819,7 @@ impl P2PManager {
     /// Fetches any missing chunks in `chunk_hashes` from the active QUIC connection
     /// (or connects via `request_peer`), verifies their BLAKE3 content hash, saves them
     /// to CAS, and applies the remote revision to the filesystem and DAG.
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch_chunks_and_reconcile(
         &self,
         folder_id: &str,
@@ -723,20 +841,35 @@ impl P2PManager {
                     match self.request_peer(dev_id, addr, req).await? {
                         Some(P2PMessage::ChunkResponse { data, .. }) => {
                             if Chunker::hash_block(&data) != *chunk_hash {
-                                return Err(format!("Corrupt chunk content for {}", chunk_hash).into());
+                                return Err(
+                                    format!("Corrupt chunk content for {}", chunk_hash).into()
+                                );
                             }
                             data
                         }
-                        _ => return Err(format!("Could not fetch chunk {} from peer {}", chunk_hash, dev_id).into()),
+                        _ => {
+                            return Err(format!(
+                                "Could not fetch chunk {} from peer {}",
+                                chunk_hash, dev_id
+                            )
+                            .into())
+                        }
                     }
                 } else {
-                    return Err(format!("Missing chunk {} and no peer connection available", chunk_hash).into());
+                    return Err(format!(
+                        "Missing chunk {} and no peer connection available",
+                        chunk_hash
+                    )
+                    .into());
                 };
                 self.sync_engine.storage().put_chunk(chunk_hash, &data)?;
             }
         }
 
-        let payload = self.sync_engine.storage().read_chunks_payload(chunk_hashes)?;
+        let payload = self
+            .sync_engine
+            .storage()
+            .read_chunks_payload(chunk_hashes)?;
         self.sync_engine.reconcile_remote_revision(
             folder_id,
             relative_path,
@@ -748,6 +881,7 @@ impl P2PManager {
     }
 
     /// Reconciles all remote files and tombstones received from an IndexResponse.
+    #[allow(clippy::too_many_arguments)]
     pub async fn apply_remote_index(
         &self,
         folder_id: &str,
@@ -764,12 +898,17 @@ impl P2PManager {
             .collect();
 
         for file in files {
-            let local_file = self.sync_engine.storage().get_file(folder_id, &file.relative_path)?;
+            let local_file = self
+                .sync_engine
+                .storage()
+                .get_file(folder_id, &file.relative_path)?;
 
             if file.is_deleted {
                 if let Some(lf) = local_file {
                     if !lf.is_deleted {
-                        let _ = self.sync_engine.mark_local_deleted(folder_id, &file.relative_path);
+                        let _ = self
+                            .sync_engine
+                            .mark_local_deleted(folder_id, &file.relative_path);
                     }
                 }
                 continue;
@@ -783,8 +922,12 @@ impl P2PManager {
             if needs_sync {
                 if let Some(rev_rec) = rev_map.get(file.current_revision.as_str()) {
                     let mut parent_hashes = Vec::new();
-                    if let Some(p1) = &rev_rec.parent_1 { parent_hashes.push(p1.clone()); }
-                    if let Some(p2) = &rev_rec.parent_2 { parent_hashes.push(p2.clone()); }
+                    if let Some(p1) = &rev_rec.parent_1 {
+                        parent_hashes.push(p1.clone());
+                    }
+                    if let Some(p2) = &rev_rec.parent_2 {
+                        parent_hashes.push(p2.clone());
+                    }
 
                     let rev_node = RevisionNode {
                         revision_hash: rev_rec.revision_hash.clone(),
@@ -801,16 +944,22 @@ impl P2PManager {
                         .get(&rev_rec.revision_hash)
                         .unwrap_or(&empty_chunks);
 
-                    if let Err(e) = self.fetch_chunks_and_reconcile(
-                        folder_id,
-                        &file.relative_path,
-                        &rev_node,
-                        chunk_hashes,
-                        connection,
-                        peer_device_id,
-                        peer_addr,
-                    ).await {
-                        warn!("Failed to reconcile remote file {}/{}: {}", folder_id, file.relative_path, e);
+                    if let Err(e) = self
+                        .fetch_chunks_and_reconcile(
+                            folder_id,
+                            &file.relative_path,
+                            &rev_node,
+                            chunk_hashes,
+                            connection,
+                            peer_device_id,
+                            peer_addr,
+                        )
+                        .await
+                    {
+                        warn!(
+                            "Failed to reconcile remote file {}/{}: {}",
+                            folder_id, file.relative_path, e
+                        );
                     }
                 }
             }
@@ -872,14 +1021,24 @@ impl P2PManager {
             Some(r) => r,
             None => return Ok(()),
         };
-        let chunk_hashes = self.sync_engine.storage().get_revision_chunks(revision_hash)?;
-        let is_deleted = self.sync_engine.storage().get_file(folder_id, relative_path)?
+        let chunk_hashes = self
+            .sync_engine
+            .storage()
+            .get_revision_chunks(revision_hash)?;
+        let is_deleted = self
+            .sync_engine
+            .storage()
+            .get_file(folder_id, relative_path)?
             .map(|f| f.is_deleted)
             .unwrap_or(false);
 
         let mut parent_hashes = Vec::new();
-        if let Some(p1) = &rev_rec.parent_1 { parent_hashes.push(p1.clone()); }
-        if let Some(p2) = &rev_rec.parent_2 { parent_hashes.push(p2.clone()); }
+        if let Some(p1) = &rev_rec.parent_1 {
+            parent_hashes.push(p1.clone());
+        }
+        if let Some(p2) = &rev_rec.parent_2 {
+            parent_hashes.push(p2.clone());
+        }
 
         let rev_node = RevisionNode {
             revision_hash: rev_rec.revision_hash.clone(),
@@ -901,7 +1060,9 @@ impl P2PManager {
 
         let active_peers: Vec<(String, SocketAddr)> = {
             let map = self.peers.lock().await;
-            map.values().map(|p| (p.device_id.clone(), p.addr)).collect()
+            map.values()
+                .map(|p| (p.device_id.clone(), p.addr))
+                .collect()
         };
 
         for (peer_id, addr) in active_peers {
@@ -1000,7 +1161,9 @@ async fn handle_quic_connection(
         {
             if let Ok(Some(_)) = manager.sync_engine.storage().get_folder(folder_id) {
                 if *is_deleted {
-                    let _ = manager.sync_engine.mark_local_deleted(folder_id, relative_path);
+                    let _ = manager
+                        .sync_engine
+                        .mark_local_deleted(folder_id, relative_path);
                 } else {
                     let _ = manager
                         .fetch_chunks_and_reconcile(

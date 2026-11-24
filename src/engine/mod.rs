@@ -17,8 +17,6 @@ use tracing::{info, warn};
 
 use crate::chunker::Chunker;
 use crate::conflict::{ConflictEngine, CoreEvent};
-use std::collections::HashMap;
-use std::sync::RwLock;
 
 use crate::dag::{LcaResult, MerkleDag, RevisionNode};
 use crate::engine::fs_utils::{
@@ -26,6 +24,9 @@ use crate::engine::fs_utils::{
     verify_folder_marker,
 };
 use crate::engine::ignore::IgnoreEngine;
+use crate::state::runtime::{
+    EngineLifecycle, FolderActivityKind, FolderRuntimeState, FolderStateTracker, PeerPresence,
+};
 use crate::state::FolderSyncState;
 use crate::storage::{FileRecord, RevisionRecord, StorageEngine};
 
@@ -36,7 +37,9 @@ pub struct SyncEngine {
     conflict_engine: Arc<ConflictEngine>,
     event_sender: broadcast::Sender<CoreEvent>,
     device_id: String,
-    folder_states: Arc<RwLock<HashMap<String, FolderSyncState>>>,
+    folder_states: FolderStateTracker,
+    peer_presence: PeerPresence,
+    lifecycle: EngineLifecycle,
 }
 
 impl SyncEngine {
@@ -46,36 +49,74 @@ impl SyncEngine {
         event_sender: broadcast::Sender<CoreEvent>,
         device_id: String,
     ) -> Self {
+        // Paused is persisted configuration; the tracker consults it on every evaluation.
+        let paused_storage = storage.clone();
+        let folder_states = FolderStateTracker::new(
+            event_sender.clone(),
+            Arc::new(move |folder_id: &str| {
+                paused_storage
+                    .get_folder(folder_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|f| f.is_paused)
+            }),
+        );
         Self {
             storage,
             chunker: Arc::new(Chunker::default()),
             conflict_engine,
             event_sender,
             device_id,
-            folder_states: Arc::new(RwLock::new(HashMap::new())),
+            folder_states,
+            peer_presence: PeerPresence::default(),
+            lifecycle: EngineLifecycle::default(),
         }
     }
 
     /// Queries the dynamic operational state of a folder.
     pub fn get_folder_state(&self, folder_id: &str) -> FolderSyncState {
-        if let Ok(Some(folder)) = self.storage.get_folder(folder_id) {
-            if folder.is_paused {
-                return FolderSyncState::Paused;
-            }
-        }
-        if let Ok(states) = self.folder_states.read() {
-            if let Some(&state) = states.get(folder_id) {
-                return state;
-            }
-        }
-        FolderSyncState::Idle
+        self.folder_states.get(folder_id).state
     }
 
-    /// Sets the dynamic operational state of a folder.
+    /// State plus the reason for an `error` state.
+    pub fn folder_runtime_state(&self, folder_id: &str) -> FolderRuntimeState {
+        self.folder_states.get(folder_id)
+    }
+
+    /// Explicitly sets a folder state (tooling/tests). Engine code derives state from
+    /// tracked activities instead, so it can never get stuck; see [`FolderStateTracker`].
     pub fn set_folder_state(&self, folder_id: &str, state: FolderSyncState) {
-        if let Ok(mut states) = self.folder_states.write() {
-            states.insert(folder_id.to_string(), state);
-        }
+        self.folder_states.set_override(folder_id, state);
+    }
+
+    /// Starts tracking a folder's runtime state (startup load / registration).
+    pub fn track_folder(&self, folder_id: &str) {
+        self.folder_states.track(folder_id);
+    }
+
+    /// Re-evaluates a folder after its persisted config changed (pause/resume).
+    pub fn refresh_folder_state(&self, folder_id: &str) {
+        self.folder_states.refresh(folder_id);
+    }
+
+    /// Drops runtime state for a deleted folder.
+    pub fn forget_folder_state(&self, folder_id: &str) {
+        self.folder_states.forget(folder_id);
+    }
+
+    /// The folder activity state machine.
+    pub fn folder_states(&self) -> &FolderStateTracker {
+        &self.folder_states
+    }
+
+    /// Lifecycle of this engine generation (starting / ready / stopping / restarting).
+    pub fn lifecycle(&self) -> &EngineLifecycle {
+        &self.lifecycle
+    }
+
+    /// Online/offline presence of peers, shared by the P2P layer and the API.
+    pub fn peer_presence(&self) -> &PeerPresence {
+        &self.peer_presence
     }
 
     pub fn storage(&self) -> &StorageEngine {
@@ -95,7 +136,10 @@ impl SyncEngine {
     }
 
     /// Chunks a payload using FastCDC and commits all chunks into the CAS block store.
-    pub fn save_payload_chunks(&self, payload: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn save_payload_chunks(
+        &self,
+        payload: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (chunks, _) = self.chunker.chunk_slice(payload);
         for (info, data) in &chunks {
             self.storage.put_chunk(&info.chunk_hash, data)?;
@@ -127,84 +171,91 @@ impl SyncEngine {
     }
 
     /// Indexes an entire folder recursively from scratch or incremental delta.
-    pub fn index_folder(&self, folder_id: &str) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn index_folder(
+        &self,
+        folder_id: &str,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let folder = match self.storage.get_folder(folder_id)? {
             Some(f) => f,
             None => return Err(format!("Folder not registered: {}", folder_id).into()),
         };
 
         if folder.is_paused {
-            self.set_folder_state(folder_id, FolderSyncState::Paused);
             info!("Folder {} is paused; skipping indexing", folder_id);
             return Ok(0);
         }
 
-        self.set_folder_state(folder_id, FolderSyncState::Scanning);
+        // The guard keeps the folder in `scanning` exactly while this runs and records
+        // success/failure on every exit path, so the state can never get stuck.
+        let activity = self
+            .folder_states
+            .begin(folder_id, FolderActivityKind::Scan);
+        let result = (|| -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+            let base_path = PathBuf::from(&folder.local_path);
+            if !base_path.exists() {
+                fs::create_dir_all(&base_path)?;
+            }
 
-        let base_path = PathBuf::from(&folder.local_path);
-        if !base_path.exists() {
-            fs::create_dir_all(&base_path)?;
-        }
+            // Mount Safety Marker verification: prevent cascading deletes if volume unmounted
+            if let Err(e) = verify_folder_marker(&base_path, &folder.marker_name) {
+                warn!("Mount safety check failed for folder {}: {}", folder_id, e);
+                return Err(Box::new(e));
+            }
 
-        // Mount Safety Marker verification: prevent cascading deletes if volume unmounted
-        if let Err(e) = verify_folder_marker(&base_path, &folder.marker_name) {
-            warn!("Mount safety check failed for folder {}: {}", folder_id, e);
-            self.set_folder_state(folder_id, FolderSyncState::Error);
-            return Err(Box::new(e));
-        }
+            let ignore_engine = self.get_folder_ignore_engine(folder_id, &base_path);
+            let mut indexed_count = 0;
+            let mut seen_paths = std::collections::HashSet::new();
+            let mut stack = vec![base_path.clone()];
 
-        let ignore_engine = self.get_folder_ignore_engine(folder_id, &base_path);
-        let mut indexed_count = 0;
-        let mut seen_paths = std::collections::HashSet::new();
-        let mut stack = vec![base_path.clone()];
+            while let Some(current_dir) = stack.pop() {
+                for entry in fs::read_dir(&current_dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    let file_name = entry.file_name();
+                    let name_str = file_name.to_string_lossy();
 
-        while let Some(current_dir) = stack.pop() {
-            for entry in fs::read_dir(&current_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                let file_name = entry.file_name();
-                let name_str = file_name.to_string_lossy();
+                    if name_str.starts_with(".synapse")
+                        || name_str.starts_with(".git")
+                        || name_str.starts_with(".stfolder")
+                        || name_str == folder.marker_name
+                    {
+                        continue;
+                    }
 
-                if name_str.starts_with(".synapse")
-                    || name_str.starts_with(".git")
-                    || name_str.starts_with(".stfolder")
-                    || name_str == folder.marker_name
-                {
-                    continue;
-                }
+                    let rel_path =
+                        sanitize_relative_path(&path.strip_prefix(&base_path)?.to_string_lossy());
+                    if ignore_engine.is_ignored(&rel_path, path.is_dir()) {
+                        continue;
+                    }
 
-                let rel_path = sanitize_relative_path(&path.strip_prefix(&base_path)?.to_string_lossy());
-                if ignore_engine.is_ignored(&rel_path, path.is_dir()) {
-                    continue;
-                }
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if path.is_file() {
+                        seen_paths.insert(rel_path.clone());
+                        let _ = self.event_sender.send(CoreEvent::FolderScanProgress {
+                            folder_id: folder_id.to_string(),
+                            current_file: rel_path.clone(),
+                            scanned_files: indexed_count + 1,
+                        });
 
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.is_file() {
-                    seen_paths.insert(rel_path.clone());
-                    let _ = self.event_sender.send(CoreEvent::FolderScanProgress {
-                        folder_id: folder_id.to_string(),
-                        current_file: rel_path.clone(),
-                        scanned_files: indexed_count + 1,
-                    });
-
-                    if self.index_single_file(folder_id, &rel_path)? {
-                        indexed_count += 1;
+                        if self.index_single_file(folder_id, &rel_path)? {
+                            indexed_count += 1;
+                        }
                     }
                 }
             }
-        }
 
-        if let Ok(existing_files) = self.storage.list_files_in_folder(folder_id) {
-            for file in existing_files {
-                if !file.is_deleted && !seen_paths.contains(&file.relative_path) {
-                    let _ = self.mark_local_deleted(folder_id, &file.relative_path);
+            if let Ok(existing_files) = self.storage.list_files_in_folder(folder_id) {
+                for file in existing_files {
+                    if !file.is_deleted && !seen_paths.contains(&file.relative_path) {
+                        let _ = self.mark_local_deleted(folder_id, &file.relative_path);
+                    }
                 }
             }
-        }
 
-        self.set_folder_state(folder_id, FolderSyncState::Idle);
-        Ok(indexed_count)
+            Ok(indexed_count)
+        })();
+        activity.finish_with(result)
     }
 
     /// Indexes a single local file: chunks with FastCDC, computes BLAKE3, writes to CAS,
@@ -221,7 +272,10 @@ impl SyncEngine {
 
         // If folder is ReceiveOnly, do NOT index or propagate local changes to peers
         if !folder.parsed_sync_mode().can_send() {
-            info!("Folder {} is ReceiveOnly; ignoring local changes in {}", folder_id, relative_path);
+            info!(
+                "Folder {} is ReceiveOnly; ignoring local changes in {}",
+                folder_id, relative_path
+            );
             return Ok(false);
         }
 
@@ -319,149 +373,177 @@ impl SyncEngine {
 
         // If folder is SendOnly, reject incoming modifications from remote peers
         if !folder.parsed_sync_mode().can_receive() {
-            warn!("Folder {} is SendOnly; rejecting incoming remote changes for {}", folder_id, relative_path);
+            warn!(
+                "Folder {} is SendOnly; rejecting incoming remote changes for {}",
+                folder_id, relative_path
+            );
             return Ok(());
         }
 
-        self.set_folder_state(folder_id, FolderSyncState::Syncing);
-
-        let rel_clean = sanitize_relative_path(relative_path);
-        if rel_clean.is_empty() {
-            return Err("Refusing to apply a remote revision with an empty path".into());
-        }
-        let base_path = PathBuf::from(&folder.local_path);
-        let local_path = safe_join(&base_path, relative_path)?;
-
-        let _ = self.event_sender.send(CoreEvent::ItemStarted {
-            folder_id: folder_id.to_string(),
-            relative_path: rel_clean.clone(),
-            action: "SYNC_INCOMING".to_string(),
-        });
-
-        // A remote revision is untrusted input.  Verify that the advertised
-        // revision actually describes the supplied payload before it can enter
-        // either the CAS or the DAG.  In particular, do not create file_chunks
-        // rows before their chunks exist: SQLite foreign keys correctly reject
-        // that ordering for a genuinely new remote file.
-        if remote_rev.file_size != remote_payload.len() as u64 {
-            return Err("Remote revision file size does not match payload".into());
-        }
-        let (computed_chunks, computed_manifest) = self.chunker.chunk_metadata_only(remote_payload);
-        let computed_hashes: Vec<String> = computed_chunks
-            .iter()
-            .map(|chunk| chunk.chunk_hash.clone())
-            .collect();
-        if computed_hashes != remote_chunk_hashes || computed_manifest != remote_rev.manifest_hash {
-            return Err("Remote revision manifest does not match payload".into());
-        }
-        let expected_revision = RevisionNode::compute_hash(
-            &remote_rev.parent_hashes,
-            &remote_rev.manifest_hash,
-            &remote_rev.author_device_id,
-            remote_rev.sequence_number,
-        );
-        if expected_revision != remote_rev.revision_hash {
-            return Err("Remote revision hash is invalid".into());
-        }
-
-        self.save_payload_chunks(remote_payload)?;
-
-        // Chunks are now durable, so their revision can safely reference them.
-        self.storage.insert_revision(
-            &RevisionRecord {
-                revision_hash: remote_rev.revision_hash.clone(),
-                parent_1: remote_rev.parent_hashes.get(0).cloned(),
-                parent_2: remote_rev.parent_hashes.get(1).cloned(),
-                manifest_hash: remote_rev.manifest_hash.clone(),
-                author_device: remote_rev.author_device_id.clone(),
-                sequence_number: remote_rev.sequence_number,
-                file_size: remote_rev.file_size,
-                created_at: remote_rev.mtime_nanos,
-            },
-            remote_chunk_hashes,
-        )?;
-
-        let local_file = self.storage.get_file(folder_id, &rel_clean)?;
-
-        match local_file {
-            None => {
-                atomic_write_file(&local_path, remote_payload, Some(remote_rev.mtime_nanos), None)?;
-                self.storage.upsert_file(&FileRecord {
-                    folder_id: folder_id.to_string(),
-                    relative_path: rel_clean.clone(),
-                    size: remote_rev.file_size,
-                    mtime_nanos: remote_rev.mtime_nanos,
-                    current_revision: remote_rev.revision_hash.clone(),
-                    is_deleted: false,
-                })?;
-
-                let _ = self.event_sender.send(CoreEvent::ItemFinished {
-                    folder_id: folder_id.to_string(),
-                    relative_path: rel_clean.clone(),
-                    action: "CREATED".to_string(),
-                    error: None,
-                });
+        let activity = self
+            .folder_states
+            .begin(folder_id, FolderActivityKind::Sync);
+        let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let rel_clean = sanitize_relative_path(relative_path);
+            if rel_clean.is_empty() {
+                return Err("Refusing to apply a remote revision with an empty path".into());
             }
-            Some(existing) => {
-                let dag = MerkleDag::new(&self.storage);
-                let lca = dag.find_lca(&existing.current_revision, &remote_rev.revision_hash);
+            let base_path = PathBuf::from(&folder.local_path);
+            let local_path = safe_join(&base_path, relative_path)?;
 
-                match lca {
-                    LcaResult::Identical => {}
-                    LcaResult::FastForwardLocal => {
-                        info!(
-                            "Local revision {} supersedes remote {}; keeping local",
-                            existing.current_revision, remote_rev.revision_hash
-                        );
-                    }
-                    LcaResult::FastForwardRemote => {
-                        info!(
-                            "Fast-forwarding remote revision {} over local {}",
-                            remote_rev.revision_hash, existing.current_revision
-                        );
+            let _ = self.event_sender.send(CoreEvent::ItemStarted {
+                folder_id: folder_id.to_string(),
+                relative_path: rel_clean.clone(),
+                action: "SYNC_INCOMING".to_string(),
+            });
 
-                        if local_path.exists() && folder.versioning_type != "None" {
-                            if let Err(e) = archive_file_version(&base_path, &rel_clean) {
-                                warn!("Failed to archive previous file version for {}/{}: {}", folder_id, rel_clean, e);
-                            }
+            // A remote revision is untrusted input.  Verify that the advertised
+            // revision actually describes the supplied payload before it can enter
+            // either the CAS or the DAG.  In particular, do not create file_chunks
+            // rows before their chunks exist: SQLite foreign keys correctly reject
+            // that ordering for a genuinely new remote file.
+            if remote_rev.file_size != remote_payload.len() as u64 {
+                return Err("Remote revision file size does not match payload".into());
+            }
+            let (computed_chunks, computed_manifest) =
+                self.chunker.chunk_metadata_only(remote_payload);
+            let computed_hashes: Vec<String> = computed_chunks
+                .iter()
+                .map(|chunk| chunk.chunk_hash.clone())
+                .collect();
+            if computed_hashes != remote_chunk_hashes
+                || computed_manifest != remote_rev.manifest_hash
+            {
+                return Err("Remote revision manifest does not match payload".into());
+            }
+            let expected_revision = RevisionNode::compute_hash(
+                &remote_rev.parent_hashes,
+                &remote_rev.manifest_hash,
+                &remote_rev.author_device_id,
+                remote_rev.sequence_number,
+            );
+            if expected_revision != remote_rev.revision_hash {
+                return Err("Remote revision hash is invalid".into());
+            }
+
+            self.save_payload_chunks(remote_payload)?;
+
+            // Chunks are now durable, so their revision can safely reference them.
+            self.storage.insert_revision(
+                &RevisionRecord {
+                    revision_hash: remote_rev.revision_hash.clone(),
+                    parent_1: remote_rev.parent_hashes.first().cloned(),
+                    parent_2: remote_rev.parent_hashes.get(1).cloned(),
+                    manifest_hash: remote_rev.manifest_hash.clone(),
+                    author_device: remote_rev.author_device_id.clone(),
+                    sequence_number: remote_rev.sequence_number,
+                    file_size: remote_rev.file_size,
+                    created_at: remote_rev.mtime_nanos,
+                },
+                remote_chunk_hashes,
+            )?;
+
+            let local_file = self.storage.get_file(folder_id, &rel_clean)?;
+
+            match local_file {
+                None => {
+                    atomic_write_file(
+                        &local_path,
+                        remote_payload,
+                        Some(remote_rev.mtime_nanos),
+                        None,
+                    )?;
+                    self.storage.upsert_file(&FileRecord {
+                        folder_id: folder_id.to_string(),
+                        relative_path: rel_clean.clone(),
+                        size: remote_rev.file_size,
+                        mtime_nanos: remote_rev.mtime_nanos,
+                        current_revision: remote_rev.revision_hash.clone(),
+                        is_deleted: false,
+                    })?;
+
+                    let _ = self.event_sender.send(CoreEvent::ItemFinished {
+                        folder_id: folder_id.to_string(),
+                        relative_path: rel_clean.clone(),
+                        action: "CREATED".to_string(),
+                        error: None,
+                    });
+                }
+                Some(existing) => {
+                    let dag = MerkleDag::new(&self.storage);
+                    let lca = dag.find_lca(&existing.current_revision, &remote_rev.revision_hash);
+
+                    match lca {
+                        LcaResult::Identical => {}
+                        LcaResult::FastForwardLocal => {
+                            info!(
+                                "Local revision {} supersedes remote {}; keeping local",
+                                existing.current_revision, remote_rev.revision_hash
+                            );
                         }
+                        LcaResult::FastForwardRemote => {
+                            info!(
+                                "Fast-forwarding remote revision {} over local {}",
+                                remote_rev.revision_hash, existing.current_revision
+                            );
 
-                        atomic_write_file(&local_path, remote_payload, Some(remote_rev.mtime_nanos), None)?;
-                        self.storage.upsert_file(&FileRecord {
-                            folder_id: folder_id.to_string(),
-                            relative_path: rel_clean.clone(),
-                            size: remote_rev.file_size,
-                            mtime_nanos: remote_rev.mtime_nanos,
-                            current_revision: remote_rev.revision_hash.clone(),
-                            is_deleted: false,
-                        })?;
+                            if local_path.exists() && folder.versioning_type != "None" {
+                                if let Err(e) = archive_file_version(&base_path, &rel_clean) {
+                                    warn!(
+                                        "Failed to archive previous file version for {}/{}: {}",
+                                        folder_id, rel_clean, e
+                                    );
+                                }
+                            }
 
-                        let _ = self.event_sender.send(CoreEvent::ItemFinished {
-                            folder_id: folder_id.to_string(),
-                            relative_path: rel_clean.clone(),
-                            action: "UPDATED".to_string(),
-                            error: None,
-                        });
-                    }
-                    LcaResult::Diverged { base_revision } => {
-                        // Branches diverged: trigger Multi-Strategy Conflict Resolution Pipeline
-                        self.conflict_engine.handle_divergence(
-                            folder_id,
-                            &rel_clean,
-                            base_revision.as_deref(),
-                            &existing.current_revision,
-                            &remote_rev.revision_hash,
-                            remote_payload,
-                            &remote_rev.author_device_id,
-                            remote_rev.mtime_nanos,
-                        )?;
+                            atomic_write_file(
+                                &local_path,
+                                remote_payload,
+                                Some(remote_rev.mtime_nanos),
+                                None,
+                            )?;
+                            self.storage.upsert_file(&FileRecord {
+                                folder_id: folder_id.to_string(),
+                                relative_path: rel_clean.clone(),
+                                size: remote_rev.file_size,
+                                mtime_nanos: remote_rev.mtime_nanos,
+                                current_revision: remote_rev.revision_hash.clone(),
+                                is_deleted: false,
+                            })?;
+
+                            let _ = self.event_sender.send(CoreEvent::ItemFinished {
+                                folder_id: folder_id.to_string(),
+                                relative_path: rel_clean.clone(),
+                                action: "UPDATED".to_string(),
+                                error: None,
+                            });
+                        }
+                        LcaResult::Diverged { base_revision } => {
+                            // Branches diverged: trigger Multi-Strategy Conflict Resolution Pipeline
+                            self.conflict_engine.handle_divergence(
+                                folder_id,
+                                &rel_clean,
+                                base_revision.as_deref(),
+                                &existing.current_revision,
+                                &remote_rev.revision_hash,
+                                remote_payload,
+                                &remote_rev.author_device_id,
+                                remote_rev.mtime_nanos,
+                            )?;
+                        }
                     }
                 }
             }
-        }
 
-        self.set_folder_state(folder_id, FolderSyncState::Idle);
-        Ok(())
+            Ok(())
+        })();
+        if let Err(e) = &result {
+            warn!(
+                "Failed to apply remote revision for {}/{}: {}",
+                folder_id, relative_path, e
+            );
+        }
+        activity.finish_with(result)
     }
 
     /// Spawns a background filesystem watcher for a monitored folder.
@@ -490,8 +572,12 @@ impl SyncEngine {
                         } else {
                             for path in event.paths {
                                 if path.exists() && path.is_file() {
-                                    let name = path.file_name().unwrap_or_default().to_string_lossy();
-                                    if name.starts_with(".synapse") || name.starts_with(".stfolder") || name.starts_with(".git") {
+                                    let name =
+                                        path.file_name().unwrap_or_default().to_string_lossy();
+                                    if name.starts_with(".synapse")
+                                        || name.starts_with(".stfolder")
+                                        || name.starts_with(".git")
+                                    {
                                         continue;
                                     }
                                     if let Ok(rel) = path.strip_prefix(&root_path) {

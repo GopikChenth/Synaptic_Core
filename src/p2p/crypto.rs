@@ -4,12 +4,10 @@
 //! allowing untrusted storage nodes / VPS instances to store, replicate, and serve
 //! chunks without inspecting plaintext data.
 
-use std::fmt;
 use rand::RngCore;
-use ring::aead::{
-    Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305,
-};
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Supported AEAD cipher algorithms for chunk-level envelope encryption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,7 +87,13 @@ impl EncryptedChunkEnvelope {
         key: &[u8; 32],
         aad: Option<&[u8]>,
     ) -> Result<Self, CryptoError> {
-        Self::encrypt(chunk_hash, plaintext, key, EncryptionAlgorithm::Aes256Gcm, aad)
+        Self::encrypt(
+            chunk_hash,
+            plaintext,
+            key,
+            EncryptionAlgorithm::Aes256Gcm,
+            aad,
+        )
     }
 
     /// Encrypts plaintext data using ChaCha20-Poly1305.
@@ -99,7 +103,13 @@ impl EncryptedChunkEnvelope {
         key: &[u8; 32],
         aad: Option<&[u8]>,
     ) -> Result<Self, CryptoError> {
-        Self::encrypt(chunk_hash, plaintext, key, EncryptionAlgorithm::ChaCha20Poly1305, aad)
+        Self::encrypt(
+            chunk_hash,
+            plaintext,
+            key,
+            EncryptionAlgorithm::ChaCha20Poly1305,
+            aad,
+        )
     }
 
     /// Encrypts plaintext chunk data with specified AEAD algorithm.
@@ -118,8 +128,8 @@ impl EncryptedChunkEnvelope {
             EncryptionAlgorithm::ChaCha20Poly1305 => &CHACHA20_POLY1305,
         };
 
-        let unbound_key = UnboundKey::new(ring_alg, key)
-            .map_err(|_| CryptoError::EncryptionFailed)?;
+        let unbound_key =
+            UnboundKey::new(ring_alg, key).map_err(|_| CryptoError::EncryptionFailed)?;
         let less_safe_key = LessSafeKey::new(unbound_key);
 
         let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
@@ -161,8 +171,8 @@ impl EncryptedChunkEnvelope {
             EncryptionAlgorithm::ChaCha20Poly1305 => &CHACHA20_POLY1305,
         };
 
-        let unbound_key = UnboundKey::new(ring_alg, key)
-            .map_err(|_| CryptoError::DecryptionFailed)?;
+        let unbound_key =
+            UnboundKey::new(ring_alg, key).map_err(|_| CryptoError::DecryptionFailed)?;
         let less_safe_key = LessSafeKey::new(unbound_key);
 
         if self.nonce.len() != 12 {
@@ -206,7 +216,11 @@ impl EncryptedChunkEnvelope {
     }
 
     /// Derives a 32-byte AEAD symmetric key using HKDF-SHA256 (RFC 5869).
-    pub fn derive_key_hkdf(secret: &[u8], salt: &[u8], info: &[u8]) -> Result<[u8; 32], CryptoError> {
+    pub fn derive_key_hkdf(
+        secret: &[u8],
+        salt: &[u8],
+        info: &[u8],
+    ) -> Result<[u8; 32], CryptoError> {
         struct KeyLen(usize);
         impl ring::hkdf::KeyType for KeyLen {
             fn len(&self) -> usize {
@@ -221,7 +235,8 @@ impl EncryptedChunkEnvelope {
             .expand(&info_slice, KeyLen(32))
             .map_err(|_| CryptoError::EncryptionFailed)?;
         let mut key = [0u8; 32];
-        okm.fill(&mut key).map_err(|_| CryptoError::EncryptionFailed)?;
+        okm.fill(&mut key)
+            .map_err(|_| CryptoError::EncryptionFailed)?;
         Ok(key)
     }
 
@@ -266,7 +281,11 @@ impl EncryptedChunkEnvelope {
     }
 
     /// Decrypts envelope using PBKDF2-HMAC-SHA256 and embedded salt.
-    pub fn decrypt_with_pbkdf2(&self, passphrase: &str, iterations: u32) -> Result<Vec<u8>, CryptoError> {
+    pub fn decrypt_with_pbkdf2(
+        &self,
+        passphrase: &str,
+        iterations: u32,
+    ) -> Result<Vec<u8>, CryptoError> {
         let salt = self.salt.as_deref().unwrap_or(b"synapse-default-salt");
         let key = Self::derive_key_pbkdf2(passphrase, salt, iterations);
         self.decrypt(&key)
@@ -323,7 +342,8 @@ mod tests {
             plaintext,
             &key,
             Some(b"folder_vault"),
-        ).expect("encryption should succeed");
+        )
+        .expect("encryption should succeed");
 
         assert_eq!(envelope.chunk_hash, chunk_hash);
         assert_eq!(envelope.algorithm, EncryptionAlgorithm::Aes256Gcm);
@@ -343,12 +363,9 @@ mod tests {
         let key = [0x77u8; 32];
         let chunk_hash = "b3_chunk_hash_02";
 
-        let envelope = EncryptedChunkEnvelope::encrypt_chacha20_poly1305(
-            chunk_hash,
-            plaintext,
-            &key,
-            None,
-        ).expect("encryption should succeed");
+        let envelope =
+            EncryptedChunkEnvelope::encrypt_chacha20_poly1305(chunk_hash, plaintext, &key, None)
+                .expect("encryption should succeed");
 
         assert_eq!(envelope.algorithm, EncryptionAlgorithm::ChaCha20Poly1305);
         let decrypted = envelope.decrypt(&key).expect("decryption should succeed");
@@ -359,15 +376,15 @@ mod tests {
     fn test_tamper_detection_fails_decryption() {
         let plaintext = b"Data integrity is paramount across all cluster nodes";
         let key = [0x55u8; 32];
-        let envelope = EncryptedChunkEnvelope::encrypt_aes_256_gcm(
-            "chunk_03",
-            plaintext,
-            &key,
-            None,
-        ).unwrap();
+        let envelope =
+            EncryptedChunkEnvelope::encrypt_aes_256_gcm("chunk_03", plaintext, &key, None).unwrap();
 
         // 1. Corrupt ciphertext at multiple bit positions: first byte, middle, last byte
-        for &pos in &[0, envelope.ciphertext.len() / 2, envelope.ciphertext.len() - 1] {
+        for &pos in &[
+            0,
+            envelope.ciphertext.len() / 2,
+            envelope.ciphertext.len() - 1,
+        ] {
             let mut tampered = envelope.clone();
             tampered.ciphertext[pos] ^= 0x01; // single bit flip
             assert!(
@@ -402,7 +419,10 @@ mod tests {
         // 4. Truncate ciphertext
         let mut truncated = envelope.clone();
         truncated.ciphertext.pop();
-        assert!(truncated.decrypt(&key).is_err(), "truncated ciphertext must fail");
+        assert!(
+            truncated.decrypt(&key).is_err(),
+            "truncated ciphertext must fail"
+        );
     }
 
     #[test]
@@ -412,12 +432,9 @@ mod tests {
         let mut key2 = [0x11u8; 32];
         key2[31] ^= 0x01; // Single bit difference in key
 
-        let envelope = EncryptedChunkEnvelope::encrypt_chacha20_poly1305(
-            "chunk_04",
-            plaintext,
-            &key1,
-            None,
-        ).unwrap();
+        let envelope =
+            EncryptedChunkEnvelope::encrypt_chacha20_poly1305("chunk_04", plaintext, &key1, None)
+                .unwrap();
 
         let res = envelope.decrypt(&key2);
         assert!(res.is_err(), "decryption with wrong key must fail");
@@ -432,7 +449,8 @@ mod tests {
             plaintext,
             &key,
             Some(b"folder_a"),
-        ).unwrap();
+        )
+        .unwrap();
 
         // 1. Decrypt with different AAD
         let res1 = envelope.decrypt_with_aad(&key, b"folder_b");
@@ -444,7 +462,10 @@ mod tests {
 
         // 3. Decrypt with 1-bit corrupted AAD
         let res3 = envelope.decrypt_with_aad(&key, b"folder_`"); // 'a' ^ 1 = '`'
-        assert!(res3.is_err(), "1-bit corrupted AAD must fail authentication");
+        assert!(
+            res3.is_err(),
+            "1-bit corrupted AAD must fail authentication"
+        );
 
         // 4. Decrypt with correct AAD succeeds
         let ok = envelope.decrypt_with_aad(&key, b"folder_a").unwrap();
@@ -462,14 +483,17 @@ mod tests {
             passphrase,
             EncryptionAlgorithm::Aes256Gcm,
             Some(b"aad_metadata"),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(envelope.salt.is_some());
         let decrypted = envelope.decrypt_with_passphrase(passphrase).unwrap();
         assert_eq!(decrypted, plaintext);
 
         // Wrong passphrase fails
-        assert!(envelope.decrypt_with_passphrase("wrong_passphrase").is_err());
+        assert!(envelope
+            .decrypt_with_passphrase("wrong_passphrase")
+            .is_err());
     }
 
     #[test]
@@ -485,7 +509,8 @@ mod tests {
         assert_eq!(key1, key2);
 
         // Different salt derives different key
-        let key_diff_salt = EncryptedChunkEnvelope::derive_key_pbkdf2(passphrase, b"different_salt!!", iterations);
+        let key_diff_salt =
+            EncryptedChunkEnvelope::derive_key_pbkdf2(passphrase, b"different_salt!!", iterations);
         assert_ne!(key1, key_diff_salt);
 
         // Different iterations derives different key
@@ -500,14 +525,18 @@ mod tests {
             iterations,
             EncryptionAlgorithm::ChaCha20Poly1305,
             Some(b"aad_folder_bound"),
-        ).expect("encryption with PBKDF2 must succeed");
+        )
+        .expect("encryption with PBKDF2 must succeed");
 
-        let decrypted = envelope.decrypt_with_pbkdf2(passphrase, iterations)
+        let decrypted = envelope
+            .decrypt_with_pbkdf2(passphrase, iterations)
             .expect("decryption with PBKDF2 must succeed");
         assert_eq!(decrypted, plaintext);
 
         // Wrong passphrase fails
-        assert!(envelope.decrypt_with_pbkdf2("incorrect_passphrase", iterations).is_err());
+        assert!(envelope
+            .decrypt_with_pbkdf2("incorrect_passphrase", iterations)
+            .is_err());
         // Wrong iterations fails
         assert!(envelope.decrypt_with_pbkdf2(passphrase, 5_000).is_err());
     }
@@ -525,7 +554,8 @@ mod tests {
         assert_eq!(key1, key2);
 
         // Different info derives different key (context domain separation)
-        let key_diff_info = EncryptedChunkEnvelope::derive_key_hkdf(secret, salt, b"other-info").unwrap();
+        let key_diff_info =
+            EncryptedChunkEnvelope::derive_key_hkdf(secret, salt, b"other-info").unwrap();
         assert_ne!(key1, key_diff_info);
 
         // 2. HKDF Envelope encryption and decryption
@@ -537,26 +567,29 @@ mod tests {
             info,
             EncryptionAlgorithm::Aes256Gcm,
             None,
-        ).expect("encryption with HKDF must succeed");
+        )
+        .expect("encryption with HKDF must succeed");
 
-        let decrypted = envelope.decrypt_with_hkdf(secret, salt, info)
+        let decrypted = envelope
+            .decrypt_with_hkdf(secret, salt, info)
             .expect("decryption with HKDF must succeed");
         assert_eq!(decrypted, plaintext);
 
         // Wrong secret fails
-        assert!(envelope.decrypt_with_hkdf(b"wrong-secret-key-32b!", salt, info).is_err());
+        assert!(envelope
+            .decrypt_with_hkdf(b"wrong-secret-key-32b!", salt, info)
+            .is_err());
         // Wrong info context fails
-        assert!(envelope.decrypt_with_hkdf(secret, salt, b"wrong-context").is_err());
+        assert!(envelope
+            .decrypt_with_hkdf(secret, salt, b"wrong-context")
+            .is_err());
     }
 
     #[test]
     fn test_large_chunk_payload_encryption_roundtrip() {
         // 1 MiB chunk typical for CAS block engine
         let chunk_size = 1024 * 1024;
-        let mut large_plaintext = vec![0u8; chunk_size];
-        for i in 0..chunk_size {
-            large_plaintext[i] = (i % 256) as u8;
-        }
+        let large_plaintext: Vec<u8> = (0..chunk_size).map(|i| (i % 256) as u8).collect();
 
         let key = [0x88u8; 32];
 
@@ -566,9 +599,12 @@ mod tests {
             &large_plaintext,
             &key,
             Some(b"large_chunk_aad"),
-        ).expect("large AES encryption must succeed");
+        )
+        .expect("large AES encryption must succeed");
         assert_eq!(env_aes.original_size, chunk_size);
-        let dec_aes = env_aes.decrypt(&key).expect("large AES decryption must succeed");
+        let dec_aes = env_aes
+            .decrypt(&key)
+            .expect("large AES decryption must succeed");
         assert_eq!(dec_aes, large_plaintext);
 
         // ChaCha20-Poly1305 with 1 MiB
@@ -577,9 +613,12 @@ mod tests {
             &large_plaintext,
             &key,
             Some(b"large_chunk_aad"),
-        ).expect("large ChaCha20 encryption must succeed");
+        )
+        .expect("large ChaCha20 encryption must succeed");
         assert_eq!(env_chacha.original_size, chunk_size);
-        let dec_chacha = env_chacha.decrypt(&key).expect("large ChaCha20 decryption must succeed");
+        let dec_chacha = env_chacha
+            .decrypt(&key)
+            .expect("large ChaCha20 decryption must succeed");
         assert_eq!(dec_chacha, large_plaintext);
     }
 
@@ -587,12 +626,9 @@ mod tests {
     fn test_envelope_serialization_wire_format_roundtrip() {
         let plaintext = b"Chunk envelope serializable to bytes for CAS storage";
         let key = [0x99u8; 32];
-        let envelope = EncryptedChunkEnvelope::encrypt_aes_256_gcm(
-            "chunk_cas_07",
-            plaintext,
-            &key,
-            None,
-        ).unwrap();
+        let envelope =
+            EncryptedChunkEnvelope::encrypt_aes_256_gcm("chunk_cas_07", plaintext, &key, None)
+                .unwrap();
 
         let serialized = envelope.to_bytes().unwrap();
         let deserialized = EncryptedChunkEnvelope::from_bytes(&serialized).unwrap();

@@ -38,9 +38,9 @@ use tracing::{info, warn};
 use crate::conflict::diff3::{self, DiffHunk};
 use crate::conflict::{CoreEvent, ResolveRequest};
 use crate::engine::SyncEngine;
-use crate::storage::{
-    DeviceRecord, FolderRecord, PeerConnectionMetrics,
-};
+use crate::state::runtime::EngineLifecycleState;
+use crate::state::{DevicePairingState, FolderOfferState, FolderSyncState};
+use crate::storage::{DeviceRecord, FolderRecord, PeerConnectionMetrics};
 
 /// Application shared state injected into Axum handlers.
 #[derive(Clone)]
@@ -62,6 +62,44 @@ pub struct SystemStatusResponse {
     pub monitored_folders_count: usize,
     pub pending_conflicts_count: usize,
     pub memory_footprint_bytes: usize,
+    /// Number of folders in each runtime state, e.g. `{"idle": 3, "error": 1}`.
+    /// `sync_state` keeps its historical values; this exposes errors and pauses too.
+    #[serde(default)]
+    pub folder_states: std::collections::BTreeMap<String, usize>,
+    /// Engine lifecycle: `starting`, `ready`, `stopping` or `restarting`.
+    #[serde(default)]
+    pub lifecycle: String,
+}
+
+/// A paired device plus its derived runtime state. Serialized as the `DeviceRecord`
+/// fields (unchanged) followed by `state`, `online` and `last_seen_secs`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceView {
+    #[serde(flatten)]
+    pub device: DeviceRecord,
+    /// `DevicePairingState` of a paired device: `"paired"` or `"paused"`.
+    pub state: String,
+    /// Heard from within the presence TTL (see the `peer_presence` state machine).
+    pub online: bool,
+    /// Seconds since the device was last heard from; absent if never seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_secs: Option<u64>,
+}
+
+impl DeviceView {
+    pub fn new(device: DeviceRecord, presence: &crate::state::runtime::PeerPresence) -> Self {
+        let state = if device.is_paused {
+            crate::state::DevicePairingState::Paused
+        } else {
+            crate::state::DevicePairingState::Paired
+        };
+        Self {
+            online: !device.is_paused && presence.is_online(&device.device_id),
+            last_seen_secs: presence.last_seen_secs(&device.device_id),
+            state: state.as_str().to_string(),
+            device,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -198,13 +236,18 @@ impl ApiServer {
             .route("/rest/system/restart", post(system_restart))
             .route("/api/v1/system/gc", post(run_system_gc))
             .route("/rest/system/gc", post(run_system_gc))
-            .route("/api/v1/system/statemachines", get(get_system_statemachines))
+            .route(
+                "/api/v1/system/statemachines",
+                get(get_system_statemachines),
+            )
             .route("/rest/system/statemachines", get(get_system_statemachines))
             .route("/api/v1/connections", get(get_connections))
             .route("/rest/system/connections", get(get_connections))
-
             .route("/api/v1/folders", get(list_folders).post(register_folder))
-            .route("/rest/system/folders", get(list_folders).post(register_folder))
+            .route(
+                "/rest/system/folders",
+                get(list_folders).post(register_folder),
+            )
             .route("/api/v1/folders/:id", delete(delete_folder))
             .route("/api/v1/folders/:id/pause", post(pause_folder))
             .route("/api/v1/folders/:id/resume", post(resume_folder))
@@ -215,30 +258,75 @@ impl ApiServer {
             .route("/api/v1/folders/:id/completion", get(get_folder_completion))
             .route("/rest/db/completion", get(get_folder_completion_query))
             .route("/api/v1/folders/:id/devices", get(list_folder_devices))
-            .route("/api/v1/folders/:id/devices/:device_id", post(share_folder_device).delete(unshare_folder_device))
-            .route("/api/v1/folders/:id/ignores", get(get_folder_ignores).post(set_folder_ignores))
-            .route("/rest/db/ignores", get(get_folder_ignores_query).post(set_folder_ignores_query))
-
+            .route(
+                "/api/v1/folders/:id/devices/:device_id",
+                post(share_folder_device).delete(unshare_folder_device),
+            )
+            .route(
+                "/api/v1/folders/:id/ignores",
+                get(get_folder_ignores).post(set_folder_ignores),
+            )
+            .route(
+                "/rest/db/ignores",
+                get(get_folder_ignores_query).post(set_folder_ignores_query),
+            )
             .route("/api/v1/devices", get(list_devices).post(add_device))
             .route("/rest/system/devices", get(list_devices).post(add_device))
             .route("/api/v1/devices/:id", get(get_device).delete(remove_device))
             .route("/api/v1/devices/:id/pause", post(pause_device))
             .route("/api/v1/devices/:id/resume", post(resume_device))
-
             .route("/api/v1/cluster/pending/devices", get(list_pending_devices))
             .route("/rest/cluster/pending/devices", get(list_pending_devices))
-            .route("/api/v1/cluster/pending/devices/:id/accept", post(accept_pending_device))
-            .route("/rest/cluster/pending/devices/:id/accept", post(accept_pending_device))
-            .route("/api/v1/cluster/pending/devices/:id/reject", post(reject_pending_device))
-            .route("/rest/cluster/pending/devices/:id/reject", post(reject_pending_device))
-
+            .route(
+                "/api/v1/cluster/pending/devices/:id/accept",
+                post(accept_pending_device),
+            )
+            .route(
+                "/rest/cluster/pending/devices/:id/accept",
+                post(accept_pending_device),
+            )
+            .route(
+                "/api/v1/cluster/pending/devices/:id/reject",
+                post(reject_pending_device),
+            )
+            .route(
+                "/rest/cluster/pending/devices/:id/reject",
+                post(reject_pending_device),
+            )
+            .route(
+                "/api/v1/cluster/rejected/folders",
+                get(list_rejected_folders),
+            )
+            .route(
+                "/api/v1/cluster/rejected/folders/:id",
+                delete(forget_rejected_folder),
+            )
+            .route(
+                "/api/v1/cluster/rejected/devices",
+                get(list_rejected_devices),
+            )
+            .route(
+                "/api/v1/cluster/rejected/devices/:id",
+                delete(forget_rejected_device),
+            )
             .route("/api/v1/cluster/pending/folders", get(list_pending_folders))
             .route("/rest/cluster/pending/folders", get(list_pending_folders))
-            .route("/api/v1/cluster/pending/folders/:id/accept", post(accept_pending_folder))
-            .route("/rest/cluster/pending/folders/:id/accept", post(accept_pending_folder))
-            .route("/api/v1/cluster/pending/folders/:id/reject", post(reject_pending_folder))
-            .route("/rest/cluster/pending/folders/:id/reject", post(reject_pending_folder))
-
+            .route(
+                "/api/v1/cluster/pending/folders/:id/accept",
+                post(accept_pending_folder),
+            )
+            .route(
+                "/rest/cluster/pending/folders/:id/accept",
+                post(accept_pending_folder),
+            )
+            .route(
+                "/api/v1/cluster/pending/folders/:id/reject",
+                post(reject_pending_folder),
+            )
+            .route(
+                "/rest/cluster/pending/folders/:id/reject",
+                post(reject_pending_folder),
+            )
             .route("/api/v1/conflicts", get(list_conflicts))
             .route("/api/v1/conflicts/:id", get(get_conflict_details))
             .route("/api/v1/conflicts/:id/base", get(get_conflict_base))
@@ -250,10 +338,12 @@ impl ApiServer {
             .route("/rest/conflicts/:id/ignore", post(ignore_conflict))
             .route("/api/v1/conflicts/:id/reopen", post(reopen_conflict))
             .route("/rest/conflicts/:id/reopen", post(reopen_conflict))
-
             .route("/api/v1/events", get(websocket_events_handler))
             .route("/rest/events", get(websocket_events_handler))
-            .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
             .layer(cors)
             .with_state(state)
     }
@@ -267,12 +357,49 @@ impl ApiServer {
     /// Runs the Axum server asynchronously with an external graceful shutdown signal.
     pub async fn run_with_shutdown(
         self,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.bind().await?.serve(shutdown_rx).await
+    }
+
+    /// Binds the listening socket without serving yet.
+    ///
+    /// Splitting bind from serve lets the caller fail fast on `EADDRINUSE` before any
+    /// other subsystem starts, and learn the real port when `0` (ephemeral) was requested.
+    pub async fn bind(self) -> std::io::Result<BoundApiServer> {
+        let listener = tokio::net::TcpListener::bind(&self.bind_addr).await?;
+        let local_addr = listener.local_addr()?;
+        Ok(BoundApiServer {
+            router: Self::create_router(self.state),
+            listener,
+            local_addr,
+        })
+    }
+}
+
+/// An API server whose socket is already bound and ready to accept connections.
+pub struct BoundApiServer {
+    router: Router,
+    listener: tokio::net::TcpListener,
+    local_addr: SocketAddr,
+}
+
+impl BoundApiServer {
+    /// The address actually bound (resolves port `0` to the OS-assigned port).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Serves requests until `shutdown_rx` flips to `true`.
+    pub async fn serve(
+        self,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let app = Self::create_router(self.state);
-        info!("Synapse Core REST & WebSocket API listening on http://{}", self.bind_addr);
-        let listener = tokio::net::TcpListener::bind(&self.bind_addr).await?;
-        axum::serve(listener, app)
+        info!(
+            "Synapse Core REST & WebSocket API listening on http://{}",
+            self.local_addr
+        );
+        axum::serve(self.listener, self.router)
             .with_graceful_shutdown(async move {
                 while !*shutdown_rx.borrow() {
                     if shutdown_rx.changed().await.is_err() {
@@ -293,11 +420,7 @@ impl ApiServer {
 /// - `Authorization: Bearer <token>`
 /// - `X-API-Key: <token>`
 /// - `?token=<token>` query parameter (for WebSocket clients)
-async fn auth_middleware(
-    State(state): State<AppState>,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let Some(expected) = state.auth_token.as_deref().filter(|t| !t.is_empty()) else {
         return next.run(req).await;
     };
@@ -339,11 +462,7 @@ fn extract_token_from_request(req: &Request) -> Option<String> {
         }
     }
 
-    if let Some(api_key) = req
-        .headers()
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(api_key) = req.headers().get("x-api-key").and_then(|v| v.to_str().ok()) {
         return Some(api_key.trim().to_string());
     }
 
@@ -377,8 +496,16 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 async fn get_system_status(State(state): State<AppState>) -> impl IntoResponse {
     let uptime = state.start_time.elapsed().as_secs();
-    let folders = state.sync_engine.storage().list_folders().unwrap_or_default();
-    let conflicts = state.sync_engine.storage().list_pending_conflicts().unwrap_or_default();
+    let folders = state
+        .sync_engine
+        .storage()
+        .list_folders()
+        .unwrap_or_default();
+    let conflicts = state
+        .sync_engine
+        .storage()
+        .list_pending_conflicts()
+        .unwrap_or_default();
     let peers = state.peer_count.load(std::sync::atomic::Ordering::Relaxed);
     let mem = get_resident_memory_bytes();
 
@@ -407,15 +534,22 @@ async fn get_system_status(State(state): State<AppState>) -> impl IntoResponse {
         "IDLE".to_string()
     };
 
+    let folder_states = state
+        .sync_engine
+        .folder_states()
+        .summarize(folders.iter().map(|f| f.folder_id.as_str()));
+
     Json(SystemStatusResponse {
         device_id: state.sync_engine.device_id().to_string(),
         uptime_seconds: uptime,
         peer_count: peers,
         sync_state,
-        version: "1.0.0".into(),
+        version: crate::VERSION.to_string(),
         monitored_folders_count: folders.len(),
         pending_conflicts_count: conflicts.len(),
         memory_footprint_bytes: mem,
+        folder_states,
+        lifecycle: state.sync_engine.lifecycle().get().as_str().to_string(),
     })
 }
 
@@ -429,7 +563,7 @@ pub struct SystemVersionResponse {
 
 async fn get_system_version() -> impl IntoResponse {
     Json(SystemVersionResponse {
-        version: "v1.0.0".into(),
+        version: format!("v{}", crate::VERSION),
         codename: "Synapse-SynapticCore".into(),
         os: std::env::consts::OS.into(),
         arch: std::env::consts::ARCH.into(),
@@ -442,15 +576,62 @@ async fn get_system_ping() -> impl IntoResponse {
 
 async fn system_shutdown(State(state): State<AppState>) -> impl IntoResponse {
     info!("System shutdown requested via API");
+    let lifecycle = state.sync_engine.lifecycle();
+    let _ = lifecycle.transition(EngineLifecycleState::Stopping);
     if let Some(tx) = &state.shutdown_tx {
         let _ = tx.send(true);
     }
-    StatusCode::OK.into_response()
+    // Repeated calls are harmless and return the same answer.
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "lifecycle": lifecycle.get().as_str() })),
+    )
+        .into_response()
 }
 
-async fn system_restart() -> impl IntoResponse {
-    info!("System restart requested via API");
-    StatusCode::OK.into_response()
+/// Stops this engine generation and starts a fresh one in-process: same PID, same API
+/// address, storage and folder watchers reloaded. Clients should expect the WebSocket
+/// to drop and can poll `/api/v1/system/ping` until it answers again.
+async fn system_restart(State(state): State<AppState>) -> impl IntoResponse {
+    let lifecycle = state.sync_engine.lifecycle();
+    let Some(tx) = &state.shutdown_tx else {
+        // Embedded router without an engine loop around it: nothing can restart us.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "restart is not available: no engine supervisor",
+                "lifecycle": lifecycle.get().as_str(),
+            })),
+        )
+            .into_response();
+    };
+    match lifecycle.transition(EngineLifecycleState::Restarting) {
+        Ok(now) => {
+            info!("System restart requested via API");
+            let _ = tx.send(true);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "lifecycle": now.as_str() })),
+            )
+                .into_response()
+        }
+        Err(current) => {
+            let meta = current.metadata();
+            (
+                StatusCode::CONFLICT,
+                Json(crate::state::StateTransitionError {
+                    entity: "engine".into(),
+                    entity_id: state.sync_engine.device_id().to_string(),
+                    current_state: current.as_str().to_string(),
+                    attempted_transition: EngineLifecycleState::Restarting.as_str().to_string(),
+                    allowed_transitions: meta.allowed_transitions,
+                    available_actions: meta.available_actions,
+                    is_terminal: meta.is_terminal,
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -461,7 +642,11 @@ pub struct GcResponse {
 
 async fn run_system_gc(State(state): State<AppState>) -> impl IntoResponse {
     let _ = state.sync_engine.storage().rebuild_chunk_ref_counts();
-    match state.sync_engine.storage().garbage_collect_orphaned_chunks() {
+    match state
+        .sync_engine
+        .storage()
+        .garbage_collect_orphaned_chunks()
+    {
         Ok(collected) => (
             StatusCode::OK,
             Json(GcResponse {
@@ -482,16 +667,27 @@ async fn run_system_gc(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn get_connections(State(state): State<AppState>) -> impl IntoResponse {
-    let devices = state.sync_engine.storage().list_devices().unwrap_or_default();
+    let devices = state
+        .sync_engine
+        .storage()
+        .list_devices()
+        .unwrap_or_default();
     let mut map = HashMap::new();
 
+    let presence = state.sync_engine.peer_presence();
     for dev in devices {
+        let online = presence.is_online(&dev.device_id);
         map.insert(
             dev.device_id.clone(),
             PeerConnectionMetrics {
                 device_id: dev.device_id,
-                address: dev.addresses.first().cloned().unwrap_or_else(|| "dynamic".into()),
-                is_connected: !dev.is_paused,
+                address: dev
+                    .addresses
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "dynamic".into()),
+                // Paired, not paused, and heard from recently (peer presence machine).
+                is_connected: !dev.is_paused && online,
                 in_bps: 0,
                 out_bps: 0,
                 total_in_bytes: 0,
@@ -521,7 +717,11 @@ async fn list_folders(State(state): State<AppState>) -> impl IntoResponse {
 
     let mut dtos = Vec::new();
     for f in folders {
-        let files = state.sync_engine.storage().list_files_in_folder(&f.folder_id).unwrap_or_default();
+        let files = state
+            .sync_engine
+            .storage()
+            .list_files_in_folder(&f.folder_id)
+            .unwrap_or_default();
         dtos.push(FolderDto {
             folder_id: f.folder_id,
             local_path: f.local_path,
@@ -543,13 +743,31 @@ async fn register_folder(
     State(state): State<AppState>,
     Json(payload): Json<RegisterFolderRequest>,
 ) -> impl IntoResponse {
+    if let Err(invalid) = crate::state::validate_folder_config(
+        &payload.conflict_policy,
+        payload.sync_mode.as_deref(),
+        payload.pull_order.as_deref(),
+        payload.versioning_type.as_deref(),
+    ) {
+        return (StatusCode::BAD_REQUEST, Json(invalid)).into_response();
+    }
     let mut folder = FolderRecord::new(payload.folder_id.clone(), payload.local_path.clone());
     folder.conflict_policy = payload.conflict_policy;
-    if let Some(sm) = payload.sync_mode { folder.sync_mode = sm; }
-    if let Some(po) = payload.pull_order { folder.pull_order = po; }
-    if let Some(vt) = payload.versioning_type { folder.versioning_type = vt; }
-    if let Some(kd) = payload.versioning_keep_days { folder.versioning_keep_days = kd; }
-    if let Some(mn) = payload.marker_name { folder.marker_name = mn; }
+    if let Some(sm) = payload.sync_mode {
+        folder.sync_mode = sm;
+    }
+    if let Some(po) = payload.pull_order {
+        folder.pull_order = po;
+    }
+    if let Some(vt) = payload.versioning_type {
+        folder.versioning_type = vt;
+    }
+    if let Some(kd) = payload.versioning_keep_days {
+        folder.versioning_keep_days = kd;
+    }
+    if let Some(mn) = payload.marker_name {
+        folder.marker_name = mn;
+    }
 
     if let Err(e) = state.sync_engine.storage().add_folder(&folder) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -559,6 +777,7 @@ async fn register_folder(
         std::path::Path::new(&payload.local_path),
         &folder.marker_name,
     );
+    state.sync_engine.track_folder(&payload.folder_id);
 
     // Trigger initial index scan
     let engine = state.sync_engine.clone();
@@ -575,7 +794,10 @@ async fn delete_folder(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     match state.sync_engine.storage().delete_folder(&id) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            state.sync_engine.forget_folder_state(&id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -585,7 +807,10 @@ async fn pause_folder(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     match state.sync_engine.storage().set_folder_paused(&id, true) {
-        Ok(_) => StatusCode::OK.into_response(),
+        Ok(_) => {
+            state.sync_engine.refresh_folder_state(&id);
+            StatusCode::OK.into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -595,7 +820,10 @@ async fn resume_folder(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     match state.sync_engine.storage().set_folder_paused(&id, false) {
-        Ok(_) => StatusCode::OK.into_response(),
+        Ok(_) => {
+            state.sync_engine.refresh_folder_state(&id);
+            StatusCode::OK.into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -611,15 +839,27 @@ fn execute_folder_rescan(state: &AppState, folder_id: &str) {
 fn fetch_folder_status(state: &AppState, folder_id: &str) -> axum::response::Response {
     match state.sync_engine.storage().get_folder_status(folder_id) {
         Ok(mut st) => {
-            st.state = state.sync_engine.get_folder_state(folder_id).as_str().to_string();
+            let runtime = state.sync_engine.folder_runtime_state(folder_id);
+            st.state = runtime.state.as_str().to_string();
+            st.error = runtime
+                .error
+                .filter(|_| runtime.state == FolderSyncState::Error);
             Json(st).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
-fn fetch_folder_completion(state: &AppState, device_id: &str, folder_id: &str) -> axum::response::Response {
-    match state.sync_engine.storage().get_device_completion(device_id, folder_id) {
+fn fetch_folder_completion(
+    state: &AppState,
+    device_id: &str,
+    folder_id: &str,
+) -> axum::response::Response {
+    match state
+        .sync_engine
+        .storage()
+        .get_device_completion(device_id, folder_id)
+    {
         Ok(comp) => Json(comp).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -678,7 +918,10 @@ async fn get_folder_completion_query(
         Some(f) => f,
         None => return (StatusCode::BAD_REQUEST, "Missing folder parameter").into_response(),
     };
-    let dev_id = params.get("device").cloned().unwrap_or_else(|| state.sync_engine.device_id().to_string());
+    let dev_id = params
+        .get("device")
+        .cloned()
+        .unwrap_or_else(|| state.sync_engine.device_id().to_string());
     fetch_folder_completion(&state, &dev_id, fid)
 }
 
@@ -696,7 +939,11 @@ async fn share_folder_device(
     AxumPath((id, device_id)): AxumPath<(String, String)>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    match state.sync_engine.storage().share_folder_with_device(&id, &device_id) {
+    match state
+        .sync_engine
+        .storage()
+        .share_folder_with_device(&id, &device_id)
+    {
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -706,7 +953,11 @@ async fn unshare_folder_device(
     AxumPath((id, device_id)): AxumPath<(String, String)>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    match state.sync_engine.storage().unshare_folder_from_device(&id, &device_id) {
+    match state
+        .sync_engine
+        .storage()
+        .unshare_folder_from_device(&id, &device_id)
+    {
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -719,8 +970,16 @@ fn fetch_folder_ignores(state: &AppState, folder_id: &str) -> axum::response::Re
     }
 }
 
-fn save_folder_ignores(state: &AppState, folder_id: &str, patterns: &[String]) -> axum::response::Response {
-    match state.sync_engine.storage().set_folder_ignores(folder_id, patterns) {
+fn save_folder_ignores(
+    state: &AppState,
+    folder_id: &str,
+    patterns: &[String],
+) -> axum::response::Response {
+    match state
+        .sync_engine
+        .storage()
+        .set_folder_ignores(folder_id, patterns)
+    {
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -770,7 +1029,14 @@ async fn set_folder_ignores_query(
 
 async fn list_devices(State(state): State<AppState>) -> impl IntoResponse {
     match state.sync_engine.storage().list_devices() {
-        Ok(devs) => Json(devs).into_response(),
+        Ok(devs) => {
+            let presence = state.sync_engine.peer_presence();
+            let views: Vec<DeviceView> = devs
+                .into_iter()
+                .map(|d| DeviceView::new(d, presence))
+                .collect();
+            Json(views).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -781,10 +1047,13 @@ async fn add_device(
 ) -> impl IntoResponse {
     match state.sync_engine.storage().add_device(&payload) {
         Ok(_) => {
-            let _ = state.sync_engine.event_sender().send(CoreEvent::DevicePaired {
-                device_id: payload.device_id.clone(),
-                name: payload.name.clone(),
-            });
+            let _ = state
+                .sync_engine
+                .event_sender()
+                .send(CoreEvent::DevicePaired {
+                    device_id: payload.device_id.clone(),
+                    name: payload.name.clone(),
+                });
             (StatusCode::CREATED, Json(payload)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -796,7 +1065,7 @@ async fn get_device(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     match state.sync_engine.storage().get_device(&id) {
-        Ok(Some(d)) => Json(d).into_response(),
+        Ok(Some(d)) => Json(DeviceView::new(d, state.sync_engine.peer_presence())).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Device not found").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -812,10 +1081,71 @@ async fn remove_device(
     }
 }
 
+// -----------------------------------------------------------------------------
+// Device pairing state machine guard
+// -----------------------------------------------------------------------------
+
+/// Outcome of checking a requested state machine action.
+enum PairingCheck {
+    /// Proceed with the transition.
+    Apply,
+    /// Already in the target state: succeed without doing anything (idempotent).
+    AlreadyThere,
+    /// Respond immediately (404 unknown device, 409 invalid transition, 500).
+    Reject(Response),
+}
+
+/// Validates a device pairing transition against `DevicePairingState`.
+///
+/// Invalid transitions return `409 Conflict` with a machine-readable
+/// [`StateTransitionError`](crate::state::StateTransitionError) body listing the
+/// allowed transitions and actions, so a UI or agent can recover without guessing.
+fn check_pairing_transition(
+    state: &AppState,
+    device_id: &str,
+    target: DevicePairingState,
+) -> PairingCheck {
+    let current = match state.sync_engine.storage().device_pairing_state(device_id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return PairingCheck::Reject(
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Device not found: {device_id}"),
+                )
+                    .into_response(),
+            )
+        }
+        Err(e) => {
+            return PairingCheck::Reject(
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            )
+        }
+    };
+    if current == target {
+        return PairingCheck::AlreadyThere;
+    }
+    if current.can_transition_to(target) {
+        return PairingCheck::Apply;
+    }
+    PairingCheck::Reject(transition_conflict(
+        "device",
+        device_id.to_string(),
+        current.as_str(),
+        target.as_str(),
+        current.metadata(),
+    ))
+}
+
 async fn pause_device(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    match check_pairing_transition(&state, &id, DevicePairingState::Paused) {
+        PairingCheck::Reject(resp) => return resp,
+        PairingCheck::AlreadyThere => return StatusCode::OK.into_response(),
+        PairingCheck::Apply => {}
+    }
     match state.sync_engine.storage().set_device_paused(&id, true) {
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -826,6 +1156,11 @@ async fn resume_device(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    match check_pairing_transition(&state, &id, DevicePairingState::Paired) {
+        PairingCheck::Reject(resp) => return resp,
+        PairingCheck::AlreadyThere => return StatusCode::OK.into_response(),
+        PairingCheck::Apply => {}
+    }
     match state.sync_engine.storage().set_device_paused(&id, false) {
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -847,14 +1182,27 @@ async fn accept_pending_device(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let pending = state.sync_engine.storage().get_pending_device(&id).ok().flatten();
+    match check_pairing_transition(&state, &id, DevicePairingState::Paired) {
+        PairingCheck::Reject(resp) => return resp,
+        PairingCheck::AlreadyThere => return StatusCode::OK.into_response(),
+        PairingCheck::Apply => {}
+    }
+    let pending = state
+        .sync_engine
+        .storage()
+        .get_pending_device(&id)
+        .ok()
+        .flatten();
     match state.sync_engine.storage().accept_pending_device(&id) {
         Ok(_) => {
             if let Some(p) = pending {
-                let _ = state.sync_engine.event_sender().send(CoreEvent::DevicePaired {
-                    device_id: p.device_id,
-                    name: p.name,
-                });
+                let _ = state
+                    .sync_engine
+                    .event_sender()
+                    .send(CoreEvent::DevicePaired {
+                        device_id: p.device_id,
+                        name: p.name,
+                    });
             }
             StatusCode::OK.into_response()
         }
@@ -866,8 +1214,36 @@ async fn reject_pending_device(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    match check_pairing_transition(&state, &id, DevicePairingState::Rejected) {
+        PairingCheck::Reject(resp) => return resp,
+        PairingCheck::AlreadyThere => return StatusCode::OK.into_response(),
+        PairingCheck::Apply => {}
+    }
     match state.sync_engine.storage().reject_pending_device(&id) {
         Ok(_) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn list_rejected_devices(State(state): State<AppState>) -> impl IntoResponse {
+    match state.sync_engine.storage().list_rejected_devices() {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Forgets a rejection so the device can request pairing again.
+async fn forget_rejected_device(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match state.sync_engine.storage().forget_rejected_device(&id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            format!("No rejected pairing request for {id}"),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -885,13 +1261,152 @@ pub struct AcceptFolderPayload {
     pub local_path: String,
 }
 
+/// Builds the `409 Conflict` response for an invalid state machine action.
+fn transition_conflict(
+    entity: &str,
+    entity_id: String,
+    current: &str,
+    attempted: &str,
+    meta: crate::state::StateMetadata,
+) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(crate::state::StateTransitionError {
+            entity: entity.into(),
+            entity_id,
+            current_state: current.into(),
+            attempted_transition: attempted.into(),
+            allowed_transitions: meta.allowed_transitions,
+            available_actions: meta.available_actions,
+            is_terminal: meta.is_terminal,
+        }),
+    )
+        .into_response()
+}
+
+/// Same contract as device pairing: 404 unknown offer, 200 no-op when already in the
+/// target state, 409 with the allowed transitions otherwise.
+fn check_folder_offer_transition(
+    state: &AppState,
+    folder_id: &str,
+    device_id: &str,
+    target: FolderOfferState,
+) -> PairingCheck {
+    let current = match state
+        .sync_engine
+        .storage()
+        .folder_offer_state(folder_id, device_id)
+    {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return PairingCheck::Reject(
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("No offer of folder '{folder_id}' from device {device_id}"),
+                )
+                    .into_response(),
+            )
+        }
+        Err(e) => {
+            return PairingCheck::Reject(
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            )
+        }
+    };
+    if current == target {
+        return PairingCheck::AlreadyThere;
+    }
+    if current.can_transition_to(target) {
+        return PairingCheck::Apply;
+    }
+    PairingCheck::Reject(transition_conflict(
+        "folder_offer",
+        format!("{folder_id}@{device_id}"),
+        current.as_str(),
+        target.as_str(),
+        current.metadata(),
+    ))
+}
+
 async fn accept_pending_folder(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
     Json(payload): Json<AcceptFolderPayload>,
 ) -> impl IntoResponse {
-    match state.sync_engine.storage().accept_pending_folder(&id, &payload.device_id, &payload.local_path) {
-        Ok(_) => StatusCode::OK.into_response(),
+    match check_folder_offer_transition(&state, &id, &payload.device_id, FolderOfferState::Accepted)
+    {
+        PairingCheck::Reject(resp) => return resp,
+        PairingCheck::AlreadyThere => return StatusCode::OK.into_response(),
+        PairingCheck::Apply => {}
+    }
+    if payload.local_path.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_field",
+                "field": "local_path",
+                "value": payload.local_path,
+                "allowed": [],
+                "message": "local_path must be a directory path on this device",
+            })),
+        )
+            .into_response();
+    }
+    match state.sync_engine.storage().accept_pending_folder(
+        &id,
+        &payload.device_id,
+        &payload.local_path,
+    ) {
+        Ok(_) => {
+            // Same setup as registering a folder: without the mount-safety marker the
+            // first scan would refuse and the accepted folder would sit in `error`.
+            let marker = state
+                .sync_engine
+                .storage()
+                .get_folder(&id)
+                .ok()
+                .flatten()
+                .map(|f| (f.local_path, f.marker_name));
+            if let Some((path, marker_name)) = marker {
+                let root = std::path::Path::new(&path);
+                let _ = std::fs::create_dir_all(root);
+                let _ = crate::engine::fs_utils::ensure_folder_marker(root, &marker_name);
+            }
+            state.sync_engine.track_folder(&id);
+            execute_folder_rescan(&state, &id);
+            StatusCode::OK.into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn list_rejected_folders(State(state): State<AppState>) -> impl IntoResponse {
+    match state.sync_engine.storage().list_rejected_folders() {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `DELETE /api/v1/cluster/rejected/folders/:id?device_id=...`
+async fn forget_rejected_folder(
+    AxumPath(id): AxumPath<String>,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let Some(device_id) = params.get("device_id") else {
+        return (StatusCode::BAD_REQUEST, "Missing device_id query parameter").into_response();
+    };
+    match state
+        .sync_engine
+        .storage()
+        .forget_rejected_folder(&id, device_id)
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            format!("No rejected offer of folder '{id}' from device {device_id}"),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -906,7 +1421,17 @@ async fn reject_pending_folder(
     State(state): State<AppState>,
     Json(payload): Json<RejectFolderPayload>,
 ) -> impl IntoResponse {
-    match state.sync_engine.storage().reject_pending_folder(&id, &payload.device_id) {
+    match check_folder_offer_transition(&state, &id, &payload.device_id, FolderOfferState::Rejected)
+    {
+        PairingCheck::Reject(resp) => return resp,
+        PairingCheck::AlreadyThere => return StatusCode::OK.into_response(),
+        PairingCheck::Apply => {}
+    }
+    match state
+        .sync_engine
+        .storage()
+        .reject_pending_folder(&id, &payload.device_id)
+    {
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -938,7 +1463,7 @@ async fn get_conflict_details(
                 local_revision: c.local_revision,
                 remote_revision: c.remote_revision,
                 staged_payload_path: c.staged_payload_path,
-                status: c.status,
+                status: c.status.as_str().to_string(),
                 detected_at: c.detected_at,
                 available_actions: status
                     .available_actions()
@@ -966,7 +1491,11 @@ async fn get_conflict_base(
     };
 
     let base_bytes = match conflict.base_revision {
-        Some(rev) => state.sync_engine.storage().read_file_from_revision(&rev).unwrap_or_default(),
+        Some(rev) => state
+            .sync_engine
+            .storage()
+            .read_file_from_revision(&rev)
+            .unwrap_or_default(),
         None => Vec::new(),
     };
 
@@ -1036,10 +1565,15 @@ async fn get_conflict_diff(
         _ => return (StatusCode::NOT_FOUND, "Folder missing").into_response(),
     };
 
-    let local_bytes = fs::read(PathBuf::from(&folder.local_path).join(&conflict.relative_path)).unwrap_or_default();
+    let local_bytes = fs::read(PathBuf::from(&folder.local_path).join(&conflict.relative_path))
+        .unwrap_or_default();
     let remote_bytes = fs::read(&conflict.staged_payload_path).unwrap_or_default();
     let base_bytes = match &conflict.base_revision {
-        Some(rev) => state.sync_engine.storage().read_file_from_revision(rev).unwrap_or_default(),
+        Some(rev) => state
+            .sync_engine
+            .storage()
+            .read_file_from_revision(rev)
+            .unwrap_or_default(),
         None => Vec::new(),
     };
 

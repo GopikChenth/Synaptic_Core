@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{params, Connection, Result as SqlResult};
+use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
 use serde::{Deserialize, Serialize};
 
 /// Folder synchronization configuration and policy.
@@ -34,12 +34,24 @@ pub struct FolderRecord {
     pub marker_name: String,
 }
 
-fn default_policy() -> String { "THREE_WAY_AUTO".to_string() }
-fn default_sync_mode() -> String { "SendReceive".to_string() }
-fn default_pull_order() -> String { "Alphabetical".to_string() }
-fn default_versioning_type() -> String { "None".to_string() }
-fn default_versioning_keep_days() -> i64 { 30 }
-fn default_marker_name() -> String { ".synapse-folder".to_string() }
+fn default_policy() -> String {
+    "THREE_WAY_AUTO".to_string()
+}
+fn default_sync_mode() -> String {
+    "SendReceive".to_string()
+}
+fn default_pull_order() -> String {
+    "Alphabetical".to_string()
+}
+fn default_versioning_type() -> String {
+    "None".to_string()
+}
+fn default_versioning_keep_days() -> i64 {
+    30
+}
+fn default_marker_name() -> String {
+    ".synapse-folder".to_string()
+}
 
 impl FolderRecord {
     pub fn new(folder_id: impl Into<String>, local_path: impl Into<String>) -> Self {
@@ -85,6 +97,15 @@ pub struct DeviceRecord {
 }
 
 /// Pending incoming device pairing request.
+/// A pairing request that was rejected (see `DevicePairingState::Rejected`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RejectedDeviceRecord {
+    pub device_id: String,
+    pub name: String,
+    pub address: String,
+    pub rejected_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingDeviceRecord {
     pub device_id: String,
@@ -125,12 +146,22 @@ pub struct PendingFolderRecord {
     pub offered_at: i64,
 }
 
+/// A folder offer that was rejected (see `FolderOfferState::Rejected`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RejectedFolderRecord {
+    pub folder_id: String,
+    pub device_id: String,
+    pub folder_label: String,
+    pub rejected_at: i64,
+}
+
 /// Folder sync metrics for UI status dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderStatusMetrics {
     #[serde(alias = "folder", alias = "folderId")]
     pub folder_id: String,
-    pub state: String, // "idle", "scanning", "syncing", "error"
+    /// `FolderSyncState` wire value: "idle", "scanning", "syncing", "paused" or "error".
+    pub state: String,
     #[serde(alias = "globalFiles")]
     pub global_files: u64,
     #[serde(alias = "globalBytes")]
@@ -148,6 +179,9 @@ pub struct FolderStatusMetrics {
     #[serde(alias = "completionPct", alias = "completion")]
     pub completion_pct: f64,
     pub sequence: u64,
+    /// Why the folder is in the `error` state (absent otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Folder completion percentage per remote device.
@@ -213,14 +247,26 @@ pub struct QuarantineConflict {
     pub local_revision: String,
     pub remote_revision: String,
     pub staged_payload_path: String,
-    pub status: String,
+    /// Serialized as `"PENDING"`, `"RESOLVED"` or `"IGNORED"` (unchanged wire format).
+    pub status: crate::state::ConflictStatus,
     pub detected_at: i64,
 }
 
 impl QuarantineConflict {
+    /// Typed status (kept for callers that predate the typed field).
     pub fn parsed_status(&self) -> crate::state::ConflictStatus {
-        self.status.parse().unwrap_or_default()
+        self.status
     }
+}
+
+/// Parses a stored conflict status. Unknown values can't be written any more (a trigger
+/// rejects them), but rows from older databases are normalised at startup; anything
+/// still unrecognised is logged and kept visible as `PENDING`.
+fn conflict_status_from_db(conflict_id: &str, raw: &str) -> crate::state::ConflictStatus {
+    raw.parse().unwrap_or_else(|_| {
+        tracing::warn!("conflict {conflict_id} has unknown status '{raw}'; treating it as PENDING");
+        crate::state::ConflictStatus::Pending
+    })
 }
 
 /// Central database and block storage manager.
@@ -242,7 +288,7 @@ impl StorageEngine {
         fs::create_dir_all(&quarantine_dir)?;
 
         let conn = Connection::open(&db_path)?;
-        
+
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -285,9 +331,7 @@ impl StorageEngine {
         fs::create_dir_all(&quarantine_dir)?;
 
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(
-            "PRAGMA foreign_keys = ON;",
-        )?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
         let engine = Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -392,6 +436,16 @@ impl StorageEngine {
                 cert_pin TEXT
             );
 
+            -- Rejected pairing requests (terminal state of the device pairing machine).
+            -- Remembered so a rejected device doesn't reappear as pending on its next
+            -- discovery broadcast. Cleared by forgetting it or by explicitly adding the device.
+            CREATE TABLE IF NOT EXISTS rejected_devices (
+                device_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                address TEXT NOT NULL,
+                rejected_at INTEGER NOT NULL
+            );
+
             -- Folder Sharing Matrix (Which folders are shared with which devices)
             CREATE TABLE IF NOT EXISTS folder_devices (
                 folder_id TEXT NOT NULL,
@@ -406,6 +460,15 @@ impl StorageEngine {
                 device_id TEXT NOT NULL,
                 folder_label TEXT NOT NULL,
                 offered_at INTEGER NOT NULL,
+                PRIMARY KEY (folder_id, device_id)
+            );
+
+            -- Rejected folder offers (terminal state of the folder offer machine).
+            CREATE TABLE IF NOT EXISTS rejected_folders (
+                folder_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                folder_label TEXT NOT NULL,
+                rejected_at INTEGER NOT NULL,
                 PRIMARY KEY (folder_id, device_id)
             );
 
@@ -433,19 +496,67 @@ impl StorageEngine {
             CREATE INDEX IF NOT EXISTS idx_conflicts_status ON quarantine_conflicts(status);
             CREATE INDEX IF NOT EXISTS idx_folder_devices_folder ON folder_devices(folder_id);
             CREATE INDEX IF NOT EXISTS idx_file_versions_folder ON file_versions(folder_id);
-            "
+            ",
         )?;
 
         // Safe migrations for folders table columns if upgraded from earlier schema
-        let _ = conn.execute("ALTER TABLE folders ADD COLUMN sync_mode TEXT NOT NULL DEFAULT 'SendReceive'", []);
-        let _ = conn.execute("ALTER TABLE folders ADD COLUMN pull_order TEXT NOT NULL DEFAULT 'Alphabetical'", []);
-        let _ = conn.execute("ALTER TABLE folders ADD COLUMN versioning_type TEXT NOT NULL DEFAULT 'None'", []);
-        let _ = conn.execute("ALTER TABLE folders ADD COLUMN versioning_keep_days INTEGER NOT NULL DEFAULT 30", []);
-        let _ = conn.execute("ALTER TABLE folders ADD COLUMN marker_name TEXT NOT NULL DEFAULT '.synapse-folder'", []);
+        let _ = conn.execute(
+            "ALTER TABLE folders ADD COLUMN sync_mode TEXT NOT NULL DEFAULT 'SendReceive'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE folders ADD COLUMN pull_order TEXT NOT NULL DEFAULT 'Alphabetical'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE folders ADD COLUMN versioning_type TEXT NOT NULL DEFAULT 'None'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE folders ADD COLUMN versioning_keep_days INTEGER NOT NULL DEFAULT 30",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE folders ADD COLUMN marker_name TEXT NOT NULL DEFAULT '.synapse-folder'",
+            [],
+        );
 
-        let _ = conn.execute("ALTER TABLE revisions ADD COLUMN sequence_number INTEGER NOT NULL DEFAULT 0", []);
-        let _ = conn.execute("ALTER TABLE revisions ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE revisions ADD COLUMN sequence_number INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE revisions ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE pending_devices ADD COLUMN cert_pin TEXT", []);
+
+        // Conflict status is a closed set (ConflictStatus). Normalise rows written by
+        // older versions, then let the database itself refuse anything else. SQLite
+        // can't add a CHECK constraint to an existing table, so triggers enforce it.
+        conn.execute_batch(
+            "UPDATE quarantine_conflicts SET status = UPPER(TRIM(status))
+                 WHERE status <> UPPER(TRIM(status));
+             CREATE TRIGGER IF NOT EXISTS quarantine_conflicts_status_insert
+                 BEFORE INSERT ON quarantine_conflicts
+                 WHEN NEW.status NOT IN ('PENDING', 'RESOLVED', 'IGNORED')
+                 BEGIN SELECT RAISE(ABORT, 'invalid conflict status'); END;
+             CREATE TRIGGER IF NOT EXISTS quarantine_conflicts_status_update
+                 BEFORE UPDATE OF status ON quarantine_conflicts
+                 WHEN NEW.status NOT IN ('PENDING', 'RESOLVED', 'IGNORED')
+                 BEGIN SELECT RAISE(ABORT, 'invalid conflict status'); END;",
+        )?;
+        let unknown: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM quarantine_conflicts
+                 WHERE status NOT IN ('PENDING', 'RESOLVED', 'IGNORED')",
+            [],
+            |row| row.get(0),
+        )?;
+        if unknown > 0 {
+            tracing::warn!(
+                "{unknown} conflict(s) have an unrecognised status; they are reported as PENDING"
+            );
+        }
         Ok(())
     }
 
@@ -508,7 +619,9 @@ impl StorageEngine {
                 sync_mode: row.get(4).unwrap_or_else(|_| default_sync_mode()),
                 pull_order: row.get(5).unwrap_or_else(|_| default_pull_order()),
                 versioning_type: row.get(6).unwrap_or_else(|_| default_versioning_type()),
-                versioning_keep_days: row.get(7).unwrap_or_else(|_| default_versioning_keep_days()),
+                versioning_keep_days: row
+                    .get(7)
+                    .unwrap_or_else(|_| default_versioning_keep_days()),
                 marker_name: row.get(8).unwrap_or_else(|_| default_marker_name()),
             })
         })?;
@@ -536,7 +649,9 @@ impl StorageEngine {
                 sync_mode: row.get(4).unwrap_or_else(|_| default_sync_mode()),
                 pull_order: row.get(5).unwrap_or_else(|_| default_pull_order()),
                 versioning_type: row.get(6).unwrap_or_else(|_| default_versioning_type()),
-                versioning_keep_days: row.get(7).unwrap_or_else(|_| default_versioning_keep_days()),
+                versioning_keep_days: row
+                    .get(7)
+                    .unwrap_or_else(|_| default_versioning_keep_days()),
                 marker_name: row.get(8).unwrap_or_else(|_| default_marker_name()),
             })
         })?;
@@ -558,7 +673,10 @@ impl StorageEngine {
 
     pub fn delete_folder(&self, folder_id: &str) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM folders WHERE folder_id = ?1", params![folder_id])?;
+        conn.execute(
+            "DELETE FROM folders WHERE folder_id = ?1",
+            params![folder_id],
+        )?;
         Ok(())
     }
 
@@ -568,7 +686,8 @@ impl StorageEngine {
 
     pub fn add_device(&self, device: &DeviceRecord) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
-        let addrs_json = serde_json::to_string(&device.addresses).unwrap_or_else(|_| "[]".to_string());
+        let addrs_json =
+            serde_json::to_string(&device.addresses).unwrap_or_else(|_| "[]".to_string());
         conn.execute(
             "INSERT INTO devices (
                 device_id, name, addresses, is_paused, is_trusted, introducer, cert_name, created_at
@@ -590,6 +709,15 @@ impl StorageEngine {
                 device.cert_name,
                 device.created_at,
             ],
+        )?;
+        // Explicitly adding a device overrides an earlier rejection / pending request.
+        conn.execute(
+            "DELETE FROM rejected_devices WHERE device_id = ?1",
+            params![device.device_id],
+        )?;
+        conn.execute(
+            "DELETE FROM pending_devices WHERE device_id = ?1",
+            params![device.device_id],
         )?;
         Ok(())
     }
@@ -650,8 +778,14 @@ impl StorageEngine {
 
     pub fn remove_device(&self, device_id: &str) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM devices WHERE device_id = ?1", params![device_id])?;
-        conn.execute("DELETE FROM folder_devices WHERE device_id = ?1", params![device_id])?;
+        conn.execute(
+            "DELETE FROM devices WHERE device_id = ?1",
+            params![device_id],
+        )?;
+        conn.execute(
+            "DELETE FROM folder_devices WHERE device_id = ?1",
+            params![device_id],
+        )?;
         Ok(())
     }
 
@@ -781,7 +915,10 @@ impl StorageEngine {
 
         // Security check: Only verified introducers may announce cluster devices
         if !self.is_device_introducer(introducer_id)? {
-            tracing::warn!("Ignored cluster device announcement from non-introducer peer {}", introducer_id);
+            tracing::warn!(
+                "Ignored cluster device announcement from non-introducer peer {}",
+                introducer_id
+            );
             return Ok(result);
         }
 
@@ -790,6 +927,12 @@ impl StorageEngine {
         for dev in announced_devices {
             // Cannot introduce itself
             if dev.device_id == introducer_id {
+                result.ignored.push(dev.device_id.clone());
+                continue;
+            }
+
+            // A device the user rejected stays rejected, even if an introducer vouches for it.
+            if self.is_device_rejected(&dev.device_id)? {
                 result.ignored.push(dev.device_id.clone());
                 continue;
             }
@@ -806,7 +949,8 @@ impl StorageEngine {
                 }
                 if changed {
                     let conn = self.conn.lock().unwrap();
-                    let addrs_json = serde_json::to_string(&updated_addrs).unwrap_or_else(|_| "[]".to_string());
+                    let addrs_json =
+                        serde_json::to_string(&updated_addrs).unwrap_or_else(|_| "[]".to_string());
                     conn.execute(
                         "UPDATE devices SET addresses = ?1 WHERE device_id = ?2",
                         params![addrs_json, dev.device_id],
@@ -819,7 +963,8 @@ impl StorageEngine {
             // Check if already in pending_devices
             let in_pending = {
                 let conn = self.conn.lock().unwrap();
-                let mut stmt = conn.prepare("SELECT 1 FROM pending_devices WHERE device_id = ?1")?;
+                let mut stmt =
+                    conn.prepare("SELECT 1 FROM pending_devices WHERE device_id = ?1")?;
                 stmt.exists(params![dev.device_id])?
             };
 
@@ -841,7 +986,11 @@ impl StorageEngine {
                 }
                 result.added_trusted.push(dev.device_id.clone());
             } else if !in_pending {
-                let address = dev.addresses.first().cloned().unwrap_or_else(|| "dynamic".into());
+                let address = dev
+                    .addresses
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "dynamic".into());
                 let pending = PendingDeviceRecord {
                     device_id: dev.device_id.clone(),
                     name: dev.name.clone(),
@@ -863,8 +1012,20 @@ impl StorageEngine {
     // PENDING PAIRING OPERATIONS
     // =========================================================================
 
-    pub fn add_pending_device(&self, rec: &PendingDeviceRecord) -> SqlResult<()> {
+    /// Stages an incoming pairing request. Returns `false` (and stores nothing) when the
+    /// device was previously rejected.
+    pub fn add_pending_device(&self, rec: &PendingDeviceRecord) -> SqlResult<bool> {
         let conn = self.conn.lock().unwrap();
+        let rejected: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM rejected_devices WHERE device_id = ?1)",
+                params![rec.device_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if rejected {
+            return Ok(false);
+        }
         conn.execute(
             "INSERT INTO pending_devices (device_id, name, address, received_at, cert_pin)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -873,9 +1034,15 @@ impl StorageEngine {
                 address = excluded.address,
                 received_at = excluded.received_at,
                 cert_pin = coalesce(excluded.cert_pin, pending_devices.cert_pin)",
-            params![rec.device_id, rec.name, rec.address, rec.received_at, rec.cert_pin],
+            params![
+                rec.device_id,
+                rec.name,
+                rec.address,
+                rec.received_at,
+                rec.cert_pin
+            ],
         )?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn list_pending_devices(&self) -> SqlResult<Vec<PendingDeviceRecord>> {
@@ -948,14 +1115,98 @@ impl StorageEngine {
             params![pending.device_id, pending.name, addrs_json, pending.cert_pin, pending.received_at],
         )?;
 
-        conn.execute("DELETE FROM pending_devices WHERE device_id = ?1", params![device_id])?;
+        conn.execute(
+            "DELETE FROM pending_devices WHERE device_id = ?1",
+            params![device_id],
+        )?;
         Ok(())
     }
 
+    /// Rejects a pending request and remembers the rejection.
     pub fn reject_pending_device(&self, device_id: &str) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM pending_devices WHERE device_id = ?1", params![device_id])?;
+        conn.execute(
+            "INSERT INTO rejected_devices (device_id, name, address, rejected_at)
+             SELECT device_id, name, address, ?2 FROM pending_devices WHERE device_id = ?1
+             ON CONFLICT(device_id) DO UPDATE SET rejected_at = excluded.rejected_at",
+            params![device_id, chrono::Utc::now().timestamp_millis()],
+        )?;
+        conn.execute(
+            "DELETE FROM pending_devices WHERE device_id = ?1",
+            params![device_id],
+        )?;
         Ok(())
+    }
+
+    pub fn is_device_rejected(&self, device_id: &str) -> SqlResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rejected_devices WHERE device_id = ?1)",
+            params![device_id],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn list_rejected_devices(&self) -> SqlResult<Vec<RejectedDeviceRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT device_id, name, address, rejected_at FROM rejected_devices ORDER BY rejected_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RejectedDeviceRecord {
+                device_id: row.get(0)?,
+                name: row.get(1)?,
+                address: row.get(2)?,
+                rejected_at: row.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Forgets a rejection so the device may request pairing again. Returns whether
+    /// a rejection existed.
+    pub fn forget_rejected_device(&self, device_id: &str) -> SqlResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM rejected_devices WHERE device_id = ?1",
+            params![device_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Current position of a device in the pairing state machine, derived from where it
+    /// is recorded: `devices` (paired / paused), `pending_devices` or `rejected_devices`.
+    /// `None` means the device is unknown.
+    pub fn device_pairing_state(
+        &self,
+        device_id: &str,
+    ) -> SqlResult<Option<crate::state::DevicePairingState>> {
+        use crate::state::DevicePairingState as S;
+        let conn = self.conn.lock().unwrap();
+        let paused: Option<i64> = conn
+            .query_row(
+                "SELECT is_paused FROM devices WHERE device_id = ?1",
+                params![device_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(p) = paused {
+            return Ok(Some(if p != 0 { S::Paused } else { S::Paired }));
+        }
+        let in_table = |table: &str| -> SqlResult<bool> {
+            conn.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE device_id = ?1)"),
+                params![device_id],
+                |row| row.get(0),
+            )
+        };
+        if in_table("pending_devices")? {
+            return Ok(Some(S::Pending));
+        }
+        if in_table("rejected_devices")? {
+            return Ok(Some(S::Rejected));
+        }
+        Ok(None)
     }
 
     // =========================================================================
@@ -995,17 +1246,33 @@ impl StorageEngine {
     // PENDING FOLDER INVITATIONS
     // =========================================================================
 
-    pub fn add_pending_folder(&self, rec: &PendingFolderRecord) -> SqlResult<()> {
+    /// Stages a folder offer. Returns `false` (and stores nothing) when this offer was
+    /// previously rejected or the folder is already shared with that device.
+    pub fn add_pending_folder(&self, rec: &PendingFolderRecord) -> SqlResult<bool> {
         let conn = self.conn.lock().unwrap();
+        let settled: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rejected_folders WHERE folder_id = ?1 AND device_id = ?2)
+                 OR EXISTS(SELECT 1 FROM folder_devices WHERE folder_id = ?1 AND device_id = ?2)",
+            params![rec.folder_id, rec.device_id],
+            |row| row.get(0),
+        )?;
+        if settled {
+            return Ok(false);
+        }
         conn.execute(
             "INSERT INTO pending_folders (folder_id, device_id, folder_label, offered_at)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(folder_id, device_id) DO UPDATE SET
                 folder_label = excluded.folder_label,
                 offered_at = excluded.offered_at",
-            params![rec.folder_id, rec.device_id, rec.folder_label, rec.offered_at],
+            params![
+                rec.folder_id,
+                rec.device_id,
+                rec.folder_label,
+                rec.offered_at
+            ],
         )?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn list_pending_folders(&self) -> SqlResult<Vec<PendingFolderRecord>> {
@@ -1029,7 +1296,12 @@ impl StorageEngine {
         Ok(list)
     }
 
-    pub fn accept_pending_folder(&self, folder_id: &str, device_id: &str, local_path: &str) -> SqlResult<()> {
+    pub fn accept_pending_folder(
+        &self,
+        folder_id: &str,
+        device_id: &str,
+        local_path: &str,
+    ) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         // Create folder locally if not exists
         conn.execute(
@@ -1049,13 +1321,77 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Rejects an offer and remembers the rejection.
     pub fn reject_pending_folder(&self, folder_id: &str, device_id: &str) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO rejected_folders (folder_id, device_id, folder_label, rejected_at)
+             SELECT folder_id, device_id, folder_label, ?3 FROM pending_folders
+             WHERE folder_id = ?1 AND device_id = ?2
+             ON CONFLICT(folder_id, device_id) DO UPDATE SET rejected_at = excluded.rejected_at",
+            params![folder_id, device_id, chrono::Utc::now().timestamp_millis()],
+        )?;
         conn.execute(
             "DELETE FROM pending_folders WHERE folder_id = ?1 AND device_id = ?2",
             params![folder_id, device_id],
         )?;
         Ok(())
+    }
+
+    pub fn list_rejected_folders(&self) -> SqlResult<Vec<RejectedFolderRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT folder_id, device_id, folder_label, rejected_at FROM rejected_folders
+             ORDER BY rejected_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RejectedFolderRecord {
+                folder_id: row.get(0)?,
+                device_id: row.get(1)?,
+                folder_label: row.get(2)?,
+                rejected_at: row.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Forgets a rejected offer so the device can offer the folder again.
+    pub fn forget_rejected_folder(&self, folder_id: &str, device_id: &str) -> SqlResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM rejected_folders WHERE folder_id = ?1 AND device_id = ?2",
+            params![folder_id, device_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Current state of the offer `(folder_id, device_id)`; `None` if there never was one
+    /// (or it was forgotten).
+    pub fn folder_offer_state(
+        &self,
+        folder_id: &str,
+        device_id: &str,
+    ) -> SqlResult<Option<crate::state::FolderOfferState>> {
+        use crate::state::FolderOfferState as S;
+        let conn = self.conn.lock().unwrap();
+        let in_table = |table: &str| -> SqlResult<bool> {
+            conn.query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM {table} WHERE folder_id = ?1 AND device_id = ?2)"
+                ),
+                params![folder_id, device_id],
+                |row| row.get(0),
+            )
+        };
+        if in_table("pending_folders")? {
+            Ok(Some(S::Pending))
+        } else if in_table("rejected_folders")? {
+            Ok(Some(S::Rejected))
+        } else if in_table("folder_devices")? {
+            Ok(Some(S::Accepted))
+        } else {
+            Ok(None)
+        }
     }
 
     // =========================================================================
@@ -1076,7 +1412,10 @@ impl StorageEngine {
     pub fn set_folder_ignores(&self, folder_id: &str, patterns: &[String]) -> SqlResult<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM folder_ignores WHERE folder_id = ?1", params![folder_id])?;
+        tx.execute(
+            "DELETE FROM folder_ignores WHERE folder_id = ?1",
+            params![folder_id],
+        )?;
         for pat in patterns {
             let trimmed = pat.trim();
             if !trimmed.is_empty() {
@@ -1099,9 +1438,8 @@ impl StorageEngine {
         let mut stmt = conn.prepare(
             "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM files WHERE folder_id = ?1 AND is_deleted = 0",
         )?;
-        let (local_files, local_bytes): (i64, i64) = stmt.query_row(params![folder_id], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+        let (local_files, local_bytes): (i64, i64) =
+            stmt.query_row(params![folder_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
 
         let is_paused: bool = conn
             .query_row(
@@ -1133,10 +1471,15 @@ impl StorageEngine {
             in_sync_bytes: u_local_bytes,
             completion_pct: 100.0,
             sequence: u_local_files,
+            error: None,
         })
     }
 
-    pub fn get_device_completion(&self, device_id: &str, folder_id: &str) -> SqlResult<DeviceCompletionMetrics> {
+    pub fn get_device_completion(
+        &self,
+        device_id: &str,
+        folder_id: &str,
+    ) -> SqlResult<DeviceCompletionMetrics> {
         let status = self.get_folder_status(folder_id)?;
         Ok(DeviceCompletionMetrics {
             device_id: device_id.to_string(),
@@ -1206,7 +1549,11 @@ impl StorageEngine {
         )? > 0)
     }
 
-    pub fn list_all_files_in_folder(&self, folder_id: &str, include_deleted: bool) -> SqlResult<Vec<FileRecord>> {
+    pub fn list_all_files_in_folder(
+        &self,
+        folder_id: &str,
+        include_deleted: bool,
+    ) -> SqlResult<Vec<FileRecord>> {
         let conn = self.conn.lock().unwrap();
         let query = if include_deleted {
             "SELECT folder_id, relative_path, size, mtime_nanos, current_revision, is_deleted
@@ -1324,7 +1671,11 @@ impl StorageEngine {
     // =========================================================================
 
     fn get_chunk_file_path(&self, chunk_hash: &str) -> PathBuf {
-        let prefix = if chunk_hash.len() >= 2 { &chunk_hash[0..2] } else { "xx" };
+        let prefix = if chunk_hash.len() >= 2 {
+            &chunk_hash[0..2]
+        } else {
+            "xx"
+        };
         let dir = self.blocks_dir.join(prefix);
         if !dir.exists() {
             let _ = fs::create_dir_all(&dir);
@@ -1333,7 +1684,11 @@ impl StorageEngine {
     }
 
     /// Stores a chunk payload in the CAS store and updates the reference count in SQLite.
-    pub fn put_chunk(&self, chunk_hash: &str, data: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn put_chunk(
+        &self,
+        chunk_hash: &str,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let file_path = self.get_chunk_file_path(chunk_hash);
         let exists = file_path.exists();
 
@@ -1357,10 +1712,13 @@ impl StorageEngine {
     /// Removes orphaned CAS blocks.  Revisions own references through
     /// `file_chunks`; standalone received blocks remain at ref_count zero until
     /// they are attached to a verified revision.
-    pub fn garbage_collect_orphaned_chunks(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn garbage_collect_orphaned_chunks(
+        &self,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let candidates: Vec<String> = {
             let conn = self.conn.lock().unwrap();
-            let mut statement = conn.prepare("SELECT chunk_hash FROM chunks WHERE ref_count <= 0")?;
+            let mut statement =
+                conn.prepare("SELECT chunk_hash FROM chunks WHERE ref_count <= 0")?;
             let hashes = statement
                 .query_map([], |row| row.get(0))?
                 .collect::<SqlResult<Vec<String>>>()?;
@@ -1378,7 +1736,10 @@ impl StorageEngine {
     }
 
     /// Reads chunk payload bytes from the CAS block store.
-    pub fn get_chunk(&self, chunk_hash: &str) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn get_chunk(
+        &self,
+        chunk_hash: &str,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
         let file_path = self.get_chunk_file_path(chunk_hash);
         if !file_path.exists() {
             return Ok(None);
@@ -1390,14 +1751,23 @@ impl StorageEngine {
     }
 
     /// Stores an encrypted chunk envelope in the CAS store for untrusted nodes.
-    pub fn put_encrypted_chunk(&self, envelope: &crate::p2p::crypto::EncryptedChunkEnvelope) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn put_encrypted_chunk(
+        &self,
+        envelope: &crate::p2p::crypto::EncryptedChunkEnvelope,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let payload = envelope.to_bytes()?;
         self.put_chunk(&envelope.chunk_hash, &payload)?;
         Ok(())
     }
 
     /// Reads an encrypted chunk envelope from the CAS store.
-    pub fn get_encrypted_chunk(&self, chunk_hash: &str) -> Result<Option<crate::p2p::crypto::EncryptedChunkEnvelope>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn get_encrypted_chunk(
+        &self,
+        chunk_hash: &str,
+    ) -> Result<
+        Option<crate::p2p::crypto::EncryptedChunkEnvelope>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         match self.get_chunk(chunk_hash)? {
             Some(data) => {
                 let envelope = crate::p2p::crypto::EncryptedChunkEnvelope::from_bytes(&data)?;
@@ -1413,13 +1783,19 @@ impl StorageEngine {
     }
 
     /// Assembles an entire file from its ordered chunk list.
-    pub fn read_file_from_revision(&self, revision_hash: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn read_file_from_revision(
+        &self,
+        revision_hash: &str,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let chunk_hashes = self.get_revision_chunks(revision_hash)?;
         self.read_chunks_payload(&chunk_hashes)
     }
 
     /// Assembles file payload bytes directly from an ordered sequence of chunk hashes.
-    pub fn read_chunks_payload(&self, chunk_hashes: &[String]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn read_chunks_payload(
+        &self,
+        chunk_hashes: &[String],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let mut payload = Vec::new();
         for hash in chunk_hashes {
             match self.get_chunk(hash)? {
@@ -1437,6 +1813,7 @@ impl StorageEngine {
     // =========================================================================
 
     /// Registers a quarantined conflict and writes the incoming conflicting payload to the staging area.
+    #[allow(clippy::too_many_arguments)]
     pub fn stage_quarantine_conflict(
         &self,
         conflict_id: &str,
@@ -1503,7 +1880,10 @@ impl StorageEngine {
                 local_revision: row.get(4)?,
                 remote_revision: row.get(5)?,
                 staged_payload_path: row.get(6)?,
-                status: row.get(7)?,
+                status: conflict_status_from_db(
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(7)?,
+                ),
                 detected_at: row.get(8)?,
             })
         })?;
@@ -1531,7 +1911,10 @@ impl StorageEngine {
                 local_revision: row.get(4)?,
                 remote_revision: row.get(5)?,
                 staged_payload_path: row.get(6)?,
-                status: row.get(7)?,
+                status: conflict_status_from_db(
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(7)?,
+                ),
                 detected_at: row.get(8)?,
             })
         })?;
@@ -1542,7 +1925,10 @@ impl StorageEngine {
         }
     }
 
-    pub fn resolve_conflict(&self, conflict_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn resolve_conflict(
+        &self,
+        conflict_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conflict = self.get_conflict(conflict_id)?;
         if let Some(c) = conflict {
             let path = PathBuf::from(&c.staged_payload_path);
@@ -1559,7 +1945,10 @@ impl StorageEngine {
         Ok(())
     }
 
-    pub fn ignore_conflict(&self, conflict_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn ignore_conflict(
+        &self,
+        conflict_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE quarantine_conflicts SET status = 'IGNORED' WHERE conflict_id = ?1",
@@ -1568,7 +1957,10 @@ impl StorageEngine {
         Ok(())
     }
 
-    pub fn reopen_conflict(&self, conflict_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn reopen_conflict(
+        &self,
+        conflict_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE quarantine_conflicts SET status = 'PENDING' WHERE conflict_id = ?1",
@@ -1612,7 +2004,9 @@ mod tests {
         assert_eq!(devs[0].name, "Pixel 9 Pro");
 
         // Folder sharing matrix
-        engine.share_folder_with_device("test_vault", &dev.device_id).unwrap();
+        engine
+            .share_folder_with_device("test_vault", &dev.device_id)
+            .unwrap();
         let shared_devs = engine.list_folder_devices("test_vault").unwrap();
         assert_eq!(shared_devs, vec![dev.device_id.clone()]);
 
@@ -1625,15 +2019,17 @@ mod tests {
         assert_eq!(retrieved, chunk_data);
 
         // 3. Staging quarantine conflict
-        let conflict_path = engine.stage_quarantine_conflict(
-            "cnf_test1",
-            "test_vault",
-            "doc.md",
-            None,
-            "rev_local",
-            "rev_remote",
-            b"Conflicting remote content",
-        ).unwrap();
+        let conflict_path = engine
+            .stage_quarantine_conflict(
+                "cnf_test1",
+                "test_vault",
+                "doc.md",
+                None,
+                "rev_local",
+                "rev_remote",
+                b"Conflicting remote content",
+            )
+            .unwrap();
         assert!(conflict_path.exists());
 
         let pending = engine.list_pending_conflicts().unwrap();
@@ -1651,7 +2047,8 @@ mod tests {
 
     #[test]
     fn test_pending_device_pairing_workflow() {
-        let temp_dir = std::env::temp_dir().join(format!("synapse_pairing_test_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("synapse_pairing_test_{}", uuid::Uuid::new_v4()));
         let engine = StorageEngine::new(&temp_dir).unwrap();
 
         // 1. Add pending device requests
@@ -1685,10 +2082,16 @@ mod tests {
         assert_eq!(pending_after_accept.len(), 1);
         assert_eq!(pending_after_accept[0].device_id, "DEV-LAPTOP-002");
 
-        let paired = engine.get_device("DEV-PHONE-001").unwrap().expect("device should be in devices table");
+        let paired = engine
+            .get_device("DEV-PHONE-001")
+            .unwrap()
+            .expect("device should be in devices table");
         assert_eq!(paired.name, "Alice's Android Phone");
         assert_eq!(paired.addresses, vec!["tcp://192.168.1.150:9190"]);
-        assert!(paired.is_trusted, "Accepted pending device must be marked trusted");
+        assert!(
+            paired.is_trusted,
+            "Accepted pending device must be marked trusted"
+        );
         assert!(!paired.is_paused);
         assert!(!paired.introducer);
 
@@ -1703,7 +2106,8 @@ mod tests {
 
     #[test]
     fn test_introducer_propagation_unauthorized_rejection() {
-        let temp_dir = std::env::temp_dir().join(format!("synapse_intro_unauth_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("synapse_intro_unauth_{}", uuid::Uuid::new_v4()));
         let engine = StorageEngine::new(&temp_dir).unwrap();
 
         // Add regular non-introducer peer
@@ -1721,19 +2125,25 @@ mod tests {
         assert!(!engine.is_device_introducer("PEER-REGULAR-01").unwrap());
 
         // Rogue peer attempts to propagate cluster devices
-        let announced = vec![
-            IntroducedDevice {
-                device_id: "SPOOFED-DEV-01".into(),
-                name: "Spoofed Device".into(),
-                addresses: vec!["tcp://10.0.0.99:9190".into()],
-                is_trusted: true,
-                cert_name: None,
-            },
-        ];
+        let announced = vec![IntroducedDevice {
+            device_id: "SPOOFED-DEV-01".into(),
+            name: "Spoofed Device".into(),
+            addresses: vec!["tcp://10.0.0.99:9190".into()],
+            is_trusted: true,
+            cert_name: None,
+        }];
 
-        let result = engine.propagate_introducer_devices("PEER-REGULAR-01", &announced, true).unwrap();
-        assert!(result.added_trusted.is_empty(), "Unauthorized propagation must not add trusted devices");
-        assert!(result.added_pending.is_empty(), "Unauthorized propagation must not add pending devices");
+        let result = engine
+            .propagate_introducer_devices("PEER-REGULAR-01", &announced, true)
+            .unwrap();
+        assert!(
+            result.added_trusted.is_empty(),
+            "Unauthorized propagation must not add trusted devices"
+        );
+        assert!(
+            result.added_pending.is_empty(),
+            "Unauthorized propagation must not add pending devices"
+        );
 
         assert!(engine.get_device("SPOOFED-DEV-01").unwrap().is_none());
         assert!(engine.list_pending_devices().unwrap().is_empty());
@@ -1743,7 +2153,8 @@ mod tests {
 
     #[test]
     fn test_introducer_propagation_auto_trust() {
-        let temp_dir = std::env::temp_dir().join(format!("synapse_intro_autotrust_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("synapse_intro_autotrust_{}", uuid::Uuid::new_v4()));
         let engine = StorageEngine::new(&temp_dir).unwrap();
 
         // Add designated introducer peer
@@ -1792,19 +2203,27 @@ mod tests {
             },
         ];
 
-        let result = engine.propagate_introducer_devices("MASTER-INTRODUCER-01", &announced, true).unwrap();
+        let result = engine
+            .propagate_introducer_devices("MASTER-INTRODUCER-01", &announced, true)
+            .unwrap();
         assert_eq!(result.added_trusted.len(), 2);
         assert!(result.added_trusted.contains(&"CLUSTER-NODE-A".to_string()));
         assert!(result.added_trusted.contains(&"CLUSTER-NODE-B".to_string()));
         assert_eq!(result.ignored, vec!["MASTER-INTRODUCER-01".to_string()]);
 
         // Verify nodes were inserted into devices table
-        let node_a = engine.get_device("CLUSTER-NODE-A").unwrap().expect("Node A should exist");
+        let node_a = engine
+            .get_device("CLUSTER-NODE-A")
+            .unwrap()
+            .expect("Node A should exist");
         assert_eq!(node_a.name, "Node Alpha");
         assert!(node_a.is_trusted);
         assert_eq!(node_a.addresses, vec!["tcp://node-a.lan:9190"]);
 
-        let node_b = engine.get_device("CLUSTER-NODE-B").unwrap().expect("Node B should exist");
+        let node_b = engine
+            .get_device("CLUSTER-NODE-B")
+            .unwrap()
+            .expect("Node B should exist");
         assert_eq!(node_b.name, "Node Beta");
         assert!(node_b.is_trusted);
 
@@ -1813,7 +2232,8 @@ mod tests {
 
     #[test]
     fn test_introducer_propagation_manual_pairing() {
-        let temp_dir = std::env::temp_dir().join(format!("synapse_intro_manual_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("synapse_intro_manual_{}", uuid::Uuid::new_v4()));
         let engine = StorageEngine::new(&temp_dir).unwrap();
 
         let introducer = DeviceRecord {
@@ -1828,18 +2248,18 @@ mod tests {
         };
         engine.add_device(&introducer).unwrap();
 
-        let announced = vec![
-            IntroducedDevice {
-                device_id: "CLUSTER-NODE-C".into(),
-                name: "Node Gamma".into(),
-                addresses: vec!["tcp://node-c.lan:9190".into()],
-                is_trusted: true,
-                cert_name: None,
-            },
-        ];
+        let announced = vec![IntroducedDevice {
+            device_id: "CLUSTER-NODE-C".into(),
+            name: "Node Gamma".into(),
+            addresses: vec!["tcp://node-c.lan:9190".into()],
+            is_trusted: true,
+            cert_name: None,
+        }];
 
         // auto_trust = false -> routes to pending_devices
-        let result = engine.propagate_introducer_devices("MASTER-INTRO-02", &announced, false).unwrap();
+        let result = engine
+            .propagate_introducer_devices("MASTER-INTRO-02", &announced, false)
+            .unwrap();
         assert_eq!(result.added_pending, vec!["CLUSTER-NODE-C".to_string()]);
         assert!(result.added_trusted.is_empty());
 
@@ -1858,7 +2278,8 @@ mod tests {
 
     #[test]
     fn test_introducer_propagation_address_merging() {
-        let temp_dir = std::env::temp_dir().join(format!("synapse_intro_merge_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("synapse_intro_merge_{}", uuid::Uuid::new_v4()));
         let engine = StorageEngine::new(&temp_dir).unwrap();
 
         let introducer = DeviceRecord {
@@ -1887,33 +2308,38 @@ mod tests {
         engine.add_device(&existing).unwrap();
 
         // Introducer announces existing device with an additional new address
-        let announced = vec![
-            IntroducedDevice {
-                device_id: "NODE-EXISTING-01".into(),
-                name: "Existing Node Updated".into(),
-                addresses: vec![
-                    "tcp://192.168.1.10:9190".into(), // existing
-                    "tcp://10.200.0.1:9190".into(),    // new VPN address
-                ],
-                is_trusted: true,
-                cert_name: None,
-            },
-        ];
+        let announced = vec![IntroducedDevice {
+            device_id: "NODE-EXISTING-01".into(),
+            name: "Existing Node Updated".into(),
+            addresses: vec![
+                "tcp://192.168.1.10:9190".into(), // existing
+                "tcp://10.200.0.1:9190".into(),   // new VPN address
+            ],
+            is_trusted: true,
+            cert_name: None,
+        }];
 
-        let result = engine.propagate_introducer_devices("MASTER-INTRO-03", &announced, true).unwrap();
+        let result = engine
+            .propagate_introducer_devices("MASTER-INTRO-03", &announced, true)
+            .unwrap();
         assert_eq!(result.updated, vec!["NODE-EXISTING-01".to_string()]);
 
         let updated = engine.get_device("NODE-EXISTING-01").unwrap().unwrap();
         assert_eq!(updated.addresses.len(), 2);
-        assert!(updated.addresses.contains(&"tcp://192.168.1.10:9190".to_string()));
-        assert!(updated.addresses.contains(&"tcp://10.200.0.1:9190".to_string()));
+        assert!(updated
+            .addresses
+            .contains(&"tcp://192.168.1.10:9190".to_string()));
+        assert!(updated
+            .addresses
+            .contains(&"tcp://10.200.0.1:9190".to_string()));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_untrusted_node_support() {
-        let temp_dir = std::env::temp_dir().join(format!("synapse_untrusted_node_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("synapse_untrusted_node_{}", uuid::Uuid::new_v4()));
         let engine = StorageEngine::new(&temp_dir).unwrap();
 
         // Add untrusted cloud VPS storage node
@@ -1930,19 +2356,29 @@ mod tests {
         engine.add_device(&untrusted_vps).unwrap();
 
         // Check trust queries
-        assert!(!engine.is_device_trusted("VPS-UNTRUSTED-STORAGE-01").unwrap());
+        assert!(!engine
+            .is_device_trusted("VPS-UNTRUSTED-STORAGE-01")
+            .unwrap());
         let untrusted_list = engine.list_untrusted_devices().unwrap();
         assert_eq!(untrusted_list.len(), 1);
         assert_eq!(untrusted_list[0].device_id, "VPS-UNTRUSTED-STORAGE-01");
 
         // Toggle trust status to trusted
-        engine.set_device_trusted("VPS-UNTRUSTED-STORAGE-01", true).unwrap();
-        assert!(engine.is_device_trusted("VPS-UNTRUSTED-STORAGE-01").unwrap());
+        engine
+            .set_device_trusted("VPS-UNTRUSTED-STORAGE-01", true)
+            .unwrap();
+        assert!(engine
+            .is_device_trusted("VPS-UNTRUSTED-STORAGE-01")
+            .unwrap());
         assert_eq!(engine.list_untrusted_devices().unwrap().len(), 0);
 
         // Toggle back to untrusted
-        engine.set_device_trusted("VPS-UNTRUSTED-STORAGE-01", false).unwrap();
-        assert!(!engine.is_device_trusted("VPS-UNTRUSTED-STORAGE-01").unwrap());
+        engine
+            .set_device_trusted("VPS-UNTRUSTED-STORAGE-01", false)
+            .unwrap();
+        assert!(!engine
+            .is_device_trusted("VPS-UNTRUSTED-STORAGE-01")
+            .unwrap());
         assert_eq!(engine.list_untrusted_devices().unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1950,7 +2386,8 @@ mod tests {
 
     #[test]
     fn test_device_pause_and_removal_cleanup() {
-        let temp_dir = std::env::temp_dir().join(format!("synapse_dev_mgmt_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("synapse_dev_mgmt_{}", uuid::Uuid::new_v4()));
         let engine = StorageEngine::new(&temp_dir).unwrap();
 
         let folder = FolderRecord::new("shared_folder_01", "/tmp/shared");
@@ -1967,8 +2404,13 @@ mod tests {
             created_at: 600,
         };
         engine.add_device(&dev).unwrap();
-        engine.share_folder_with_device("shared_folder_01", "DEV-MGMT-01").unwrap();
-        assert_eq!(engine.list_folder_devices("shared_folder_01").unwrap(), vec!["DEV-MGMT-01".to_string()]);
+        engine
+            .share_folder_with_device("shared_folder_01", "DEV-MGMT-01")
+            .unwrap();
+        assert_eq!(
+            engine.list_folder_devices("shared_folder_01").unwrap(),
+            vec!["DEV-MGMT-01".to_string()]
+        );
 
         // Pause device
         engine.set_device_paused("DEV-MGMT-01", true).unwrap();
@@ -1983,14 +2425,104 @@ mod tests {
         // Remove device -> cleans up devices table and folder_devices associations
         engine.remove_device("DEV-MGMT-01").unwrap();
         assert!(engine.get_device("DEV-MGMT-01").unwrap().is_none());
-        assert!(engine.list_folder_devices("shared_folder_01").unwrap().is_empty());
+        assert!(engine
+            .list_folder_devices("shared_folder_01")
+            .unwrap()
+            .is_empty());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
+    fn conflict_status_is_normalised_and_enforced_by_the_database() {
+        let dir = std::env::temp_dir().join(format!("synapse_cstatus_{}", uuid::Uuid::new_v4()));
+        let engine = StorageEngine::new(&dir).unwrap();
+        {
+            let conn = engine.conn.lock().unwrap();
+            // Simulate a row written by an older version (lowercase) via a raw insert
+            // that bypasses the trigger by temporarily dropping it.
+            conn.execute_batch("DROP TRIGGER quarantine_conflicts_status_insert;")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO quarantine_conflicts (conflict_id, folder_id, relative_path,
+                    local_revision, remote_revision, staged_payload_path, status, detected_at)
+                 VALUES ('c1', 'f', 'a.txt', 'l', 'r', '/tmp/x', ' pending', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        // Re-opening runs the migration: normalised and trigger restored.
+        drop(engine);
+        let engine = StorageEngine::new(&dir).unwrap();
+        let c = engine.get_conflict("c1").unwrap().unwrap();
+        assert_eq!(c.status, crate::state::ConflictStatus::Pending);
+        assert_eq!(
+            engine.list_pending_conflicts().unwrap().len(),
+            1,
+            "visible in the list"
+        );
+
+        let conn = engine.conn.lock().unwrap();
+        let bad = conn.execute(
+            "UPDATE quarantine_conflicts SET status = 'DONE' WHERE conflict_id = 'c1'",
+            [],
+        );
+        assert!(bad.is_err(), "database rejects unknown statuses");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejected_folder_offer_is_not_restaged() {
+        let dir = std::env::temp_dir().join(format!("synapse_offer_{}", uuid::Uuid::new_v4()));
+        let engine = StorageEngine::new(&dir).unwrap();
+        let offer = PendingFolderRecord {
+            folder_id: "music".into(),
+            device_id: "DEV-B".into(),
+            folder_label: "Music".into(),
+            offered_at: 1,
+        };
+        use crate::state::FolderOfferState as S;
+        assert_eq!(engine.folder_offer_state("music", "DEV-B").unwrap(), None);
+        assert!(engine.add_pending_folder(&offer).unwrap());
+        assert_eq!(
+            engine.folder_offer_state("music", "DEV-B").unwrap(),
+            Some(S::Pending)
+        );
+        engine.reject_pending_folder("music", "DEV-B").unwrap();
+        assert_eq!(
+            engine.folder_offer_state("music", "DEV-B").unwrap(),
+            Some(S::Rejected)
+        );
+        assert!(
+            !engine.add_pending_folder(&offer).unwrap(),
+            "rejection is remembered"
+        );
+        assert!(engine.list_pending_folders().unwrap().is_empty());
+        assert_eq!(
+            engine.list_rejected_folders().unwrap()[0].folder_label,
+            "Music"
+        );
+        assert!(engine.forget_rejected_folder("music", "DEV-B").unwrap());
+        assert!(engine.add_pending_folder(&offer).unwrap());
+        engine
+            .accept_pending_folder("music", "DEV-B", "/tmp/music")
+            .unwrap();
+        assert_eq!(
+            engine.folder_offer_state("music", "DEV-B").unwrap(),
+            Some(S::Accepted)
+        );
+        assert!(
+            !engine.add_pending_folder(&offer).unwrap(),
+            "already shared"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_pending_folder_invitations_workflow() {
-        let temp_dir = std::env::temp_dir().join(format!("synapse_folder_invites_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("synapse_folder_invites_{}", uuid::Uuid::new_v4()));
         let engine = StorageEngine::new(&temp_dir).unwrap();
 
         let inv1 = PendingFolderRecord {
@@ -2012,14 +2544,21 @@ mod tests {
         assert_eq!(pending.len(), 2);
 
         // Accept folder_photos
-        engine.accept_pending_folder("folder_photos", "REMOTE-DEV-01", "/home/user/Photos").unwrap();
-        let folder = engine.get_folder("folder_photos").unwrap().expect("Folder should be registered");
+        engine
+            .accept_pending_folder("folder_photos", "REMOTE-DEV-01", "/home/user/Photos")
+            .unwrap();
+        let folder = engine
+            .get_folder("folder_photos")
+            .unwrap()
+            .expect("Folder should be registered");
         assert_eq!(folder.local_path, "/home/user/Photos");
         let shared = engine.list_folder_devices("folder_photos").unwrap();
         assert_eq!(shared, vec!["REMOTE-DEV-01".to_string()]);
 
         // Reject folder_finance
-        engine.reject_pending_folder("folder_finance", "REMOTE-DEV-02").unwrap();
+        engine
+            .reject_pending_folder("folder_finance", "REMOTE-DEV-02")
+            .unwrap();
         assert!(engine.get_folder("folder_finance").unwrap().is_none());
         assert_eq!(engine.list_pending_folders().unwrap().len(), 0);
 

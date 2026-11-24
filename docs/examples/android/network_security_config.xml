@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Save as src/main/res/xml/network_security_config.xml.
+  Allows plain HTTP only to the on-device Synapse API; everything else stays HTTPS-only.
+  Without this, OkHttp/HttpURLConnection fail with
+  "CLEARTEXT communication to 127.0.0.1 not permitted by network security policy".
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

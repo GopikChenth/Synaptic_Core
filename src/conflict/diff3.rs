@@ -64,7 +64,10 @@ pub fn merge3(base_str: &str, local_str: &str, remote_str: &str) -> MergeResult 
     for op in diff_local.ops() {
         let (tag, old_range, new_range) = (op.tag(), op.old_range(), op.new_range());
         if tag != DiffTag::Equal {
-            let replaced: Vec<String> = local_lines[new_range].iter().map(|s| s.to_string()).collect();
+            let replaced: Vec<String> = local_lines[new_range]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
             local_edits.push((old_range.start, old_range.end, replaced));
         }
     }
@@ -74,7 +77,10 @@ pub fn merge3(base_str: &str, local_str: &str, remote_str: &str) -> MergeResult 
     for op in diff_remote.ops() {
         let (tag, old_range, new_range) = (op.tag(), op.old_range(), op.new_range());
         if tag != DiffTag::Equal {
-            let replaced: Vec<String> = remote_lines[new_range].iter().map(|s| s.to_string()).collect();
+            let replaced: Vec<String> = remote_lines[new_range]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
             remote_edits.push((old_range.start, old_range.end, replaced));
         }
     }
@@ -92,7 +98,10 @@ pub fn merge3(base_str: &str, local_str: &str, remote_str: &str) -> MergeResult 
                 hunk_type: HunkType::Conflict,
                 base_lines: base_lines.iter().map(|line| (*line).to_string()).collect(),
                 local_lines: local_lines.iter().map(|line| (*line).to_string()).collect(),
-                remote_lines: remote_lines.iter().map(|line| (*line).to_string()).collect(),
+                remote_lines: remote_lines
+                    .iter()
+                    .map(|line| (*line).to_string())
+                    .collect(),
             }],
         };
     }
@@ -131,8 +140,12 @@ pub fn merge3(base_str: &str, local_str: &str, remote_str: &str) -> MergeResult 
         };
 
         // Find if local modified this exact slice or overlapping range
-        let local_mod = local_edits.iter().find(|(s, e, _)| *s <= b_start && *e >= b_end);
-        let remote_mod = remote_edits.iter().find(|(s, e, _)| *s <= b_start && *e >= b_end);
+        let local_mod = local_edits
+            .iter()
+            .find(|(s, e, _)| *s <= b_start && *e >= b_end);
+        let remote_mod = remote_edits
+            .iter()
+            .find(|(s, e, _)| *s <= b_start && *e >= b_end);
 
         match (local_mod, remote_mod) {
             (None, None) => {
@@ -195,7 +208,8 @@ pub fn merge3(base_str: &str, local_str: &str, remote_str: &str) -> MergeResult 
             hunks,
         }
     } else {
-        let use_crlf = local_str.contains("\r\n") || remote_str.contains("\r\n") || base_str.contains("\r\n");
+        let use_crlf =
+            local_str.contains("\r\n") || remote_str.contains("\r\n") || base_str.contains("\r\n");
         let line_ending = if use_crlf { "\r\n" } else { "\n" };
         let mut final_text = merged_output.join(line_ending);
         if (local_str.ends_with('\n') || remote_str.ends_with('\n')) && !final_text.is_empty() {
@@ -223,7 +237,9 @@ mod tests {
                 assert!(merged.contains("Line 5 modified by remote"));
                 assert!(merged.contains("Line 3"));
             }
-            MergeResult::Conflict { .. } => panic!("Expected clean merge for non-overlapping edits"),
+            MergeResult::Conflict { .. } => {
+                panic!("Expected clean merge for non-overlapping edits")
+            }
         }
     }
 
@@ -234,7 +250,10 @@ mod tests {
         let remote = "Header\nShared Content edited by Bob\nFooter\n";
 
         match merge3(base, local, remote) {
-            MergeResult::Conflict { overlapping_lines_count, hunks } => {
+            MergeResult::Conflict {
+                overlapping_lines_count,
+                hunks,
+            } => {
                 assert!(overlapping_lines_count > 0);
                 let conflict_hunk = hunks.iter().find(|h| h.hunk_type == HunkType::Conflict);
                 assert!(conflict_hunk.is_some());
@@ -249,7 +268,10 @@ mod tests {
         let local = "zero\none\ntwo\n";
         let remote = "one\ntwo\nthree\n";
 
-        assert!(matches!(merge3(base, local, remote), MergeResult::Conflict { .. }));
+        assert!(matches!(
+            merge3(base, local, remote),
+            MergeResult::Conflict { .. }
+        ));
     }
 
     #[test]
@@ -260,7 +282,10 @@ mod tests {
 
         match merge3(base, local, remote) {
             MergeResult::Clean(merged) => {
-                assert!(merged.contains("\r\n"), "CRLF line endings should be preserved");
+                assert!(
+                    merged.contains("\r\n"),
+                    "CRLF line endings should be preserved"
+                );
                 assert!(merged.contains("Line 1 modified by local\r\n"));
                 assert!(merged.contains("Line 5 modified by remote\r\n"));
             }
@@ -276,7 +301,9 @@ mod tests {
 
         match merge3(base, local, remote) {
             MergeResult::Clean(merged) => assert_eq!(merged, "new content\n"),
-            MergeResult::Conflict { .. } => panic!("Expected clean merge for identical additions on empty base"),
+            MergeResult::Conflict { .. } => {
+                panic!("Expected clean merge for identical additions on empty base")
+            }
         }
     }
 
@@ -286,7 +313,10 @@ mod tests {
         let local = "alice content\n";
         let remote = "bob content\n";
 
-        assert!(matches!(merge3(base, local, remote), MergeResult::Conflict { .. }));
+        assert!(matches!(
+            merge3(base, local, remote),
+            MergeResult::Conflict { .. }
+        ));
     }
 
     #[test]
@@ -299,7 +329,9 @@ mod tests {
             MergeResult::Clean(merged) => {
                 assert!(merged.contains("item modified"));
             }
-            MergeResult::Conflict { .. } => panic!("Expected clean merge for repeated lines non-overlapping"),
+            MergeResult::Conflict { .. } => {
+                panic!("Expected clean merge for repeated lines non-overlapping")
+            }
         }
     }
 

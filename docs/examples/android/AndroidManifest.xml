@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Merge into your app's src/main/AndroidManifest.xml -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Without INTERNET every socket() call fails with EACCES and the daemon exits. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- LAN peer discovery (broadcast/multicast) -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- Foreground service (Android 9+ / 14+) and its notification (13+) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+      extractNativeLibs="true": required for exec mode on older AGP versions; with
+      AGP 4.2+ prefer `packaging { jniLibs { useLegacyPackaging = true } }` in Gradle.
+      networkSecurityConfig: Android 9+ blocks cleartext HTTP, including to 127.0.0.1.
+    -->
+    <application
+        android:extractNativeLibs="true"
+        android:networkSecurityConfig="@xml/network_security_config">
+
+        <service
+            android:name="dev.synapse.core.SynapseSyncService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+    </application>
+</manifest>

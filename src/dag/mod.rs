@@ -3,8 +3,8 @@
 //! Maintains revision ancestry graphs and calculates Lowest Common Ancestors (LCA)
 //! to differentiate fast-forwards from divergent edits.
 
-use std::collections::{HashSet, VecDeque};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashSet, VecDeque};
 
 use crate::storage::StorageEngine;
 
@@ -86,9 +86,7 @@ pub enum LcaResult {
     /// Remote is a descendant of local: remote cleanly supersedes local.
     FastForwardRemote,
     /// Both branches diverged: 3-way merge or quarantine required.
-    Diverged {
-        base_revision: Option<String>,
-    },
+    Diverged { base_revision: Option<String> },
 }
 
 /// DAG Traversal and Lowest Common Ancestor (LCA) Resolver.

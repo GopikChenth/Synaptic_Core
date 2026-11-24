@@ -54,9 +54,15 @@ Returns engine health, device identity, peer count, monitored folders, and resid
   "version": "1.0.0",
   "monitored_folders_count": 3,
   "pending_conflicts_count": 0,
-  "memory_footprint_bytes": 18432000
+  "memory_footprint_bytes": 18432000,
+  "folder_states": { "idle": 2, "error": 1 },
+  "lifecycle": "ready"
 }
 ```
+`sync_state` is one of `IDLE`, `SCANNING`, `SYNCING`, `PAUSED` (unchanged). `folder_states`
+counts folders per runtime state, including `error` and `paused`, which `sync_state`
+doesn't distinguish. `lifecycle` is the engine lifecycle state: `starting`, `ready`,
+`stopping` or `restarting`. See [state-machines.md](state-machines.md).
 
 ### 1.2 System Version
 Returns engine version, codename, architecture, and operating system.
@@ -87,16 +93,25 @@ Simple health probe for monitoring daemons and process wrappers.
 Gracefully stops the continuous synchronization daemon, closes SQLite WAL files, and terminates QUIC endpoints.
 
 - **Endpoint:** `POST /api/v1/system/shutdown` or `POST /rest/system/shutdown`
-- **Response:** `200 OK`
+- **Response:** `200 OK` `{"lifecycle": "stopping"}`. Repeating the call is harmless.
 
 ### 1.5 System Restart
-Flushes memory caches and restarts the synchronization daemon process.
+Stops the engine and starts it again **in the same process**: same PID, same API
+address (also when started with `--port 0`). Storage, folders, watchers and P2P are
+reloaded. The WebSocket connection drops; poll `GET /api/v1/system/status` until
+`lifecycle` is `ready` again (typically well under a second).
 
 - **Endpoint:** `POST /api/v1/system/restart` or `POST /rest/system/restart`
-- **Response:** `200 OK`
+- **Response:** `200 OK` `{"lifecycle": "restarting"}`
+- **`409 Conflict`:** the engine isn't `ready` (e.g. already stopping). The body is a
+  state-transition error, see [Errors](#state-transition-errors).
+- **`503 Service Unavailable`:** the API router is embedded without an engine loop that
+  could restart it.
 
 ### 1.6 Peer Connection Statistics
 Returns real-time network throughput, transfer metrics, and latency per paired peer.
+`is_connected` is `true` only for a paired, unpaused device that was heard from within
+the presence TTL (30 s). See the `peer_presence` state machine.
 
 - **Endpoint:** `GET /api/v1/connections` or `GET /rest/system/connections`
 - **Response:** `200 OK`
@@ -158,9 +173,22 @@ Registers a directory for continuous synchronization, validates mount markers, a
 }
 ```
 - **Sync Modes:** `SendReceive`, `SendOnly`, `ReceiveOnly`
-- **Pull Orders:** `Alphabetical`, `SmallestFirst`, `LargestFirst`, `NewestFirst`, `OldestFirst`
+- **Conflict Policies:** `THREE_WAY_AUTO`, `LWW`, `MANUAL`
+- **Pull Orders:** `Alphabetical`, `SmallestFirst`, `LargestFirst`, `NewestFirst`, `OldestFirst` (`random` accepted for Syncthing compatibility; pulls alphabetically)
 - **Versioning Types:** `None`, `TrashCan`, `Simple`, `Staggered`
+- Matching is case-insensitive and `_` is optional (`SEND_RECEIVE` = `SendReceive`).
+  Values are stored exactly as sent.
 - **Response:** `201 Created`
+- **`400 Bad Request`** for an unknown value. Nothing is stored:
+```json
+{
+  "error": "invalid_field",
+  "field": "sync_mode",
+  "value": "mirror",
+  "allowed": ["SendReceive", "SendOnly", "ReceiveOnly"],
+  "message": "Unsupported sync_mode 'mirror'. Accepted values: SendReceive, SendOnly, ReceiveOnly"
+}
+```
 
 ### 2.3 Remove Monitored Folder
 - **Endpoint:** `DELETE /api/v1/folders/:id`
@@ -196,6 +224,9 @@ Initiates an immediate disk index rescan and Merkle DAG reconciliation.
   "sequence": 254
 }
 ```
+`state` is `idle`, `scanning`, `syncing`, `paused` or `error`. When it is `error`, the
+response also includes `"error": "<reason>"` (e.g. a missing mount-safety marker). A
+successful rescan clears it.
 
 ### 2.7 Device Folder Completion
 Returns completion percentage and byte progress for a remote device.
@@ -251,10 +282,16 @@ Retrieve or update ignore rules supporting `(?d)`, `(?i)`, `!`, and globs.
     "is_trusted": true,
     "introducer": false,
     "cert_name": null,
-    "created_at": 1730560000
+    "created_at": 1730560000,
+    "state": "paired",
+    "online": true,
+    "last_seen_secs": 4
   }
 ]
 ```
+`state` is `paired` or `paused`. `online` follows the `peer_presence` state machine.
+`last_seen_secs` is omitted if the device was never heard from. `GET /api/v1/devices/:id`
+returns the same shape.
 
 ### 3.2 Add / Pair a Device Manually
 - **Endpoint:** `POST /api/v1/devices` or `POST /rest/system/devices`
@@ -267,17 +304,52 @@ Retrieve or update ignore rules supporting `(?d)`, `(?i)`, `!`, and globs.
 }
 ```
 - **Response:** `201 Created`
+- Adding a device explicitly also clears an earlier rejection or pending request for it.
 
 ### 3.3 Remove / Pause / Resume Device
 - **Remove:** `DELETE /api/v1/devices/:id`
-- **Pause:** `POST /api/v1/devices/:id/pause`
-- **Resume:** `POST /api/v1/devices/:id/resume`
+- **Pause:** `POST /api/v1/devices/:id/pause` (paired → paused)
+- **Resume:** `POST /api/v1/devices/:id/resume` (paused → paired)
 
 ### 3.4 Mutual Pairing Handshake (Incoming Device Requests)
 When an unknown peer requests pairing:
 - **List Pending Devices:** `GET /api/v1/cluster/pending/devices` or `GET /rest/cluster/pending/devices`
 - **Accept Pairing:** `POST /api/v1/cluster/pending/devices/:id/accept` or `POST /rest/cluster/pending/devices/:id/accept`
 - **Reject Pairing:** `POST /api/v1/cluster/pending/devices/:id/reject` or `POST /rest/cluster/pending/devices/:id/reject`
+- **List Rejected:** `GET /api/v1/cluster/rejected/devices`
+- **Forget a Rejection:** `DELETE /api/v1/cluster/rejected/devices/:id`. Returns `204`, or
+  `404` if the device isn't rejected. The device may request pairing again afterwards.
+
+A rejection is remembered: the device is **not** shown as pending again when it keeps
+broadcasting discovery packets, and introducers can't re-introduce it.
+
+All pairing actions follow the `device_pairing_lifecycle` state machine:
+
+| Action | From | To | Repeat call |
+|---|---|---|---|
+| accept | `pending` | `paired` | `200`, no-op |
+| reject | `pending` | `rejected` | `200`, no-op |
+| pause | `paired` | `paused` | `200`, no-op |
+| resume | `paused` | `paired` | `200`, no-op |
+
+An unknown device returns `404`. Any other combination returns `409 Conflict` with a
+[state-transition error](#state-transition-errors).
+
+### State transition errors
+Invalid lifecycle actions (devices, folder offers, engine restart) return `409 Conflict` with a body
+that says what *is* possible, so a UI can disable the right buttons and an agent can
+recover without guessing:
+```json
+{
+  "entity": "device",
+  "entity_id": "K3F7P2X-…",
+  "current_state": "pending",
+  "attempted_transition": "paused",
+  "allowed_transitions": ["paired", "rejected"],
+  "available_actions": ["ACCEPT", "REJECT"],
+  "is_terminal": false
+}
+```
 
 ### 3.5 Incoming Remote Folder Invitations
 When a paired peer offers to share a folder:
@@ -286,6 +358,24 @@ When a paired peer offers to share a folder:
   - Body: `{ "device_id": "DEV_ID", "local_path": "/home/user/SharedFolder" }`
 - **Reject Invitation:** `POST /api/v1/cluster/pending/folders/:id/reject`
   - Body: `{ "device_id": "DEV_ID" }`
+- **List Rejected:** `GET /api/v1/cluster/rejected/folders`
+- **Forget a Rejection:** `DELETE /api/v1/cluster/rejected/folders/:id?device_id=DEV_ID`.
+  Returns `204`, or `404` if there is no such rejection.
+
+Offers follow the `folder_offer_lifecycle` state machine, keyed by `(folder_id, device_id)`:
+
+| Action | From | To | Repeat call |
+|---|---|---|---|
+| accept | `pending` | `accepted` | `200`, no-op |
+| reject | `pending` | `rejected` | `200`, no-op |
+
+- Accepting creates the local directory and its mount-safety marker, registers the folder,
+  shares it with the offering device and starts the initial scan. An empty `local_path`
+  returns `400`.
+- A rejected offer is remembered and not staged again. An offer for a folder that is
+  already shared with that device is ignored.
+- No such offer: `404`. Any other combination: `409` with a
+  [state-transition error](#state-transition-errors).
 
 ---
 
@@ -449,12 +539,23 @@ Emitted when a file is synchronized and atomically placed on disk:
 }
 ```
 
-#### 5. Additional Lifecycle Events
+#### 5. `FOLDER_STATE_CHANGED`
+Emitted on every folder runtime-state transition. A UI can drive its folder badge
+from this event alone. `error` is set when `to` is `"error"`.
+```json
+{
+  "event": "FOLDER_STATE_CHANGED",
+  "data": { "folder_id": "notes_vault", "from": "scanning", "to": "error",
+            "error": "Safety marker '.synapse-folder' missing! Folder unmounted or corrupted; aborting sync" }
+}
+```
+
+#### 6. Additional Lifecycle Events
 - `DEVICE_PAIRED`: `{ "device_id": "...", "name": "..." }`
-- `PEER_CONNECTED`: `{ "peer_id": "...", "addr": "192.168.1.42:9190" }`
-- `PEER_DISCONNECTED`: `{ "peer_id": "..." }`
-- `SYNC_STARTED`: `{ "folder_id": "notes_vault" }`
-- `SYNC_COMPLETED`: `{ "folder_id": "notes_vault", "files_synced": 5 }`
+- `PEER_CONNECTED`: `{ "peer_id": "...", "addr": "192.168.1.42:9190" }`: a paired peer came online (first contact, or back after going offline)
+- `PEER_DISCONNECTED`: `{ "peer_id": "..." }`: a paired peer went silent for longer than the presence TTL
+- `SYNC_STARTED`: `{ "folder_id": "notes_vault" }`: folder entered `syncing`
+- `SYNC_COMPLETED`: `{ "folder_id": "notes_vault", "files_synced": 5 }`: folder left `syncing`. `files_synced` counts remote revisions applied in that episode
 - `CONFLICT_RESOLVED`: `{ "conflict_id": "...", "action": "CUSTOM_MERGE" }`
 
 Send `"ping"` over the WebSocket connection to receive an instant `"pong"` heartbeat.

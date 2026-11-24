@@ -47,7 +47,7 @@ DAEMON_PID=$!
 
 # Wait for daemon to be ready
 echo -n "Waiting for daemon to bind to http://127.0.0.1:${PORT}..."
-for i in {1..20}; do
+for _ in {1..20}; do
     if curl -s "http://127.0.0.1:${PORT}/api/v1/system/status" > /dev/null 2>&1; then
         echo " Ready!"
         break

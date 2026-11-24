@@ -31,8 +31,8 @@ use synapse_core::conflict::{diff3, ConflictEngine, CoreEvent, ResolveAction, Re
 use synapse_core::dag::RevisionNode;
 use synapse_core::engine::SyncEngine;
 use synapse_core::storage::{
-    DeviceCompletionMetrics, DeviceRecord, FolderRecord, FolderStatusMetrics,
-    PendingDeviceRecord, PendingFolderRecord, StorageEngine,
+    DeviceCompletionMetrics, DeviceRecord, FolderRecord, FolderStatusMetrics, PendingDeviceRecord,
+    PendingFolderRecord, StorageEngine,
 };
 
 struct TestHarness {
@@ -59,12 +59,7 @@ impl TestHarness {
             device_id.clone(),
         ));
 
-        let sync_engine = SyncEngine::new(
-            storage.clone(),
-            conflict_engine.clone(),
-            tx,
-            device_id,
-        );
+        let sync_engine = SyncEngine::new(storage.clone(), conflict_engine.clone(), tx, device_id);
 
         let app_state = AppState {
             start_time: std::time::Instant::now(),
@@ -99,12 +94,16 @@ impl TestHarness {
 
         // 1. Base file
         fs::write(&file_path, base_text).unwrap();
-        self.sync_engine.index_single_file(folder_id, file_rel).unwrap();
+        self.sync_engine
+            .index_single_file(folder_id, file_rel)
+            .unwrap();
         let base_file = self.storage.get_file(folder_id, file_rel).unwrap().unwrap();
 
         // 2. Local edit
         fs::write(&file_path, local_text).unwrap();
-        self.sync_engine.index_single_file(folder_id, file_rel).unwrap();
+        self.sync_engine
+            .index_single_file(folder_id, file_rel)
+            .unwrap();
 
         // 3. Remote edit
         let chunker = Chunker::default();
@@ -112,7 +111,10 @@ impl TestHarness {
         for (info, data) in &remote_chunks {
             self.storage.put_chunk(&info.chunk_hash, data).unwrap();
         }
-        let remote_chunk_hashes: Vec<String> = remote_chunks.into_iter().map(|(c, _)| c.chunk_hash).collect();
+        let remote_chunk_hashes: Vec<String> = remote_chunks
+            .into_iter()
+            .map(|(c, _)| c.chunk_hash)
+            .collect();
 
         let remote_rev = RevisionNode::new(
             vec![base_file.current_revision.clone()],
@@ -124,16 +126,21 @@ impl TestHarness {
         );
 
         // 4. Reconcile remote revision (triggers Tier 2 quarantine due to overlapping edits)
-        self.sync_engine.reconcile_remote_revision(
-            folder_id,
-            file_rel,
-            &remote_rev,
-            &remote_chunk_hashes,
-            remote_text.as_bytes(),
-        ).unwrap();
+        self.sync_engine
+            .reconcile_remote_revision(
+                folder_id,
+                file_rel,
+                &remote_rev,
+                &remote_chunk_hashes,
+                remote_text.as_bytes(),
+            )
+            .unwrap();
 
         let conflicts = self.storage.list_pending_conflicts().unwrap();
-        let c = conflicts.iter().find(|c| c.relative_path == file_rel).expect("Quarantined conflict must exist");
+        let c = conflicts
+            .iter()
+            .find(|c| c.relative_path == file_rel)
+            .expect("Quarantined conflict must exist");
         c.conflict_id.clone()
     }
 }
@@ -155,10 +162,10 @@ async fn test_tier1_automated_3way_merge() {
     fs::create_dir_all(&folder_path).unwrap();
 
     let folder_id = "notes_vault";
-    harness.storage.add_folder(&FolderRecord::new(
-        folder_id,
-        folder_path.to_string_lossy(),
-    )).unwrap();
+    harness
+        .storage
+        .add_folder(&FolderRecord::new(folder_id, folder_path.to_string_lossy()))
+        .unwrap();
 
     // 1. Create Base File
     let file_rel = "doc.md";
@@ -166,25 +173,43 @@ async fn test_tier1_automated_3way_merge() {
     let base_content = "# Project Notes\n\nSection A: Introduction\n\nSection B: Conclusion\n";
     fs::write(&file_path, base_content).unwrap();
 
-    harness.sync_engine.index_single_file(folder_id, file_rel).unwrap();
-    let base_file = harness.storage.get_file(folder_id, file_rel).unwrap().unwrap();
+    harness
+        .sync_engine
+        .index_single_file(folder_id, file_rel)
+        .unwrap();
+    let base_file = harness
+        .storage
+        .get_file(folder_id, file_rel)
+        .unwrap()
+        .unwrap();
     let base_rev_hash = base_file.current_revision.clone();
 
     // 2. Local Edits Section A
     let local_content = "# Project Notes\n\nSection A: Introduction with Desktop details\n\nSection B: Conclusion\n";
     fs::write(&file_path, local_content).unwrap();
-    harness.sync_engine.index_single_file(folder_id, file_rel).unwrap();
-    let local_file = harness.storage.get_file(folder_id, file_rel).unwrap().unwrap();
+    harness
+        .sync_engine
+        .index_single_file(folder_id, file_rel)
+        .unwrap();
+    let local_file = harness
+        .storage
+        .get_file(folder_id, file_rel)
+        .unwrap()
+        .unwrap();
     let local_rev_hash = local_file.current_revision.clone();
 
     // 3. Remote Edits Section B (Concurrent edit, diverged from Base)
-    let remote_content = "# Project Notes\n\nSection A: Introduction\n\nSection B: Conclusion updated by Mobile\n";
+    let remote_content =
+        "# Project Notes\n\nSection A: Introduction\n\nSection B: Conclusion updated by Mobile\n";
     let chunker = Chunker::default();
     let (remote_chunks, remote_manifest) = chunker.chunk_slice(remote_content.as_bytes());
     for (info, data) in &remote_chunks {
         harness.storage.put_chunk(&info.chunk_hash, data).unwrap();
     }
-    let remote_chunk_hashes: Vec<String> = remote_chunks.into_iter().map(|(c, _)| c.chunk_hash).collect();
+    let remote_chunk_hashes: Vec<String> = remote_chunks
+        .into_iter()
+        .map(|(c, _)| c.chunk_hash)
+        .collect();
 
     let remote_rev = RevisionNode::new(
         vec![base_rev_hash.clone()],
@@ -196,13 +221,16 @@ async fn test_tier1_automated_3way_merge() {
     );
 
     // 4. Reconcile Remote Revision
-    harness.sync_engine.reconcile_remote_revision(
-        folder_id,
-        file_rel,
-        &remote_rev,
-        &remote_chunk_hashes,
-        remote_content.as_bytes(),
-    ).unwrap();
+    harness
+        .sync_engine
+        .reconcile_remote_revision(
+            folder_id,
+            file_rel,
+            &remote_rev,
+            &remote_chunk_hashes,
+            remote_content.as_bytes(),
+        )
+        .unwrap();
 
     // 5. Verify Clean 3-Way Auto-Merge on disk
     let merged_on_disk = fs::read_to_string(&file_path).unwrap();
@@ -210,8 +238,16 @@ async fn test_tier1_automated_3way_merge() {
     assert!(merged_on_disk.contains("Section B: Conclusion updated by Mobile"));
 
     // Verify 2-parent merge commit
-    let updated_file = harness.storage.get_file(folder_id, file_rel).unwrap().unwrap();
-    let merge_rev = harness.storage.get_revision(&updated_file.current_revision).unwrap().unwrap();
+    let updated_file = harness
+        .storage
+        .get_file(folder_id, file_rel)
+        .unwrap()
+        .unwrap();
+    let merge_rev = harness
+        .storage
+        .get_revision(&updated_file.current_revision)
+        .unwrap()
+        .unwrap();
     assert_eq!(merge_rev.parent_1, Some(local_rev_hash));
     assert_eq!(merge_rev.parent_2, Some(remote_rev.revision_hash));
 
@@ -231,23 +267,33 @@ async fn test_tier2_virtual_quarantine_zero_pollution() {
     fs::create_dir_all(&folder_path).unwrap();
 
     let folder_id = "vault";
-    harness.storage.add_folder(&FolderRecord::new(
-        folder_id,
-        folder_path.to_string_lossy(),
-    )).unwrap();
+    harness
+        .storage
+        .add_folder(&FolderRecord::new(folder_id, folder_path.to_string_lossy()))
+        .unwrap();
 
     // 1. Base File
     let file_rel = "todo.txt";
     let file_path = folder_path.join(file_rel);
     let base_content = "Task 1: Pending\nTask 2: In Progress\n";
     fs::write(&file_path, base_content).unwrap();
-    harness.sync_engine.index_single_file(folder_id, file_rel).unwrap();
-    let base_file = harness.storage.get_file(folder_id, file_rel).unwrap().unwrap();
+    harness
+        .sync_engine
+        .index_single_file(folder_id, file_rel)
+        .unwrap();
+    let base_file = harness
+        .storage
+        .get_file(folder_id, file_rel)
+        .unwrap()
+        .unwrap();
 
     // 2. Local Edits Task 2
     let local_content = "Task 1: Pending\nTask 2: Finished by Alice\n";
     fs::write(&file_path, local_content).unwrap();
-    harness.sync_engine.index_single_file(folder_id, file_rel).unwrap();
+    harness
+        .sync_engine
+        .index_single_file(folder_id, file_rel)
+        .unwrap();
 
     // 3. Remote concurrently edits Task 2 differently (OVERLAPPING EDIT)
     let remote_content = "Task 1: Pending\nTask 2: Blocked by Bob\n";
@@ -256,7 +302,10 @@ async fn test_tier2_virtual_quarantine_zero_pollution() {
     for (info, data) in &remote_chunks {
         harness.storage.put_chunk(&info.chunk_hash, data).unwrap();
     }
-    let remote_chunk_hashes: Vec<String> = remote_chunks.into_iter().map(|(c, _)| c.chunk_hash).collect();
+    let remote_chunk_hashes: Vec<String> = remote_chunks
+        .into_iter()
+        .map(|(c, _)| c.chunk_hash)
+        .collect();
 
     let remote_rev = RevisionNode::new(
         vec![base_file.current_revision.clone()],
@@ -268,20 +317,27 @@ async fn test_tier2_virtual_quarantine_zero_pollution() {
     );
 
     // 4. Reconcile
-    harness.sync_engine.reconcile_remote_revision(
-        folder_id,
-        file_rel,
-        &remote_rev,
-        &remote_chunk_hashes,
-        remote_content.as_bytes(),
-    ).unwrap();
+    harness
+        .sync_engine
+        .reconcile_remote_revision(
+            folder_id,
+            file_rel,
+            &remote_rev,
+            &remote_chunk_hashes,
+            remote_content.as_bytes(),
+        )
+        .unwrap();
 
     // 5. CRITICAL CHECK: ZERO FILESYSTEM POLLUTION!
     let disk_content = fs::read_to_string(&file_path).unwrap();
     assert_eq!(disk_content, local_content);
 
     let folder_entries: Vec<_> = fs::read_dir(&folder_path).unwrap().collect();
-    assert_eq!(folder_entries.len(), 1, "User directory must not contain .sync-conflict-* clutter");
+    assert_eq!(
+        folder_entries.len(),
+        1,
+        "User directory must not contain .sync-conflict-* clutter"
+    );
 
     // 6. Conflicting version safely quarantined in internal staging
     let conflicts = harness.storage.list_pending_conflicts().unwrap();
@@ -309,7 +365,9 @@ async fn test_system_endpoints_all() {
         .unwrap();
     let res_ping_rest = router.clone().oneshot(req_ping_rest).await.unwrap();
     assert_eq!(res_ping_rest.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_ping_rest.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_ping_rest.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["ping"], "pong");
 
@@ -320,7 +378,9 @@ async fn test_system_endpoints_all() {
         .unwrap();
     let res_ping_v1 = router.clone().oneshot(req_ping_v1).await.unwrap();
     assert_eq!(res_ping_v1.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_ping_v1.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_ping_v1.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["ping"], "pong");
 
@@ -332,9 +392,11 @@ async fn test_system_endpoints_all() {
         .unwrap();
     let res_ver_rest = router.clone().oneshot(req_ver_rest).await.unwrap();
     assert_eq!(res_ver_rest.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_ver_rest.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_ver_rest.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let ver_rest: SystemVersionResponse = serde_json::from_slice(&body).unwrap();
-    assert_eq!(ver_rest.version, "v1.0.0");
+    assert_eq!(ver_rest.version, concat!("v", env!("CARGO_PKG_VERSION")));
     assert_eq!(ver_rest.codename, "Synapse-SynapticCore");
     assert!(!ver_rest.os.is_empty());
     assert!(!ver_rest.arch.is_empty());
@@ -346,9 +408,11 @@ async fn test_system_endpoints_all() {
         .unwrap();
     let res_ver_v1 = router.clone().oneshot(req_ver_v1).await.unwrap();
     assert_eq!(res_ver_v1.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_ver_v1.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_ver_v1.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let ver_v1: SystemVersionResponse = serde_json::from_slice(&body).unwrap();
-    assert_eq!(ver_v1.version, "v1.0.0");
+    assert_eq!(ver_v1.version, concat!("v", env!("CARGO_PKG_VERSION")));
     assert_eq!(ver_v1.codename, "Synapse-SynapticCore");
 
     // 3. /rest/system/status and /api/v1/system/status
@@ -359,7 +423,9 @@ async fn test_system_endpoints_all() {
         .unwrap();
     let res_status_rest = router.clone().oneshot(req_status_rest).await.unwrap();
     assert_eq!(res_status_rest.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_status_rest.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_status_rest.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let status_rest: SystemStatusResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(status_rest.device_id, "test_dev_01");
     assert_eq!(status_rest.sync_state, "IDLE");
@@ -375,7 +441,9 @@ async fn test_system_endpoints_all() {
         .unwrap();
     let res_status_v1 = router.clone().oneshot(req_status_v1).await.unwrap();
     assert_eq!(res_status_v1.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_status_v1.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_status_v1.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let status_v1: SystemStatusResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(status_v1.device_id, "test_dev_01");
 
@@ -399,14 +467,35 @@ async fn test_system_endpoints_all() {
         .unwrap();
     let res_conn_rest = router.clone().oneshot(req_conn_rest).await.unwrap();
     assert_eq!(res_conn_rest.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_conn_rest.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_conn_rest.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let conn_map: HashMap<String, synapse_core::storage::PeerConnectionMetrics> =
         serde_json::from_slice(&body).unwrap();
     assert!(conn_map.contains_key("DEV_PEER_01"));
     let peer_metrics = &conn_map["DEV_PEER_01"];
     assert_eq!(peer_metrics.device_id, "DEV_PEER_01");
     assert_eq!(peer_metrics.address, "10.0.0.12:9190");
-    assert!(peer_metrics.is_connected);
+    // Never heard from: a paired-but-silent device is not reported as connected.
+    assert!(!peer_metrics.is_connected);
+
+    // A heartbeat (discovery announcement / protocol message) brings it online.
+    harness
+        .sync_engine
+        .peer_presence()
+        .heard_from("DEV_PEER_01");
+    let req_conn_rest = Request::builder()
+        .uri("/rest/system/connections")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let res_conn_rest = router.clone().oneshot(req_conn_rest).await.unwrap();
+    let body = axum::body::to_bytes(res_conn_rest.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conn_map: HashMap<String, synapse_core::storage::PeerConnectionMetrics> =
+        serde_json::from_slice(&body).unwrap();
+    assert!(conn_map["DEV_PEER_01"].is_connected);
 
     let req_conn_v1 = Request::builder()
         .uri("/api/v1/connections")
@@ -434,21 +523,17 @@ async fn test_system_endpoints_all() {
     assert_eq!(res_sd_v1.status(), StatusCode::OK);
 
     // 6. /rest/system/restart and /api/v1/system/restart
-    let req_rs_rest = Request::builder()
-        .uri("/rest/system/restart")
-        .method("POST")
-        .body(Body::empty())
-        .unwrap();
-    let res_rs_rest = router.clone().oneshot(req_rs_rest).await.unwrap();
-    assert_eq!(res_rs_rest.status(), StatusCode::OK);
-
-    let req_rs_v1 = Request::builder()
-        .uri("/api/v1/system/restart")
-        .method("POST")
-        .body(Body::empty())
-        .unwrap();
-    let res_rs_v1 = router.clone().oneshot(req_rs_v1).await.unwrap();
-    assert_eq!(res_rs_v1.status(), StatusCode::OK);
+    // This bare router has no engine loop around it, so it must say so instead of
+    // pretending (the real daemon restart is covered in tests/daemon_lifecycle.rs).
+    for uri in ["/rest/system/restart", "/api/v1/system/restart"] {
+        let req = Request::builder()
+            .uri(uri)
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let res = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+    }
 }
 
 // =============================================================================
@@ -477,7 +562,9 @@ async fn test_cluster_pairing_and_devices_all() {
         .unwrap();
     let res_p1 = router.clone().oneshot(req_p1).await.unwrap();
     assert_eq!(res_p1.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_p1.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_p1.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let list: Vec<PendingDeviceRecord> = serde_json::from_slice(&body).unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].device_id, pending_dev1.device_id);
@@ -491,7 +578,10 @@ async fn test_cluster_pairing_and_devices_all() {
     assert_eq!(res_p2.status(), StatusCode::OK);
 
     // 2. Accept Pending Device via /api/v1/cluster/pending/devices/:id/accept
-    let accept_uri = format!("/api/v1/cluster/pending/devices/{}/accept", pending_dev1.device_id);
+    let accept_uri = format!(
+        "/api/v1/cluster/pending/devices/{}/accept",
+        pending_dev1.device_id
+    );
     let req_accept = Request::builder()
         .uri(&accept_uri)
         .method("POST")
@@ -508,7 +598,9 @@ async fn test_cluster_pairing_and_devices_all() {
         .unwrap();
     let res_devs = router.clone().oneshot(req_devs).await.unwrap();
     assert_eq!(res_devs.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_devs.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_devs.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let paired: Vec<DeviceRecord> = serde_json::from_slice(&body).unwrap();
     assert_eq!(paired.len(), 1);
     assert_eq!(paired[0].device_id, pending_dev1.device_id);
@@ -527,7 +619,10 @@ async fn test_cluster_pairing_and_devices_all() {
     };
     harness.storage.add_pending_device(&pending_dev2).unwrap();
 
-    let reject_uri = format!("/rest/cluster/pending/devices/{}/reject", pending_dev2.device_id);
+    let reject_uri = format!(
+        "/rest/cluster/pending/devices/{}/reject",
+        pending_dev2.device_id
+    );
     let req_rej = Request::builder()
         .uri(&reject_uri)
         .method("POST")
@@ -588,7 +683,9 @@ async fn test_cluster_pairing_and_devices_all() {
         .unwrap();
     let res_get_dev = router.clone().oneshot(req_get_dev).await.unwrap();
     assert_eq!(res_get_dev.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_get_dev.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_get_dev.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let fetched_dev: DeviceRecord = serde_json::from_slice(&body).unwrap();
     assert_eq!(fetched_dev.name, "Alpha Machine");
 
@@ -609,7 +706,11 @@ async fn test_cluster_pairing_and_devices_all() {
         .unwrap();
     let res_pause = router.clone().oneshot(req_pause).await.unwrap();
     assert_eq!(res_pause.status(), StatusCode::OK);
-    let d = harness.storage.get_device("ALPHA-DEV-001").unwrap().unwrap();
+    let d = harness
+        .storage
+        .get_device("ALPHA-DEV-001")
+        .unwrap()
+        .unwrap();
     assert!(d.is_paused);
 
     let req_resume = Request::builder()
@@ -619,7 +720,11 @@ async fn test_cluster_pairing_and_devices_all() {
         .unwrap();
     let res_resume = router.clone().oneshot(req_resume).await.unwrap();
     assert_eq!(res_resume.status(), StatusCode::OK);
-    let d = harness.storage.get_device("ALPHA-DEV-001").unwrap().unwrap();
+    let d = harness
+        .storage
+        .get_device("ALPHA-DEV-001")
+        .unwrap()
+        .unwrap();
     assert!(!d.is_paused);
 
     // Delete Device
@@ -630,7 +735,11 @@ async fn test_cluster_pairing_and_devices_all() {
         .unwrap();
     let res_del = router.clone().oneshot(req_del).await.unwrap();
     assert_eq!(res_del.status(), StatusCode::NO_CONTENT);
-    assert!(harness.storage.get_device("ALPHA-DEV-001").unwrap().is_none());
+    assert!(harness
+        .storage
+        .get_device("ALPHA-DEV-001")
+        .unwrap()
+        .is_none());
 
     // 5. Pending Folders Invitations
     let p_folder = PendingFolderRecord {
@@ -648,7 +757,9 @@ async fn test_cluster_pairing_and_devices_all() {
         .unwrap();
     let res_pf_rest = router.clone().oneshot(req_pf_rest).await.unwrap();
     assert_eq!(res_pf_rest.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_pf_rest.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_pf_rest.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let p_folders: Vec<PendingFolderRecord> = serde_json::from_slice(&body).unwrap();
     assert_eq!(p_folders.len(), 1);
     assert_eq!(p_folders[0].folder_id, "shared_team_folder");
@@ -667,7 +778,8 @@ async fn test_cluster_pairing_and_devices_all() {
     let accept_folder_payload = serde_json::to_string(&AcceptFolderPayload {
         device_id: "BETA-DEV-002".into(),
         local_path: team_folder_path.to_string_lossy().to_string(),
-    }).unwrap();
+    })
+    .unwrap();
 
     let req_af = Request::builder()
         .uri("/api/v1/cluster/pending/folders/shared_team_folder/accept")
@@ -679,7 +791,10 @@ async fn test_cluster_pairing_and_devices_all() {
     assert_eq!(res_af.status(), StatusCode::OK);
 
     // Verify folder created and shared
-    let team_devs = harness.storage.list_folder_devices("shared_team_folder").unwrap();
+    let team_devs = harness
+        .storage
+        .list_folder_devices("shared_team_folder")
+        .unwrap();
     assert_eq!(team_devs, vec!["BETA-DEV-002".to_string()]);
 
     // Reject pending folder
@@ -693,7 +808,8 @@ async fn test_cluster_pairing_and_devices_all() {
 
     let rej_folder_payload = serde_json::to_string(&RejectFolderPayload {
         device_id: "BETA-DEV-002".into(),
-    }).unwrap();
+    })
+    .unwrap();
     let req_rf = Request::builder()
         .uri("/rest/cluster/pending/folders/junk_folder/reject")
         .method("POST")
@@ -766,7 +882,9 @@ async fn test_folder_lifecycle_controls_status_and_ignores() {
         .unwrap();
     let res_list_v1 = router.clone().oneshot(req_list_v1).await.unwrap();
     assert_eq!(res_list_v1.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_list_v1.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_list_v1.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let dtos: Vec<FolderDto> = serde_json::from_slice(&body).unwrap();
     assert_eq!(dtos.len(), 2);
 
@@ -782,17 +900,33 @@ async fn test_folder_lifecycle_controls_status_and_ignores() {
     // Write and index a file
     let sample_file = folder_v1_path.join("file1.txt");
     fs::write(&sample_file, "Hello Synapse!").unwrap();
-    harness.sync_engine.index_single_file("vault_v1", "file1.txt").unwrap();
-
-    let req_st_rest = Request::builder()
-        .uri("/rest/db/status?folder=vault_v1")
-        .method("GET")
-        .body(Body::empty())
+    harness
+        .sync_engine
+        .index_single_file("vault_v1", "file1.txt")
         .unwrap();
-    let res_st_rest = router.clone().oneshot(req_st_rest).await.unwrap();
-    assert_eq!(res_st_rest.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_st_rest.into_body(), usize::MAX).await.unwrap();
-    let status_rest: FolderStatusMetrics = serde_json::from_slice(&body).unwrap();
+
+    // Registration kicks off a background scan; wait for it to settle so the
+    // assertions below don't race it (state would briefly read "scanning").
+    let mut status_rest: Option<FolderStatusMetrics> = None;
+    for _ in 0..100 {
+        let req_st_rest = Request::builder()
+            .uri("/rest/db/status?folder=vault_v1")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let res_st_rest = router.clone().oneshot(req_st_rest).await.unwrap();
+        assert_eq!(res_st_rest.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res_st_rest.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let st: FolderStatusMetrics = serde_json::from_slice(&body).unwrap();
+        if st.state == "idle" {
+            status_rest = Some(st);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let status_rest = status_rest.expect("folder never returned to idle after initial scan");
     assert_eq!(status_rest.folder_id, "vault_v1");
     assert_eq!(status_rest.state, "idle");
     assert_eq!(status_rest.local_files, 1);
@@ -814,7 +948,9 @@ async fn test_folder_lifecycle_controls_status_and_ignores() {
         .unwrap();
     let res_st_v1 = router.clone().oneshot(req_st_v1).await.unwrap();
     assert_eq!(res_st_v1.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_st_v1.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_st_v1.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let status_v1: FolderStatusMetrics = serde_json::from_slice(&body).unwrap();
     assert_eq!(status_v1.local_files, 1);
 
@@ -826,7 +962,9 @@ async fn test_folder_lifecycle_controls_status_and_ignores() {
         .unwrap();
     let res_comp_rest = router.clone().oneshot(req_comp_rest).await.unwrap();
     assert_eq!(res_comp_rest.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_comp_rest.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_comp_rest.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let comp_rest: DeviceCompletionMetrics = serde_json::from_slice(&body).unwrap();
     assert_eq!(comp_rest.folder_id, "vault_v1");
     assert_eq!(comp_rest.completion_pct, 100.0);
@@ -875,7 +1013,8 @@ async fn test_folder_lifecycle_controls_status_and_ignores() {
     // 5. Folder Ignores: /rest/db/ignores?folder=vault_v1 and /api/v1/folders/:id/ignores
     let ig_payload_1 = serde_json::to_string(&IgnoresRequest {
         ignore: vec!["*.tmp".into(), ".git/".into()],
-    }).unwrap();
+    })
+    .unwrap();
     let req_ig_v1_set = Request::builder()
         .uri("/api/v1/folders/vault_v1/ignores")
         .method("POST")
@@ -892,14 +1031,21 @@ async fn test_folder_lifecycle_controls_status_and_ignores() {
         .unwrap();
     let res_ig_v1_get = router.clone().oneshot(req_ig_v1_get).await.unwrap();
     assert_eq!(res_ig_v1_get.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_ig_v1_get.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_ig_v1_get.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let ig_v1: IgnoresRequest = serde_json::from_slice(&body).unwrap();
     assert_eq!(ig_v1.ignore, vec!["*.tmp", ".git/"]);
 
     // Test Syncthing /rest/db/ignores with query parameter
     let ig_payload_2 = serde_json::to_string(&IgnoresRequest {
-        ignore: vec!["node_modules/".into(), "*.log".into(), "(?d).DS_Store".into()],
-    }).unwrap();
+        ignore: vec![
+            "node_modules/".into(),
+            "*.log".into(),
+            "(?d).DS_Store".into(),
+        ],
+    })
+    .unwrap();
     let req_ig_rest_set = Request::builder()
         .uri("/rest/db/ignores?folder=vault_v1")
         .method("POST")
@@ -916,7 +1062,9 @@ async fn test_folder_lifecycle_controls_status_and_ignores() {
         .unwrap();
     let res_ig_rest_get = router.clone().oneshot(req_ig_rest_get).await.unwrap();
     assert_eq!(res_ig_rest_get.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_ig_rest_get.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_ig_rest_get.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let ig_rest: IgnoresRequest = serde_json::from_slice(&body).unwrap();
     assert_eq!(ig_rest.ignore.len(), 3);
 
@@ -937,7 +1085,9 @@ async fn test_folder_lifecycle_controls_status_and_ignores() {
         .unwrap();
     let res_devs_init = router.clone().oneshot(req_devs_init).await.unwrap();
     assert_eq!(res_devs_init.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_devs_init.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_devs_init.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let shared_devs: Vec<String> = serde_json::from_slice(&body).unwrap();
     assert_eq!(shared_devs.len(), 0);
 
@@ -956,7 +1106,9 @@ async fn test_folder_lifecycle_controls_status_and_ignores() {
         .body(Body::empty())
         .unwrap();
     let res_devs_after = router.clone().oneshot(req_devs_after).await.unwrap();
-    let body = axum::body::to_bytes(res_devs_after.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_devs_after.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let shared_devs: Vec<String> = serde_json::from_slice(&body).unwrap();
     assert_eq!(shared_devs, vec!["REMOTE_PEER_42"]);
 
@@ -975,7 +1127,9 @@ async fn test_folder_lifecycle_controls_status_and_ignores() {
         .body(Body::empty())
         .unwrap();
     let res_devs_final = router.clone().oneshot(req_devs_final).await.unwrap();
-    let body = axum::body::to_bytes(res_devs_final.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_devs_final.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let shared_devs: Vec<String> = serde_json::from_slice(&body).unwrap();
     assert_eq!(shared_devs.len(), 0);
 
@@ -1023,10 +1177,10 @@ async fn test_conflict_endpoints_diff_and_resolution_actions() {
     fs::create_dir_all(&folder_path).unwrap();
 
     let folder_id = "conflict_vault";
-    harness.storage.add_folder(&FolderRecord::new(
-        folder_id,
-        folder_path.to_string_lossy(),
-    )).unwrap();
+    harness
+        .storage
+        .add_folder(&FolderRecord::new(folder_id, folder_path.to_string_lossy()))
+        .unwrap();
 
     // -------------------------------------------------------------------------
     // Phase 1: 3-Way Diff Inspection Endpoints (Base, Local, Remote, Diff)
@@ -1052,8 +1206,11 @@ async fn test_conflict_endpoints_diff_and_resolution_actions() {
         .unwrap();
     let res = router.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
-    let conflicts: Vec<synapse_core::storage::QuarantineConflict> = serde_json::from_slice(&body).unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conflicts: Vec<synapse_core::storage::QuarantineConflict> =
+        serde_json::from_slice(&body).unwrap();
     assert_eq!(conflicts.len(), 1);
     assert_eq!(conflicts[0].conflict_id, cnf_id_1);
 
@@ -1074,7 +1231,9 @@ async fn test_conflict_endpoints_diff_and_resolution_actions() {
         .unwrap();
     let res = router.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(String::from_utf8_lossy(&body), base_text_1);
 
     // GET /api/v1/conflicts/:id/local
@@ -1085,7 +1244,9 @@ async fn test_conflict_endpoints_diff_and_resolution_actions() {
         .unwrap();
     let res = router.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(String::from_utf8_lossy(&body), local_text_1);
 
     // GET /api/v1/conflicts/:id/remote
@@ -1096,7 +1257,9 @@ async fn test_conflict_endpoints_diff_and_resolution_actions() {
         .unwrap();
     let res = router.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(String::from_utf8_lossy(&body), remote_text_1);
 
     // GET /api/v1/conflicts/:id/diff (3-Way Diff Generation)
@@ -1107,11 +1270,16 @@ async fn test_conflict_endpoints_diff_and_resolution_actions() {
         .unwrap();
     let res = router.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let diff: DiffResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(diff.conflict_id, cnf_id_1);
     assert_eq!(diff.relative_path, "diff_test.txt");
-    assert!(diff.hunks.iter().any(|h| matches!(h.hunk_type, diff3::HunkType::Conflict)));
+    assert!(diff
+        .hunks
+        .iter()
+        .any(|h| matches!(h.hunk_type, diff3::HunkType::Conflict)));
 
     // -------------------------------------------------------------------------
     // Phase 2: Action ACCEPT_LOCAL
@@ -1206,8 +1374,16 @@ async fn test_conflict_endpoints_diff_and_resolution_actions() {
     assert_eq!(on_disk_custom, custom_solution);
 
     // Merged file tracked with 2 parents in Merkle DAG
-    let custom_file = harness.storage.get_file(folder_id, "custom_test.txt").unwrap().unwrap();
-    let custom_rev = harness.storage.get_revision(&custom_file.current_revision).unwrap().unwrap();
+    let custom_file = harness
+        .storage
+        .get_file(folder_id, "custom_test.txt")
+        .unwrap()
+        .unwrap();
+    let custom_rev = harness
+        .storage
+        .get_revision(&custom_file.current_revision)
+        .unwrap()
+        .unwrap();
     assert!(custom_rev.parent_1.is_some());
     assert!(custom_rev.parent_2.is_some());
     assert_eq!(harness.storage.list_pending_conflicts().unwrap().len(), 0);
@@ -1248,7 +1424,10 @@ async fn test_conflict_endpoints_diff_and_resolution_actions() {
     // Sidecar file created with remote content
     let sidecar_name = format!("keep_both.conflict-{}.txt", cnf_id_4);
     let sidecar_path = folder_path.join(&sidecar_name);
-    assert!(sidecar_path.exists(), "Sidecar conflict file must be created on disk");
+    assert!(
+        sidecar_path.exists(),
+        "Sidecar conflict file must be created on disk"
+    );
     let on_disk_sidecar = fs::read_to_string(&sidecar_path).unwrap();
     assert_eq!(on_disk_sidecar, remote_text_4);
 
@@ -1320,7 +1499,9 @@ async fn test_websocket_realtime_event_streaming() {
     let mut n_total = 0;
     while !String::from_utf8_lossy(&handshake_res[..n_total]).contains("\r\n\r\n") {
         let n = stream.read(&mut handshake_res[n_total..]).await.unwrap();
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         n_total += n;
     }
     let res_str = String::from_utf8_lossy(&handshake_res[..n_total]);
@@ -1336,8 +1517,11 @@ async fn test_websocket_realtime_event_streaming() {
 
     // Read incoming WebSocket Text Frame from server
     let mut frame_buf = [0u8; 1024];
-    let read_result = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut frame_buf)).await;
-    let n = read_result.expect("Timed out waiting for WebSocket event").unwrap();
+    let read_result =
+        tokio::time::timeout(Duration::from_secs(5), stream.read(&mut frame_buf)).await;
+    let n = read_result
+        .expect("Timed out waiting for WebSocket event")
+        .unwrap();
     assert!(n >= 2, "Must read at least frame header");
 
     // Verify WebSocket frame header: 0x81 (FIN=1, Text frame opcode=1)
@@ -1348,25 +1532,37 @@ async fn test_websocket_realtime_event_streaming() {
         let len = u16::from_be_bytes([frame_buf[2], frame_buf[3]]) as usize;
         (4, len)
     };
-    let payload_str = String::from_utf8_lossy(&frame_buf[payload_start..payload_start + payload_len]);
-    assert!(payload_str.contains("DEVICE_PAIRED"), "Expected DEVICE_PAIRED in event payload: {}", payload_str);
+    let payload_str =
+        String::from_utf8_lossy(&frame_buf[payload_start..payload_start + payload_len]);
+    assert!(
+        payload_str.contains("DEVICE_PAIRED"),
+        "Expected DEVICE_PAIRED in event payload: {}",
+        payload_str
+    );
     assert!(payload_str.contains("WS_TEST_DEVICE_100"));
 
     // Test sending masked "ping" message and receiving "pong" reply
     let mask = [0x5A, 0xA5, 0x12, 0x34];
     let ping_bytes = b"ping";
-    let masked_ping: Vec<u8> = ping_bytes.iter().enumerate().map(|(i, &b)| b ^ mask[i % 4]).collect();
+    let masked_ping: Vec<u8> = ping_bytes
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| b ^ mask[i % 4])
+        .collect();
     let mut ping_frame = vec![0x81, 0x84]; // 0x80 (masked) | 4 bytes
     ping_frame.extend_from_slice(&mask);
     ping_frame.extend_from_slice(&masked_ping);
     stream.write_all(&ping_frame).await.unwrap();
 
     let mut pong_buf = [0u8; 128];
-    let pong_result = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut pong_buf)).await;
-    let n_pong = pong_result.expect("Timed out waiting for WebSocket pong").unwrap();
+    let pong_result =
+        tokio::time::timeout(Duration::from_secs(5), stream.read(&mut pong_buf)).await;
+    let n_pong = pong_result
+        .expect("Timed out waiting for WebSocket pong")
+        .unwrap();
     assert!(n_pong >= 6);
     assert_eq!(pong_buf[0], 0x81); // Text frame
-    assert_eq!(pong_buf[1], 4);    // Length 4
+    assert_eq!(pong_buf[1], 4); // Length 4
     assert_eq!(&pong_buf[2..6], b"pong");
 
     // Also verify /rest/events WebSocket handshake on live server
@@ -1380,13 +1576,21 @@ async fn test_websocket_realtime_event_streaming() {
          Sec-WebSocket-Version: 13\r\n\r\n",
         addr
     );
-    stream_rest.write_all(handshake_rest.as_bytes()).await.unwrap();
+    stream_rest
+        .write_all(handshake_rest.as_bytes())
+        .await
+        .unwrap();
 
     let mut handshake_res_rest = [0u8; 1024];
     let mut n_total_rest = 0;
     while !String::from_utf8_lossy(&handshake_res_rest[..n_total_rest]).contains("\r\n\r\n") {
-        let n = stream_rest.read(&mut handshake_res_rest[n_total_rest..]).await.unwrap();
-        if n == 0 { break; }
+        let n = stream_rest
+            .read(&mut handshake_res_rest[n_total_rest..])
+            .await
+            .unwrap();
+        if n == 0 {
+            break;
+        }
         n_total_rest += n;
     }
     let res_str_rest = String::from_utf8_lossy(&handshake_res_rest[..n_total_rest]);
@@ -1414,14 +1618,25 @@ async fn test_state_machine_architecture_ux_dx_ax() {
     let res = router.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
-    let machines: Vec<synapse_core::state::StateMachineDef> = serde_json::from_slice(&body).unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let machines: Vec<synapse_core::state::StateMachineDef> =
+        serde_json::from_slice(&body).unwrap();
 
     assert!(machines.len() >= 5);
-    let conflict_sm = machines.iter().find(|m| m.machine_id == "conflict_lifecycle").expect("conflict_lifecycle machine must exist");
+    let conflict_sm = machines
+        .iter()
+        .find(|m| m.machine_id == "conflict_lifecycle")
+        .expect("conflict_lifecycle machine must exist");
     assert_eq!(conflict_sm.initial_state, "PENDING");
-    assert!(conflict_sm.states.iter().any(|s| s.state == "PENDING" && !s.is_terminal && s.available_actions.contains(&"ACCEPT_LOCAL".to_string())));
-    assert!(conflict_sm.states.iter().any(|s| s.state == "RESOLVED" && s.is_terminal && s.available_actions.is_empty()));
+    assert!(conflict_sm.states.iter().any(|s| s.state == "PENDING"
+        && !s.is_terminal
+        && s.available_actions.contains(&"ACCEPT_LOCAL".to_string())));
+    assert!(conflict_sm
+        .states
+        .iter()
+        .any(|s| s.state == "RESOLVED" && s.is_terminal && s.available_actions.is_empty()));
 
     // Verify alias route /rest/system/statemachines
     let req_rest = Request::builder()
@@ -1438,7 +1653,10 @@ async fn test_state_machine_architecture_ux_dx_ax() {
     let folder_path = harness.temp_dir.join("sm_test_vault");
     fs::create_dir_all(&folder_path).unwrap();
     let folder_id = "sm_vault";
-    harness.storage.add_folder(&FolderRecord::new(folder_id, folder_path.to_string_lossy())).unwrap();
+    harness
+        .storage
+        .add_folder(&FolderRecord::new(folder_id, folder_path.to_string_lossy()))
+        .unwrap();
 
     let cnf_id = harness.stage_conflict(
         folder_id,
@@ -1457,7 +1675,9 @@ async fn test_state_machine_architecture_ux_dx_ax() {
         .unwrap();
     let res_det = router.clone().oneshot(req_det).await.unwrap();
     assert_eq!(res_det.status(), StatusCode::OK);
-    let det_body = axum::body::to_bytes(res_det.into_body(), usize::MAX).await.unwrap();
+    let det_body = axum::body::to_bytes(res_det.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let det_json: serde_json::Value = serde_json::from_slice(&det_body).unwrap();
     assert_eq!(det_json["status"], "PENDING");
     assert_eq!(det_json["is_terminal"], false);
@@ -1487,11 +1707,19 @@ async fn test_state_machine_architecture_ux_dx_ax() {
         .unwrap();
     let res_det_after = router.clone().oneshot(req_det_after).await.unwrap();
     assert_eq!(res_det_after.status(), StatusCode::OK);
-    let det_after_body = axum::body::to_bytes(res_det_after.into_body(), usize::MAX).await.unwrap();
+    let det_after_body = axum::body::to_bytes(res_det_after.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let det_after_json: serde_json::Value = serde_json::from_slice(&det_after_body).unwrap();
     assert_eq!(det_after_json["status"], "RESOLVED");
     assert_eq!(det_after_json["is_terminal"], true);
-    assert_eq!(det_after_json["available_actions"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        det_after_json["available_actions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
 
     // Second resolution attempt: must be REJECTED by transition guard (UX & DX Safety)
     let req_double_res = Request::builder()
@@ -1502,7 +1730,9 @@ async fn test_state_machine_architecture_ux_dx_ax() {
         .unwrap();
     let res_double = router.clone().oneshot(req_double_res).await.unwrap();
     assert_eq!(res_double.status(), StatusCode::BAD_REQUEST);
-    let err_body = axum::body::to_bytes(res_double.into_body(), usize::MAX).await.unwrap();
+    let err_body = axum::body::to_bytes(res_double.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let err_str = String::from_utf8_lossy(&err_body);
     assert!(err_str.contains("Invalid state transition"));
     assert!(err_str.contains("RESOLVED"));
@@ -1530,7 +1760,10 @@ async fn test_state_machine_architecture_ux_dx_ax() {
 
     let conflict_rec = harness.storage.get_conflict(&cnf_id_2).unwrap().unwrap();
     assert_eq!(conflict_rec.status, "IGNORED");
-    assert_eq!(conflict_rec.parsed_status(), synapse_core::state::ConflictStatus::Ignored);
+    assert_eq!(
+        conflict_rec.parsed_status(),
+        synapse_core::state::ConflictStatus::Ignored
+    );
 
     // Reopen conflict back to PENDING
     let req_reopen = Request::builder()
@@ -1543,7 +1776,10 @@ async fn test_state_machine_architecture_ux_dx_ax() {
 
     let conflict_reopened = harness.storage.get_conflict(&cnf_id_2).unwrap().unwrap();
     assert_eq!(conflict_reopened.status, "PENDING");
-    assert_eq!(conflict_reopened.parsed_status(), synapse_core::state::ConflictStatus::Pending);
+    assert_eq!(
+        conflict_reopened.parsed_status(),
+        synapse_core::state::ConflictStatus::Pending
+    );
 
     // -------------------------------------------------------------------------
     // 4. Dynamic Folder & System Sync State
@@ -1555,19 +1791,25 @@ async fn test_state_machine_architecture_ux_dx_ax() {
         .unwrap();
     let res_status = router.clone().oneshot(req_status).await.unwrap();
     assert_eq!(res_status.status(), StatusCode::OK);
-    let body_st = axum::body::to_bytes(res_status.into_body(), usize::MAX).await.unwrap();
+    let body_st = axum::body::to_bytes(res_status.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let metrics: FolderStatusMetrics = serde_json::from_slice(&body_st).unwrap();
     assert_eq!(metrics.state, "idle");
 
     // Manually set folder to scanning
-    harness.sync_engine.set_folder_state(folder_id, synapse_core::state::FolderSyncState::Scanning);
+    harness
+        .sync_engine
+        .set_folder_state(folder_id, synapse_core::state::FolderSyncState::Scanning);
     let req_scanning = Request::builder()
         .uri(format!("/api/v1/folders/{}/status", folder_id))
         .method("GET")
         .body(Body::empty())
         .unwrap();
     let res_scanning = router.clone().oneshot(req_scanning).await.unwrap();
-    let body_sc = axum::body::to_bytes(res_scanning.into_body(), usize::MAX).await.unwrap();
+    let body_sc = axum::body::to_bytes(res_scanning.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let metrics_sc: FolderStatusMetrics = serde_json::from_slice(&body_sc).unwrap();
     assert_eq!(metrics_sc.state, "scanning");
 
@@ -1578,28 +1820,37 @@ async fn test_state_machine_architecture_ux_dx_ax() {
         .body(Body::empty())
         .unwrap();
     let res_sys = router.clone().oneshot(req_sys).await.unwrap();
-    let sys_body = axum::body::to_bytes(res_sys.into_body(), usize::MAX).await.unwrap();
+    let sys_body = axum::body::to_bytes(res_sys.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let sys_status: SystemStatusResponse = serde_json::from_slice(&sys_body).unwrap();
     assert_eq!(sys_status.sync_state, "SCANNING");
 
     // Reset back to idle
-    harness.sync_engine.set_folder_state(folder_id, synapse_core::state::FolderSyncState::Idle);
+    harness
+        .sync_engine
+        .set_folder_state(folder_id, synapse_core::state::FolderSyncState::Idle);
 
     // -------------------------------------------------------------------------
     // 5. Swarm Scheduler Chunk State Introspection
     // -------------------------------------------------------------------------
-    let mut scheduler = synapse_core::p2p::SwarmScheduler::new(synapse_core::p2p::PullOrder::Alphabetical);
+    let mut scheduler =
+        synapse_core::p2p::SwarmScheduler::new(synapse_core::p2p::PullOrder::Alphabetical);
     scheduler.register_peer("peer_alpha", vec!["chunk_001"]);
     scheduler.queue_file("test", "f1.bin", 1024, 1, vec!["chunk_001".into()]);
 
     // Initial state: Pending
-    let st1 = scheduler.get_chunk_state("chunk_001").expect("chunk_001 must exist");
+    let st1 = scheduler
+        .get_chunk_state("chunk_001")
+        .expect("chunk_001 must exist");
     assert_eq!(st1, synapse_core::state::ChunkDownloadState::Pending);
 
     // Scheduled: InFlight
     let assignment = scheduler.schedule_next().expect("assignment must exist");
     assert_eq!(assignment.peer_id, "peer_alpha");
-    let st2 = scheduler.get_chunk_state("chunk_001").expect("chunk_001 must exist");
+    let st2 = scheduler
+        .get_chunk_state("chunk_001")
+        .expect("chunk_001 must exist");
     match st2 {
         synapse_core::state::ChunkDownloadState::InFlight { peer_id, .. } => {
             assert_eq!(peer_id, "peer_alpha");
@@ -1609,7 +1860,9 @@ async fn test_state_machine_architecture_ux_dx_ax() {
 
     // Chunk received: Completed
     scheduler.mark_completed("chunk_001");
-    let st3 = scheduler.get_chunk_state("chunk_001").expect("chunk_001 must exist");
+    let st3 = scheduler
+        .get_chunk_state("chunk_001")
+        .expect("chunk_001 must exist");
     assert_eq!(st3, synapse_core::state::ChunkDownloadState::Completed);
 
     // -------------------------------------------------------------------------
@@ -1621,23 +1874,45 @@ async fn test_state_machine_architecture_ux_dx_ax() {
         "dev_b".into(),
         "127.0.0.1:443".into(),
     );
-    assert_eq!(session.state, synapse_core::p2p::relay::RelaySessionState::Disconnected);
+    assert_eq!(
+        session.state,
+        synapse_core::p2p::relay::RelaySessionState::Disconnected
+    );
 
     // Legal transition: Disconnected -> Connecting
-    assert!(session.transition_to(synapse_core::p2p::relay::RelaySessionState::Connecting).is_ok());
-    assert_eq!(session.state, synapse_core::p2p::relay::RelaySessionState::Connecting);
+    assert!(session
+        .transition_to(synapse_core::p2p::relay::RelaySessionState::Connecting)
+        .is_ok());
+    assert_eq!(
+        session.state,
+        synapse_core::p2p::relay::RelaySessionState::Connecting
+    );
 
     // Legal transition: Connecting -> Joined
-    assert!(session.transition_to(synapse_core::p2p::relay::RelaySessionState::Joined).is_ok());
+    assert!(session
+        .transition_to(synapse_core::p2p::relay::RelaySessionState::Joined)
+        .is_ok());
 
     // Illegal transition: Joined -> Disconnected (invalid jump without Closing)
-    assert!(session.transition_to(synapse_core::p2p::relay::RelaySessionState::Disconnected).is_err());
-    assert_eq!(session.state, synapse_core::p2p::relay::RelaySessionState::Joined);
+    assert!(session
+        .transition_to(synapse_core::p2p::relay::RelaySessionState::Disconnected)
+        .is_err());
+    assert_eq!(
+        session.state,
+        synapse_core::p2p::relay::RelaySessionState::Joined
+    );
 
     // Legal transition: Joined -> Active -> Closed
-    assert!(session.transition_to(synapse_core::p2p::relay::RelaySessionState::Active).is_ok());
-    assert!(session.transition_to(synapse_core::p2p::relay::RelaySessionState::Closed).is_ok());
-    assert_eq!(session.state, synapse_core::p2p::relay::RelaySessionState::Closed);
+    assert!(session
+        .transition_to(synapse_core::p2p::relay::RelaySessionState::Active)
+        .is_ok());
+    assert!(session
+        .transition_to(synapse_core::p2p::relay::RelaySessionState::Closed)
+        .is_ok());
+    assert_eq!(
+        session.state,
+        synapse_core::p2p::relay::RelaySessionState::Closed
+    );
 }
 
 // =============================================================================
@@ -1664,16 +1939,27 @@ async fn test_mobile_pairing_event_and_acceptance_workflow() {
         cert_pin: None,
     };
     harness.storage.add_pending_device(&pending_rec).unwrap();
-    let _ = harness.sync_engine.event_sender().send(synapse_core::conflict::CoreEvent::DevicePending {
-        device_id: mobile_id.into(),
-        name: mobile_name.into(),
-        address: mobile_addr.into(),
-    });
+    let _ =
+        harness
+            .sync_engine
+            .event_sender()
+            .send(synapse_core::conflict::CoreEvent::DevicePending {
+                device_id: mobile_id.into(),
+                name: mobile_name.into(),
+                address: mobile_addr.into(),
+            });
 
     // 2. Verify WebSocket/event bus receives DevicePending event
-    let event1 = rx_events.recv().await.expect("Expected DevicePending event");
+    let event1 = rx_events
+        .recv()
+        .await
+        .expect("Expected DevicePending event");
     match event1 {
-        synapse_core::conflict::CoreEvent::DevicePending { device_id, name, address } => {
+        synapse_core::conflict::CoreEvent::DevicePending {
+            device_id,
+            name,
+            address,
+        } => {
             assert_eq!(device_id, mobile_id);
             assert_eq!(name, mobile_name);
             assert_eq!(address, mobile_addr);
@@ -1689,7 +1975,9 @@ async fn test_mobile_pairing_event_and_acceptance_workflow() {
         .unwrap();
     let res_pending = router.clone().oneshot(req_pending).await.unwrap();
     assert_eq!(res_pending.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res_pending.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res_pending.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let pending_list: Vec<PendingDeviceRecord> = serde_json::from_slice(&body).unwrap();
     assert_eq!(pending_list.len(), 1);
     assert_eq!(pending_list[0].device_id, mobile_id);
@@ -1895,7 +2183,9 @@ async fn test_system_cas_garbage_collection_endpoints() {
     let res = router.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    let body = axum::body::to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let gc_resp: synapse_core::api::GcResponse = serde_json::from_slice(&body).unwrap();
     assert!(gc_resp.success);
     assert!(gc_resp.collected_chunks >= 1);
@@ -1938,11 +2228,29 @@ async fn test_end_to_end_peer_replication_and_deletion_tombstones() {
     let (tx_a, _) = tokio::sync::broadcast::channel(64);
     let (tx_b, _) = tokio::sync::broadcast::channel(64);
 
-    let conflict_a = Arc::new(ConflictEngine::new(storage_a.clone(), tx_a.clone(), identity_a.device_id.clone()));
-    let sync_engine_a = SyncEngine::new(storage_a.clone(), conflict_a, tx_a.clone(), identity_a.device_id.clone());
+    let conflict_a = Arc::new(ConflictEngine::new(
+        storage_a.clone(),
+        tx_a.clone(),
+        identity_a.device_id.clone(),
+    ));
+    let sync_engine_a = SyncEngine::new(
+        storage_a.clone(),
+        conflict_a,
+        tx_a.clone(),
+        identity_a.device_id.clone(),
+    );
 
-    let conflict_b = Arc::new(ConflictEngine::new(storage_b.clone(), tx_b.clone(), identity_b.device_id.clone()));
-    let sync_engine_b = SyncEngine::new(storage_b.clone(), conflict_b, tx_b.clone(), identity_b.device_id.clone());
+    let conflict_b = Arc::new(ConflictEngine::new(
+        storage_b.clone(),
+        tx_b.clone(),
+        identity_b.device_id.clone(),
+    ));
+    let sync_engine_b = SyncEngine::new(
+        storage_b.clone(),
+        conflict_b,
+        tx_b.clone(),
+        identity_b.device_id.clone(),
+    );
 
     let p2p_a = P2PManager::new(
         identity_a.clone(),
@@ -2005,10 +2313,19 @@ async fn test_end_to_end_peer_replication_and_deletion_tombstones() {
     let index_req = P2PMessage::IndexRequest {
         folder_id: folder_id.into(),
     };
-    let index_resp = p2p_a.handle_p2p_message(index_req, None).await.unwrap().unwrap();
+    let index_resp = p2p_a
+        .handle_p2p_message(index_req, None)
+        .await
+        .unwrap()
+        .unwrap();
 
     match index_resp {
-        P2PMessage::IndexResponse { folder_id: fid, files, revisions, chunk_lists } => {
+        P2PMessage::IndexResponse {
+            folder_id: fid,
+            files,
+            revisions,
+            chunk_lists,
+        } => {
             assert_eq!(fid, folder_id);
             assert_eq!(files.len(), 1);
             assert_eq!(revisions.len(), 1);
@@ -2022,15 +2339,18 @@ async fn test_end_to_end_peer_replication_and_deletion_tombstones() {
             }
 
             // Apply remote index to Node B
-            p2p_b.apply_remote_index(
-                folder_id,
-                &files,
-                &revisions,
-                &chunk_lists,
-                None,
-                Some(&identity_a.device_id),
-                None,
-            ).await.unwrap();
+            p2p_b
+                .apply_remote_index(
+                    folder_id,
+                    &files,
+                    &revisions,
+                    &chunk_lists,
+                    None,
+                    Some(&identity_a.device_id),
+                    None,
+                )
+                .await
+                .unwrap();
         }
         _ => panic!("Expected IndexResponse"),
     }
@@ -2047,31 +2367,52 @@ async fn test_end_to_end_peer_replication_and_deletion_tombstones() {
     fs::remove_file(sync_dir_a.join(file_rel)).unwrap();
     sync_engine_a.index_folder(folder_id).unwrap();
     let rec_a_del = storage_a.get_file(folder_id, file_rel).unwrap().unwrap();
-    assert!(rec_a_del.is_deleted, "Node A should mark file as deleted tombstone");
+    assert!(
+        rec_a_del.is_deleted,
+        "Node A should mark file as deleted tombstone"
+    );
 
     // 6. Node B syncs the deletion tombstone
     let index_req_2 = P2PMessage::IndexRequest {
         folder_id: folder_id.into(),
     };
-    let index_resp_2 = p2p_a.handle_p2p_message(index_req_2, None).await.unwrap().unwrap();
+    let index_resp_2 = p2p_a
+        .handle_p2p_message(index_req_2, None)
+        .await
+        .unwrap()
+        .unwrap();
 
     match index_resp_2 {
-        P2PMessage::IndexResponse { files, revisions, chunk_lists, .. } => {
-            p2p_b.apply_remote_index(
-                folder_id,
-                &files,
-                &revisions,
-                &chunk_lists,
-                None,
-                Some(&identity_a.device_id),
-                None,
-            ).await.unwrap();
+        P2PMessage::IndexResponse {
+            files,
+            revisions,
+            chunk_lists,
+            ..
+        } => {
+            p2p_b
+                .apply_remote_index(
+                    folder_id,
+                    &files,
+                    &revisions,
+                    &chunk_lists,
+                    None,
+                    Some(&identity_a.device_id),
+                    None,
+                )
+                .await
+                .unwrap();
         }
         _ => panic!("Expected IndexResponse for deletion"),
     }
 
     // 7. Verify deletion propagated to Node B: file removed from disk, tombstone in DB
-    assert!(!target_path_b.exists(), "Target file should be deleted from Node B's disk");
+    assert!(
+        !target_path_b.exists(),
+        "Target file should be deleted from Node B's disk"
+    );
     let rec_b_del = storage_b.get_file(folder_id, file_rel).unwrap().unwrap();
-    assert!(rec_b_del.is_deleted, "Node B should record deletion tombstone in SQLite");
+    assert!(
+        rec_b_del.is_deleted,
+        "Node B should record deletion tombstone in SQLite"
+    );
 }

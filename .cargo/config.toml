@@ -1,0 +1,19 @@
+# Android: align ELF LOAD segments to 16 KiB.
+#
+# Android 15+ devices may run with a 16 KiB page size, and Google Play requires 16 KiB
+# compatible native code for apps targeting Android 15+. Binaries linked with the NDK
+# r26 default (4 KiB) fail to load on those devices. The flag is harmless on 4 KiB
+# devices. `scripts/verify-android-elf.sh` checks the result.
+#
+# Note: a RUSTFLAGS environment variable overrides these; build-android.sh handles that.
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.i686-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

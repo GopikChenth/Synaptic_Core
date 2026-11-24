@@ -1,9 +1,55 @@
-/target
-/bin/synapse-core
-/bin/synapse-core.exe
-/bin/android/
+# Rust / Cargo build artifacts
+/target/
+Cargo.lock.bak
+*.rs.bk
+
+# Compiled binaries and distributions
+/dist/
+/bin/
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+
+# Android & NDK build artifacts
+/_ndk/
+*.apk
+*.aar
+*.zip
+.gradle/
+local.properties
+
+# Synapse runtime & database files
+.synapse/
 *.db
 *.db-wal
 *.db-shm
 *.log
-.synapse/
+
+# Git bundle & migration backups
+*.bundle
+_move_to_dotfolders/
+
+# Stale / local in-process JNI bindings (superceded by HTTP daemon, reference in docs/examples/android)
+/android/
+src/ffi.rs
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+[Dd]esktop.ini

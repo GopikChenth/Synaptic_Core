@@ -1,22 +1,46 @@
 //! Synapse Core: Standalone Daemon and CLI Entrypoint.
 //!
 //! Provides CLI execution mechanics for both desktop environments and Android execution
-//! via `ProcessBuilder` (when deployed as `libsynapse.so`).
+//! via `ProcessBuilder` (when deployed as `jniLibs/<abi>/libsynapse.so`).
+//!
+//! Exit codes (stable, relied on by the Android/Kotlin launchers):
+//!
+//! | code | meaning                                             |
+//! |------|-----------------------------------------------------|
+//! | 0    | clean shutdown                                      |
+//! | 1    | unexpected runtime error                            |
+//! | 2    | invalid command line (clap)                         |
+//! | 3    | configuration error (no home dir, insecure bind...) |
+//! | 4    | another instance already owns the home directory    |
+//! | 5    | control-plane API port could not be bound           |
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use tracing::{error, info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{error, info};
 
-use synapse_core::{SynapseConfig, SynapseCore};
+use synapse_core::telemetry::{self, LogFormat, LogOptions};
+use synapse_core::{ExitReason, StartupError, SynapseConfig, SynapseCore, VERSION};
+
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("SYNAPSE_GIT_REV"),
+    " ",
+    env!("SYNAPSE_BUILD_TARGET"),
+    ")"
+);
 
 #[derive(Parser, Debug)]
 #[command(
     name = "synapse-core",
     author = "Synapse Team",
-    version = "1.0.0",
+    version = VERSION,
+    long_version = LONG_VERSION,
     about = "Decentralized File Synchronization & 3-Way Conflict Resolution Engine"
 )]
 struct Cli {
@@ -28,7 +52,7 @@ struct Cli {
     #[arg(short = 'a', long, default_value = "127.0.0.1")]
     addr: String,
 
-    /// Control plane HTTP & WebSocket API port
+    /// Control plane HTTP & WebSocket API port (0 = pick a free port; see runtime.json)
     #[arg(short = 'p', long, default_value_t = 9090)]
     port: u16,
 
@@ -45,8 +69,36 @@ struct Cli {
     token: Option<String>,
 
     /// Custom human-readable device name
-    #[arg(long)]
+    #[arg(long, env = "SYNAPSE_DEVICE_NAME")]
     device_name: Option<String>,
+
+    /// Log filter (RUST_LOG syntax), e.g. `info` or `synapse_core=debug,quinn=warn`
+    #[arg(long, env = "SYNAPSE_LOG", default_value = "info")]
+    log_level: String,
+
+    /// Log line format: text | json
+    #[arg(long, env = "SYNAPSE_LOG_FORMAT", default_value = "text")]
+    log_format: LogFormat,
+
+    /// Also write daily-rotated log files to this directory
+    #[arg(long, env = "SYNAPSE_LOG_DIR")]
+    log_dir: Option<PathBuf>,
+
+    /// Number of rotated log files to keep
+    #[arg(long, default_value_t = 7)]
+    log_max_files: usize,
+
+    /// Do not log to stdout (use with --log-dir when stdout is not drained)
+    #[arg(long)]
+    quiet: bool,
+
+    /// Exit when the parent process dies (prevents orphaned daemons holding ports)
+    #[arg(long, env = "SYNAPSE_EXIT_WITH_PARENT")]
+    exit_with_parent: bool,
+
+    /// Exit when stdin is closed (parent keeps the pipe open while it wants us alive)
+    #[arg(long)]
+    exit_on_stdin_close: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -143,16 +195,121 @@ enum DeviceCommands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .with_target(false)
-        .finish();
-    let _ = tracing::subscriber::set_global_default(subscriber);
-
+fn main() -> ExitCode {
     let cli = Cli::parse();
+    let is_daemon = matches!(cli.command, None | Some(Commands::Run));
 
+    // Daemon logs go through non-blocking writers (see telemetry docs); one-shot CLI
+    // subcommands only log warnings so their tabular output stays clean. The guard
+    // lives for the whole process, across engine restarts.
+    let _log_guard = match telemetry::init(&LogOptions {
+        filter: if is_daemon {
+            cli.log_level.clone()
+        } else {
+            "warn".into()
+        },
+        format: cli.log_format,
+        stdout: !cli.quiet,
+        dir: if is_daemon { cli.log_dir.clone() } else { None },
+        max_files: cli.log_max_files,
+    }) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("synapse-core: {e}");
+            return ExitCode::from(3);
+        }
+    };
+
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let outcome = runtime.block_on(real_main(cli));
+    drop(runtime);
+
+    match outcome {
+        Ok(Outcome::Done) => ExitCode::SUCCESS,
+        Ok(Outcome::Daemon(config)) => run_daemon(*config),
+        Err(e) => report(e),
+    }
+}
+
+enum Outcome {
+    /// A one-shot subcommand finished.
+    Done,
+    /// Run the engine with this configuration.
+    Daemon(Box<SynapseConfig>),
+}
+
+fn build_runtime() -> Result<tokio::runtime::Runtime, ExitCode> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("synapse-worker")
+        .build()
+        .map_err(|e| {
+            eprintln!("synapse-core: cannot start async runtime: {e}");
+            ExitCode::from(1)
+        })
+}
+
+fn report(e: Box<dyn std::error::Error + Send + Sync>) -> ExitCode {
+    error!("{e}");
+    eprintln!("synapse-core: {e}");
+    ExitCode::from(exit_code_for(e.as_ref()))
+}
+
+/// Runs engine generations until shutdown.
+///
+/// Each generation gets its own Tokio runtime. Dropping the runtime cancels every task
+/// the generation spawned (discovery loops, QUIC connections, watchers), so a restart
+/// can't leak tasks or keep sockets bound. The next generation rebinds the same API
+/// address, so clients reconnect to the same URL.
+fn run_daemon(mut config: SynapseConfig) -> ExitCode {
+    let mut generation: u32 = 1;
+    loop {
+        let runtime = match build_runtime() {
+            Ok(rt) => rt,
+            Err(code) => return code,
+        };
+        let bound = Arc::new(Mutex::new(None::<SocketAddr>));
+        let bound_cb = bound.clone();
+        let cfg = config.clone();
+        let result = runtime.block_on(async move {
+            SynapseCore::init(cfg)?
+                .on_ready(move |info| {
+                    if let Ok(mut b) = bound_cb.lock() {
+                        *b = Some(info.api_addr);
+                    }
+                })
+                .run_until_exit()
+                .await
+        });
+        runtime.shutdown_timeout(Duration::from_secs(5));
+
+        match result {
+            Ok(ExitReason::Shutdown) => return ExitCode::SUCCESS,
+            Ok(ExitReason::Restart) => {
+                if let Some(addr) = bound.lock().ok().and_then(|b| *b) {
+                    config.api_addr = addr; // keep the same port, even if it was ephemeral
+                }
+                generation += 1;
+                info!("Restarting Synapse Core engine (generation {generation})");
+            }
+            Err(e) => return report(e),
+        }
+    }
+}
+
+fn exit_code_for(e: &(dyn std::error::Error + 'static)) -> u8 {
+    match e.downcast_ref::<StartupError>() {
+        Some(StartupError::AlreadyRunning { .. }) => 4,
+        Some(StartupError::ApiBind { .. }) => 5,
+        Some(StartupError::NoHomeDir | StartupError::InsecureBind { .. }) => 3,
+        None => 1,
+    }
+}
+
+async fn real_main(cli: Cli) -> Result<Outcome, Box<dyn std::error::Error + Send + Sync>> {
     let mut config = SynapseConfig::default();
 
     if let Some(h) = cli.home {
@@ -165,6 +322,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     config.api_addr = SocketAddr::new(ip, cli.port);
     config.p2p_port = cli.p2p_port;
     config.discovery_port = cli.discovery_port;
+    config.exit_with_parent = cli.exit_with_parent;
+    config.exit_on_stdin_close = cli.exit_on_stdin_close;
     if let Some(tok) = cli.token {
         config.auth_token = Some(tok);
     }
@@ -172,8 +331,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.device_name = dev;
     }
 
-    if !matches!(cli.command, Some(Commands::Status { .. })) {
-        let _ = std::fs::create_dir_all(&config.home_dir);
+    let needs_home = !matches!(cli.command, Some(Commands::Status { .. }));
+    if needs_home {
+        if config.home_dir.as_os_str().is_empty() {
+            return Err(StartupError::NoHomeDir.into());
+        }
+        std::fs::create_dir_all(&config.home_dir).map_err(|e| {
+            format!(
+                "cannot create home directory {}: {e}",
+                config.home_dir.display()
+            )
+        })?;
     }
 
     match cli.command {
@@ -184,37 +352,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok(resp) => println!("{}", resp),
                 Err(e) => eprintln!("Unable to connect to daemon: {}", e),
             }
-            Ok(())
+            Ok(Outcome::Done)
         }
         Some(Commands::Folders { cmd }) => {
             let storage = synapse_core::storage::StorageEngine::new(&config.home_dir)?;
             match cmd {
                 FolderCommands::List => {
                     let folders = storage.list_folders()?;
-                    println!("{:<20} {:<30} {:<15} {:<8}", "FOLDER ID", "LOCAL PATH", "POLICY", "PAUSED");
+                    println!(
+                        "{:<20} {:<30} {:<15} {:<8}",
+                        "FOLDER ID", "LOCAL PATH", "POLICY", "PAUSED"
+                    );
                     println!("{:-<75}", "");
                     for f in folders {
-                        println!("{:<20} {:<30} {:<15} {:<8}", f.folder_id, f.local_path, f.conflict_policy, f.is_paused);
+                        println!(
+                            "{:<20} {:<30} {:<15} {:<8}",
+                            f.folder_id, f.local_path, f.conflict_policy, f.is_paused
+                        );
                     }
                 }
                 FolderCommands::Add { id, path, policy } => {
-                    let mut rec = synapse_core::storage::FolderRecord::new(id.clone(), path.to_string_lossy());
+                    synapse_core::state::validate_folder_config(&policy, None, None, None)?;
+                    let mut rec = synapse_core::storage::FolderRecord::new(
+                        id.clone(),
+                        path.to_string_lossy(),
+                    );
                     rec.conflict_policy = policy;
                     storage.add_folder(&rec)?;
-                    println!("Successfully registered folder '{}' at '{}'", id, rec.local_path);
+                    println!(
+                        "Successfully registered folder '{}' at '{}'",
+                        id, rec.local_path
+                    );
                 }
             }
-            Ok(())
+            Ok(Outcome::Done)
         }
         Some(Commands::Conflicts { cmd }) => {
             let storage = synapse_core::storage::StorageEngine::new(&config.home_dir)?;
             match cmd {
                 ConflictCommands::List => {
                     let list = storage.list_pending_conflicts()?;
-                    println!("{:<15} {:<20} {:<30} {:<10}", "CONFLICT ID", "FOLDER", "PATH", "STATUS");
+                    println!(
+                        "{:<15} {:<20} {:<30} {:<10}",
+                        "CONFLICT ID", "FOLDER", "PATH", "STATUS"
+                    );
                     println!("{:-<75}", "");
                     for c in list {
-                        println!("{:<15} {:<20} {:<30} {:<10}", c.conflict_id, c.folder_id, c.relative_path, c.status);
+                        println!(
+                            "{:<15} {:<20} {:<30} {:<10}",
+                            c.conflict_id, c.folder_id, c.relative_path, c.status
+                        );
                     }
                 }
                 ConflictCommands::Diff { id } => {
@@ -237,25 +424,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         "KEEP_BOTH" => synapse_core::conflict::ResolveAction::KeepBoth,
                         other => {
                             eprintln!("Unknown action: {}. Expected ACCEPT_LOCAL, ACCEPT_REMOTE, CUSTOM_MERGE, or KEEP_BOTH", other);
-                            return Ok(());
+                            return Ok(Outcome::Done);
                         }
                     };
                     let (tx, _) = tokio::sync::broadcast::channel(10);
-                    let engine = synapse_core::conflict::ConflictEngine::new(storage, tx, "cli".into());
-                    engine.resolve(&id, &synapse_core::conflict::ResolveRequest {
-                        action: act,
-                        merged_content: None,
-                    })?;
+                    let engine =
+                        synapse_core::conflict::ConflictEngine::new(storage, tx, "cli".into());
+                    engine.resolve(
+                        &id,
+                        &synapse_core::conflict::ResolveRequest {
+                            action: act,
+                            merged_content: None,
+                        },
+                    )?;
                     println!("Conflict '{}' successfully resolved.", id);
                 }
             }
-            Ok(())
+            Ok(Outcome::Done)
         }
         Some(Commands::Devices { cmd }) => {
             let storage = synapse_core::storage::StorageEngine::new(&config.home_dir)?;
             match cmd {
                 DeviceCommands::Id => {
-                    let identity = synapse_core::p2p::NodeIdentity::load_or_generate(&config.home_dir)?;
+                    let identity =
+                        synapse_core::p2p::NodeIdentity::load_or_generate(&config.home_dir)?;
                     println!("Device Name:         {}", config.device_name);
                     println!("Device ID:           {}", identity.formatted_id);
                     println!("Raw Key Fingerprint: {}", identity.device_id);
@@ -265,10 +457,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     if list.is_empty() {
                         println!("No paired devices configured.");
                     } else {
-                        println!("{:<35} {:<20} {:<10} {:<10}", "DEVICE ID", "NAME", "PAUSED", "TRUSTED");
+                        println!(
+                            "{:<35} {:<20} {:<10} {:<10}",
+                            "DEVICE ID", "NAME", "PAUSED", "TRUSTED"
+                        );
                         println!("{:-<80}", "");
                         for d in list {
-                            println!("{:<35} {:<20} {:<10} {:<10}", d.device_id, d.name, d.is_paused, d.is_trusted);
+                            println!(
+                                "{:<35} {:<20} {:<10} {:<10}",
+                                d.device_id, d.name, d.is_paused, d.is_trusted
+                            );
                         }
                     }
                 }
@@ -282,7 +480,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         for d in list {
                             println!("{:<35} {:<20} {:<25}", d.device_id, d.name, d.address);
                         }
-                        println!("\nTo accept a device: synapse-core devices accept --id <DEVICE_ID>");
+                        println!(
+                            "\nTo accept a device: synapse-core devices accept --id <DEVICE_ID>"
+                        );
                     }
                 }
                 DeviceCommands::Accept { id } => {
@@ -308,28 +508,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     println!("Successfully added and paired device: {}", id);
                 }
             }
-            Ok(())
+            Ok(Outcome::Done)
         }
         Some(Commands::Gc) => {
             let storage = synapse_core::storage::StorageEngine::new(&config.home_dir)?;
             let _ = storage.rebuild_chunk_ref_counts();
             let collected = storage.garbage_collect_orphaned_chunks()?;
-            println!("CAS Garbage Collection complete. Removed {} orphaned chunk(s).", collected);
-            Ok(())
+            println!(
+                "CAS Garbage Collection complete. Removed {} orphaned chunk(s).",
+                collected
+            );
+            Ok(Outcome::Done)
         }
         Some(Commands::Run) | None => {
-            info!("Synapse Core v1.0.0 starting...");
+            info!(
+                "Synapse Core v{VERSION} starting (pid {})",
+                std::process::id()
+            );
             info!("Home Directory: {}", config.home_dir.display());
             info!("API Address:    http://{}", config.api_addr);
             info!("P2P Port:       {}", config.p2p_port);
             info!("Discovery Port: {}", config.discovery_port);
 
-            let core = SynapseCore::init(config)?;
-            if let Err(e) = core.run().await {
-                error!("Synapse Core exited with error: {}", e);
-            }
-
-            Ok(())
+            Ok(Outcome::Daemon(Box::new(config)))
         }
     }
 }

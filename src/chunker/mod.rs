@@ -72,7 +72,8 @@ impl Chunker {
             return (Vec::new(), manifest);
         }
 
-        let chunker = fastcdc::v2020::FastCDC::new(data, self.min_size, self.avg_size, self.max_size);
+        let chunker =
+            fastcdc::v2020::FastCDC::new(data, self.min_size, self.avg_size, self.max_size);
         let mut result = Vec::new();
         let mut hashes = Vec::new();
 
@@ -100,7 +101,8 @@ impl Chunker {
             return (Vec::new(), manifest);
         }
 
-        let chunker = fastcdc::v2020::FastCDC::new(data, self.min_size, self.avg_size, self.max_size);
+        let chunker =
+            fastcdc::v2020::FastCDC::new(data, self.min_size, self.avg_size, self.max_size);
         let mut result = Vec::new();
         let mut hashes = Vec::new();
 
@@ -163,7 +165,13 @@ mod tests {
         let orig_hashes: Vec<_> = orig_chunks.iter().map(|c| &c.chunk_hash).collect();
         let mod_hashes: Vec<_> = mod_chunks.iter().map(|c| &c.chunk_hash).collect();
 
-        let common_hashes = mod_hashes.iter().filter(|h| orig_hashes.contains(h)).count();
-        assert!(common_hashes > 0, "FastCDC must preserve downstream chunks across shifts");
+        let common_hashes = mod_hashes
+            .iter()
+            .filter(|h| orig_hashes.contains(h))
+            .count();
+        assert!(
+            common_hashes > 0,
+            "FastCDC must preserve downstream chunks across shifts"
+        );
     }
 }

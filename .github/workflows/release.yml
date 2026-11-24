@@ -1,0 +1,326 @@
+# =============================================================================
+# Release pipeline for the Synapse Core engine binary.
+#
+#   meta ──┬── desktop (linux x86_64/arm64 · windows x64 · macos universal)
+#          │      build → static-link check → API smoke test → package
+#          │
+#          └── android-build (arm64-v8a · armeabi-v7a · x86_64)
+#                 build → ELF verification (ABI, bionic, PIE, 16 KiB) → package
+#                   └── android-emulator (API 24 · 34 · 35 16 KiB pages)
+#                          run engine as an app would → API smoke test
+#
+#   release  (tags v* only, after everything above is green)
+#          checksums → manifest.json → release notes → build provenance → GitHub Release
+#
+# Start a release from the Actions tab with "Prepare Release" (bumps the version,
+# tags, then dispatches this workflow on the tag), or push a vX.Y.Z tag yourself.
+#
+# Every run uploads the packaged archives as workflow artifacts, so any commit on
+# main can be downloaded and tested before it is tagged.
+# =============================================================================
+name: Release Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  ANDROID_NDK_VERSION: r27c
+  ANDROID_API_LEVEL: "21"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  meta:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version and validate tag
+        id: v
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="synapse-core") | .version')"
+          echo "Cargo.toml version: ${version}"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            if [[ "${tag}" != "v${version}" ]]; then
+              echo "::error::Tag ${tag} does not match Cargo.toml version v${version}. Bump the version first."
+              exit 1
+            fi
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          [[ "${version}" == *-* ]] && pre=true || pre=false
+          echo "prerelease=${pre}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  desktop:
+    name: ${{ matrix.name }}
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            targets: x86_64-unknown-linux-musl
+            ext: ""
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            targets: aarch64-unknown-linux-musl
+            ext: ""
+          - name: windows-x64
+            os: windows-latest
+            targets: x86_64-pc-windows-msvc
+            ext: ".exe"
+          - name: macos-universal
+            os: macos-latest
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            ext: ""
+    defaults:
+      run:
+        shell: bash
+    env:
+      SYNAPSE_GIT_REV: ${{ github.sha }}
+      # Static MSVC CRT: no Visual C++ Redistributable needed on user machines.
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+      # musl: fully static Linux binaries that run on any distribution.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets || matrix.targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Install musl toolchain
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+
+      - name: Build
+        run: |
+          mkdir -p dist/bin
+          for target in ${{ matrix.targets }}; do
+            cargo build --release --locked --target "${target}" --bin synapse-core
+          done
+          if [[ "${{ matrix.name }}" == macos-universal ]]; then
+            lipo -create -output dist/bin/synapse-core \
+              target/aarch64-apple-darwin/release/synapse-core \
+              target/x86_64-apple-darwin/release/synapse-core
+          else
+            cp "target/${{ matrix.targets }}/release/synapse-core${{ matrix.ext }}" dist/bin/
+          fi
+
+      - name: Check linkage
+        run: |
+          bin="dist/bin/synapse-core${{ matrix.ext }}"
+          case "${{ matrix.name }}" in
+            linux-*)
+              file "${bin}"
+              file "${bin}" | grep -Eq 'static(-pie)? linked' || { echo "::error::not statically linked"; exit 1; } ;;
+            macos-*)
+              lipo -info "${bin}"
+              lipo "${bin}" -verify_arch arm64 x86_64 ;;
+            windows-*)
+              ls -l "${bin}" ;;
+          esac
+
+      - name: API smoke test
+        run: scripts/smoke-test.sh --bin "dist/bin/synapse-core${{ matrix.ext }}" --expect-version "${{ needs.meta.outputs.version }}"
+
+      - name: Package
+        run: |
+          scripts/package.sh bin "dist/bin/synapse-core${{ matrix.ext }}" \
+            "synapse-core-${{ needs.meta.outputs.version }}-${{ matrix.name }}" dist/release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  android-build:
+    name: android (build + verify)
+    needs: meta
+    runs-on: ubuntu-latest
+    env:
+      SYNAPSE_GIT_REV: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.ANDROID_NDK_VERSION }}
+          add-to-path: false
+
+      - name: Build & verify (ABI, bionic interpreter, PIE, 16 KiB alignment)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          scripts/build-android.sh \
+            --abis arm64-v8a,armeabi-v7a,x86_64 \
+            --api "${ANDROID_API_LEVEL}" \
+            --out dist/android/jniLibs
+
+      - name: Package
+        run: |
+          scripts/package.sh android dist/android/jniLibs \
+            "synapse-core-${{ needs.meta.outputs.version }}-android-jniLibs" dist/release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-jniLibs
+          path: dist/android/jniLibs
+          if-no-files-found: error
+          retention-days: 3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android-jniLibs
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  android-emulator:
+    name: android API ${{ matrix.api }} (${{ matrix.label }})
+    needs: [ meta, android-build ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - api: 24
+            target: default
+            label: oldest supported
+            experimental: false
+          - api: 34
+            target: google_apis
+            label: current
+            experimental: false
+          - api: 35
+            target: google_apis_ps16k
+            label: 16 KiB pages
+            experimental: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-jniLibs
+          path: dist/android/jniLibs
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run engine on emulator and test the API
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api }}
+          target: ${{ matrix.target }}
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
+          script: bash scripts/smoke-test-android.sh dist/android/jniLibs/x86_64/libsynapse.so ${{ needs.meta.outputs.version }}
+
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ meta, desktop, android-build, android-emulator ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist/release
+          merge-multiple: true
+
+      - name: Checksums & manifest
+        run: |
+          python3 scripts/release-manifest.py \
+            --dir dist/release \
+            --version "${{ needs.meta.outputs.version }}" \
+            --tag "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --commit "${GITHUB_SHA}"
+          (cd dist/release && sha256sum -c SHA256SUMS.txt)
+          {
+            echo "### synapse-core ${{ needs.meta.outputs.version }}"
+            echo
+            echo "| Platform | Arch | File | Size | SHA-256 |"
+            echo "|---|---|---|---|---|"
+            jq -r '.artifacts[] | "| \(.platform) | \(.arch) | `\(.file)` | \(.size / 1048576 * 100 | floor / 100) MiB | `\(.sha256[0:16])…` |"' dist/release/manifest.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Release notes header
+        run: |
+          python3 scripts/release-notes.py \
+            --manifest dist/release/manifest.json \
+            --repo "${GITHUB_REPOSITORY}" > dist/release-notes.md
+          cat dist/release-notes.md
+
+      - name: Build provenance attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/release/*.tar.gz
+            dist/release/*.zip
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: synapse-core ${{ needs.meta.outputs.version }}
+          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
+          body_path: dist/release-notes.md
+          generate_release_notes: true
+          make_latest: ${{ needs.meta.outputs.prerelease != 'true' }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/release/*.tar.gz
+            dist/release/*.zip
+            dist/release/SHA256SUMS.txt
+            dist/release/manifest.json

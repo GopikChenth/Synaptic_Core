@@ -53,17 +53,17 @@ impl IgnoreEngine {
 
             if pat.starts_with("(?d)") {
                 allow_dir_delete = true;
-                pat = &pat[4..].trim_start();
+                pat = pat[4..].trim_start();
             }
 
             if pat.starts_with("(?i)") {
                 case_insensitive = true;
-                pat = &pat[4..].trim_start();
+                pat = pat[4..].trim_start();
             }
 
             if pat.starts_with('!') {
                 is_inverted = true;
-                pat = &pat[1..].trim_start();
+                pat = pat[1..].trim_start();
             }
 
             let dir_only = pat.ends_with('/') || pat.ends_with('\\');
@@ -125,10 +125,10 @@ fn match_glob(path: &str, pattern: &str) -> bool {
     }
 
     // Prefix match for directories
-    if path.starts_with(clean_pat) {
-        if path.len() == clean_pat.len() || path.as_bytes().get(clean_pat.len()) == Some(&b'/') {
-            return true;
-        }
+    if path.starts_with(clean_pat)
+        && (path.len() == clean_pat.len() || path.as_bytes().get(clean_pat.len()) == Some(&b'/'))
+    {
+        return true;
     }
 
     false

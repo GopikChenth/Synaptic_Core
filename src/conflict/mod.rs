@@ -45,10 +45,7 @@ pub enum CoreEvent {
     #[serde(rename = "CONFLICT_DETECTED")]
     ConflictDetected(ConflictDetectedData),
     #[serde(rename = "CONFLICT_RESOLVED")]
-    ConflictResolved {
-        conflict_id: String,
-        action: String,
-    },
+    ConflictResolved { conflict_id: String, action: String },
     #[serde(rename = "FILE_CHANGED")]
     FileChanged {
         folder_id: String,
@@ -56,23 +53,16 @@ pub enum CoreEvent {
         revision: String,
     },
     #[serde(rename = "SYNC_STARTED")]
-    SyncStarted {
-        folder_id: String,
-    },
+    SyncStarted { folder_id: String },
     #[serde(rename = "SYNC_COMPLETED")]
     SyncCompleted {
         folder_id: String,
         files_synced: usize,
     },
     #[serde(rename = "PEER_CONNECTED")]
-    PeerConnected {
-        peer_id: String,
-        addr: String,
-    },
+    PeerConnected { peer_id: String, addr: String },
     #[serde(rename = "PEER_DISCONNECTED")]
-    PeerDisconnected {
-        peer_id: String,
-    },
+    PeerDisconnected { peer_id: String },
     #[serde(rename = "FOLDER_SCAN_PROGRESS")]
     FolderScanProgress {
         folder_id: String,
@@ -100,15 +90,21 @@ pub enum CoreEvent {
         error: Option<String>,
     },
     #[serde(rename = "DEVICE_PAIRED")]
-    DevicePaired {
-        device_id: String,
-        name: String,
-    },
+    DevicePaired { device_id: String, name: String },
     #[serde(rename = "DEVICE_PENDING")]
     DevicePending {
         device_id: String,
         name: String,
         address: String,
+    },
+    /// A folder's runtime state changed (see the `folder_sync_lifecycle` state machine).
+    /// `error` is set when `to` is `"error"`.
+    #[serde(rename = "FOLDER_STATE_CHANGED")]
+    FolderStateChanged {
+        folder_id: String,
+        from: String,
+        to: String,
+        error: Option<String>,
     },
     #[serde(rename = "REMOTE_INDEX_UPDATED")]
     RemoteIndexUpdated {
@@ -186,7 +182,7 @@ impl ConflictEngine {
         self.storage.insert_revision(
             &RevisionRecord {
                 revision_hash: rev_node.revision_hash.clone(),
-                parent_1: parent_hashes.get(0).cloned(),
+                parent_1: parent_hashes.first().cloned(),
                 parent_2: parent_hashes.get(1).cloned(),
                 manifest_hash: manifest,
                 author_device: self.device_id.clone(),
@@ -226,8 +222,8 @@ impl ConflictEngine {
                 | "csv" | "xml" | "yaml" | "yml" | "toml" | "sh" | "bash" | "sql" | "ini" => {
                     return true;
                 }
-                "png" | "jpg" | "jpeg" | "gif" | "webp" | "mp4" | "mkv" | "mp3" | "zip"
-                | "tar" | "gz" | "pdf" | "exe" | "so" | "dll" | "db" | "sqlite" => return false,
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "mp4" | "mkv" | "mp3" | "zip" | "tar"
+                | "gz" | "pdf" | "exe" | "so" | "dll" | "db" | "sqlite" => return false,
                 _ => {}
             }
         }
@@ -263,6 +259,7 @@ impl ConflictEngine {
 
     /// Attempts reconciliation of incoming remote version against local disk file.
     /// Follows the 3-Tier Multi-Strategy Pipeline.
+    #[allow(clippy::too_many_arguments)]
     pub fn handle_divergence(
         &self,
         folder_id: &str,
@@ -298,11 +295,17 @@ impl ConflictEngine {
                 .unwrap_or(0);
 
             let (chosen_payload, chosen_mtime) = if remote_mtime >= local_mtime {
-                info!("LWW policy: accepting newer remote version for {}/{}", folder_id, relative_path);
+                info!(
+                    "LWW policy: accepting newer remote version for {}/{}",
+                    folder_id, relative_path
+                );
                 atomic_write_file(&full_local_path, remote_payload, None, None)?;
                 (remote_payload, remote_mtime)
             } else {
-                info!("LWW policy: keeping newer local version for {}/{}", folder_id, relative_path);
+                info!(
+                    "LWW policy: keeping newer local version for {}/{}",
+                    folder_id, relative_path
+                );
                 (&local_payload[..], local_mtime)
             };
 
@@ -334,7 +337,10 @@ impl ConflictEngine {
         if is_text {
             auto_merge_attempted = true;
             let base_payload = match base_rev {
-                Some(brev) => self.storage.read_file_from_revision(brev).unwrap_or_default(),
+                Some(brev) => self
+                    .storage
+                    .read_file_from_revision(brev)
+                    .unwrap_or_default(),
                 None => Vec::new(),
             };
 
@@ -367,7 +373,10 @@ impl ConflictEngine {
 
                     return Ok(true);
                 }
-                diff3::MergeResult::Conflict { overlapping_lines_count, .. } => {
+                diff3::MergeResult::Conflict {
+                    overlapping_lines_count,
+                    ..
+                } => {
                     overlapping_lines = overlapping_lines_count;
                     warn!(
                         "Tier 1 Auto-Merge detected {} overlapping lines in {}/{}",
@@ -398,7 +407,9 @@ impl ConflictEngine {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
-        let local_size = local_meta.map(|m| m.len()).unwrap_or(local_payload.len() as u64);
+        let local_size = local_meta
+            .map(|m| m.len())
+            .unwrap_or(local_payload.len() as u64);
 
         let event = CoreEvent::ConflictDetected(ConflictDetectedData {
             conflict_id: conflict_id.clone(),
@@ -484,7 +495,10 @@ impl ConflictEngine {
                     &conflict.folder_id,
                     &conflict.relative_path,
                     &local_bytes,
-                    vec![conflict.local_revision.clone(), conflict.remote_revision.clone()],
+                    vec![
+                        conflict.local_revision.clone(),
+                        conflict.remote_revision.clone(),
+                    ],
                     mtime_nanos,
                 )?;
 
@@ -532,7 +546,10 @@ impl ConflictEngine {
                     &conflict.folder_id,
                     &conflict.relative_path,
                     content.as_bytes(),
-                    vec![conflict.local_revision.clone(), conflict.remote_revision.clone()],
+                    vec![
+                        conflict.local_revision.clone(),
+                        conflict.remote_revision.clone(),
+                    ],
                     chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
                 )?;
 
@@ -584,7 +601,10 @@ impl ConflictEngine {
                     &conflict.folder_id,
                     &conflict.relative_path,
                     &local_bytes,
-                    vec![conflict.local_revision.clone(), conflict.remote_revision.clone()],
+                    vec![
+                        conflict.local_revision.clone(),
+                        conflict.remote_revision.clone(),
+                    ],
                     mtime_nanos,
                 )?;
 
@@ -607,7 +627,10 @@ impl ConflictEngine {
     }
 
     /// Ignores or dismisses a quarantined conflict.
-    pub fn ignore(&self, conflict_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn ignore(
+        &self,
+        conflict_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conflict = match self.storage.get_conflict(conflict_id)? {
             Some(c) => c,
             None => return Err(format!("Conflict ID not found: {}", conflict_id).into()),
@@ -639,7 +662,10 @@ impl ConflictEngine {
     }
 
     /// Reopens an ignored conflict back to PENDING.
-    pub fn reopen(&self, conflict_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn reopen(
+        &self,
+        conflict_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conflict = match self.storage.get_conflict(conflict_id)? {
             Some(c) => c,
             None => return Err(format!("Conflict ID not found: {}", conflict_id).into()),

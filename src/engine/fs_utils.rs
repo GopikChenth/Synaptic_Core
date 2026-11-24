@@ -20,7 +20,11 @@ pub enum FsSafetyError {
 impl std::fmt::Display for FsSafetyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MarkerMissing(m) => write!(f, "Safety marker '{}' missing! Folder unmounted or corrupted; aborting sync", m),
+            Self::MarkerMissing(m) => write!(
+                f,
+                "Safety marker '{}' missing! Folder unmounted or corrupted; aborting sync",
+                m
+            ),
             Self::DirectoryNotFound(d) => write!(f, "Directory does not exist: {}", d),
             Self::IoError(e) => write!(f, "Filesystem I/O error: {}", e),
         }
@@ -39,7 +43,9 @@ impl From<std::io::Error> for FsSafetyError {
 /// Prevents deleting remote files if an external USB drive, NFS share, or encrypted partition unmounts.
 pub fn verify_folder_marker(folder_root: &Path, marker_name: &str) -> Result<(), FsSafetyError> {
     if !folder_root.exists() {
-        return Err(FsSafetyError::DirectoryNotFound(folder_root.display().to_string()));
+        return Err(FsSafetyError::DirectoryNotFound(
+            folder_root.display().to_string(),
+        ));
     }
 
     let primary_marker = folder_root.join(marker_name);
@@ -141,7 +147,9 @@ pub fn safe_join(folder_root: &Path, relative_path: &str) -> Result<PathBuf, FsS
     let normalized = relative_path.replace('\\', "/");
     let raw = Path::new(&normalized);
     if raw.is_absolute()
-        || raw.components().any(|component| matches!(component, std::path::Component::ParentDir))
+        || raw
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
     {
         return Err(FsSafetyError::IoError(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -423,7 +431,8 @@ mod tests {
 
     #[test]
     fn test_case_collision_detection() {
-        let temp_dir = std::env::temp_dir().join(format!("synapse_case_test_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("synapse_case_test_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let readme = temp_dir.join("ReadMe.md");
@@ -432,11 +441,20 @@ mod tests {
         // Differing letter case (e.g. ReadMe.md vs readme.md) -> collision detected!
         let collision = detect_case_collision(&temp_dir, "readme.md");
         assert!(collision.is_some());
-        assert_eq!(collision.unwrap().to_string_lossy().replace('\\', "/"), "ReadMe.md");
+        assert_eq!(
+            collision.unwrap().to_string_lossy().replace('\\', "/"),
+            "ReadMe.md"
+        );
 
         let collision_upper = detect_case_collision(&temp_dir, "README.MD");
         assert!(collision_upper.is_some());
-        assert_eq!(collision_upper.unwrap().to_string_lossy().replace('\\', "/"), "ReadMe.md");
+        assert_eq!(
+            collision_upper
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/"),
+            "ReadMe.md"
+        );
 
         let collision_all_caps = detect_case_collision(&temp_dir, "README.md");
         assert!(collision_all_caps.is_some());
@@ -454,7 +472,8 @@ mod tests {
 
     #[test]
     fn test_case_collision_nested_directories() {
-        let temp_dir = std::env::temp_dir().join(format!("synapse_case_nested_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("synapse_case_nested_{}", uuid::Uuid::new_v4()));
         let sub = temp_dir.join("Docs").join("SubFolder");
         fs::create_dir_all(&sub).unwrap();
         let target = sub.join("ReadMe.md");
@@ -463,12 +482,18 @@ mod tests {
         // Differing case across all nested directories and filename
         let collision = detect_case_collision(&temp_dir, "docs/subfolder/readme.md");
         assert!(collision.is_some());
-        assert_eq!(collision.unwrap().to_string_lossy().replace('\\', "/"), "Docs/SubFolder/ReadMe.md");
+        assert_eq!(
+            collision.unwrap().to_string_lossy().replace('\\', "/"),
+            "Docs/SubFolder/ReadMe.md"
+        );
 
         // Windows backslash path
         let collision_win = detect_case_collision(&temp_dir, "docs\\subfolder\\readme.md");
         assert!(collision_win.is_some());
-        assert_eq!(collision_win.unwrap().to_string_lossy().replace('\\', "/"), "Docs/SubFolder/ReadMe.md");
+        assert_eq!(
+            collision_win.unwrap().to_string_lossy().replace('\\', "/"),
+            "Docs/SubFolder/ReadMe.md"
+        );
 
         // All uppercase
         let collision_caps = detect_case_collision(&temp_dir, "DOCS/SUBFOLDER/README.MD");
@@ -477,12 +502,18 @@ mod tests {
         // Differing case only in directory segment
         let collision_dir = detect_case_collision(&temp_dir, "docs/subfolder/ReadMe.md");
         assert!(collision_dir.is_some());
-        assert_eq!(collision_dir.unwrap().to_string_lossy().replace('\\', "/"), "Docs/SubFolder/ReadMe.md");
+        assert_eq!(
+            collision_dir.unwrap().to_string_lossy().replace('\\', "/"),
+            "Docs/SubFolder/ReadMe.md"
+        );
 
         // Differing case only in filename
         let collision_file = detect_case_collision(&temp_dir, "Docs/SubFolder/readme.md");
         assert!(collision_file.is_some());
-        assert_eq!(collision_file.unwrap().to_string_lossy().replace('\\', "/"), "Docs/SubFolder/ReadMe.md");
+        assert_eq!(
+            collision_file.unwrap().to_string_lossy().replace('\\', "/"),
+            "Docs/SubFolder/ReadMe.md"
+        );
 
         // Exact match
         let exact = detect_case_collision(&temp_dir, "Docs/SubFolder/ReadMe.md");
@@ -497,7 +528,8 @@ mod tests {
 
     #[test]
     fn test_special_file_symlink_helpers() {
-        let temp_dir = std::env::temp_dir().join(format!("synapse_symlink_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("synapse_symlink_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let target_file = temp_dir.join("original.txt");
@@ -514,14 +546,20 @@ mod tests {
         let payload = symlink_cas_payload("original.txt");
         assert!(is_special_file_payload(&payload));
         let parsed = parse_special_cas_payload(&payload).unwrap();
-        assert_eq!(parsed, SpecialFileType::Symlink { target: "original.txt".to_string() });
+        assert_eq!(
+            parsed,
+            SpecialFileType::Symlink {
+                target: "original.txt".to_string()
+            }
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_special_file_hardlink_helpers() {
-        let temp_dir = std::env::temp_dir().join(format!("synapse_hardlink_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("synapse_hardlink_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let orig = temp_dir.join("file.txt");
@@ -536,21 +574,30 @@ mod tests {
             assert_eq!(get_hardlink_count(&orig).unwrap(), 2);
             assert_eq!(get_hardlink_count(&hardlink_path).unwrap(), 2);
             assert!(is_hardlink(&orig));
-            assert_eq!(get_file_inode(&orig).unwrap(), get_file_inode(&hardlink_path).unwrap());
+            assert_eq!(
+                get_file_inode(&orig).unwrap(),
+                get_file_inode(&hardlink_path).unwrap()
+            );
         }
 
         // CAS payload round-trip
         let payload = hardlink_cas_payload("file.txt");
         assert!(is_special_file_payload(&payload));
         let parsed = parse_special_cas_payload(&payload).unwrap();
-        assert_eq!(parsed, SpecialFileType::Hardlink { target: "file.txt".to_string() });
+        assert_eq!(
+            parsed,
+            SpecialFileType::Hardlink {
+                target: "file.txt".to_string()
+            }
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_mount_marker_verification() {
-        let temp_dir = std::env::temp_dir().join(format!("synapse_marker_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("synapse_marker_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
 
         // 1. Marker missing initially
@@ -589,7 +636,7 @@ mod tests {
         let res_unmounted = verify_folder_marker(&unmounted, ".synapse-folder");
         assert!(res_unmounted.is_err());
         match res_unmounted {
-            Err(FsSafetyError::DirectoryNotFound(_)) => {},
+            Err(FsSafetyError::DirectoryNotFound(_)) => {}
             other => panic!("Expected DirectoryNotFound, got {:?}", other),
         }
 
@@ -598,7 +645,8 @@ mod tests {
 
     #[test]
     fn test_atomic_write() {
-        let temp_dir = std::env::temp_dir().join(format!("synapse_atomic_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("synapse_atomic_{}", uuid::Uuid::new_v4()));
         let parent_dir = temp_dir.join("sub");
         let file_path = parent_dir.join("test.txt");
 
@@ -606,7 +654,13 @@ mod tests {
         let target_mode = 0o755u32;
 
         // 1. Initial write
-        atomic_write_file(&file_path, b"Atomic Payload Content", Some(target_nanos), Some(target_mode)).unwrap();
+        atomic_write_file(
+            &file_path,
+            b"Atomic Payload Content",
+            Some(target_nanos),
+            Some(target_mode),
+        )
+        .unwrap();
         assert!(file_path.exists());
         assert_eq!(fs::read(&file_path).unwrap(), b"Atomic Payload Content");
 
@@ -633,7 +687,13 @@ mod tests {
         // 2. Atomic overwrite of existing file
         let update_nanos = 1_705_000_456_000_000_000i64;
         let update_mode = 0o644u32;
-        atomic_write_file(&file_path, b"Updated Atomic Payload", Some(update_nanos), Some(update_mode)).unwrap();
+        atomic_write_file(
+            &file_path,
+            b"Updated Atomic Payload",
+            Some(update_nanos),
+            Some(update_mode),
+        )
+        .unwrap();
 
         assert_eq!(fs::read(&file_path).unwrap(), b"Updated Atomic Payload");
 
@@ -653,7 +713,10 @@ mod tests {
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with(".synapse.tmp."))
             .collect();
-        assert!(temp_files_after.is_empty(), "No temporary files should remain after overwrite");
+        assert!(
+            temp_files_after.is_empty(),
+            "No temporary files should remain after overwrite"
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -661,34 +724,66 @@ mod tests {
     #[test]
     fn test_path_sanitization() {
         // Standard path
-        assert_eq!(sanitize_relative_path("foo/bar/test.txt"), "foo/bar/test.txt");
+        assert_eq!(
+            sanitize_relative_path("foo/bar/test.txt"),
+            "foo/bar/test.txt"
+        );
 
         // Directory traversal with ..
-        assert_eq!(sanitize_relative_path("foo/../bar/test.txt"), "bar/test.txt");
-        assert_eq!(sanitize_relative_path("a/b/../../c/d/../e/file.txt"), "c/e/file.txt");
-        assert_eq!(sanitize_relative_path("../../../../etc/passwd"), "etc/passwd");
+        assert_eq!(
+            sanitize_relative_path("foo/../bar/test.txt"),
+            "bar/test.txt"
+        );
+        assert_eq!(
+            sanitize_relative_path("a/b/../../c/d/../e/file.txt"),
+            "c/e/file.txt"
+        );
+        assert_eq!(
+            sanitize_relative_path("../../../../etc/passwd"),
+            "etc/passwd"
+        );
         assert_eq!(sanitize_relative_path("foo/bar/baz/../../qux"), "foo/qux");
 
         // Current directory components and redundant slashes
-        assert_eq!(sanitize_relative_path("./foo/./bar/./test.txt"), "foo/bar/test.txt");
-        assert_eq!(sanitize_relative_path("foo///bar//file.txt"), "foo/bar/file.txt");
+        assert_eq!(
+            sanitize_relative_path("./foo/./bar/./test.txt"),
+            "foo/bar/test.txt"
+        );
+        assert_eq!(
+            sanitize_relative_path("foo///bar//file.txt"),
+            "foo/bar/file.txt"
+        );
 
         // Windows backslash normalization
-        assert_eq!(sanitize_relative_path("nested\\folder/sub\\file.txt"), "nested/folder/sub/file.txt");
+        assert_eq!(
+            sanitize_relative_path("nested\\folder/sub\\file.txt"),
+            "nested/folder/sub/file.txt"
+        );
 
         // Windows illegal characters replacement
-        assert_eq!(sanitize_relative_path("illegal:name*file?.txt"), "illegal_name_file_.txt");
-        assert_eq!(sanitize_relative_path("folder<1>/file:name?version*\"test\"|pipe.txt"), "folder_1_/file_name_version__test__pipe.txt");
+        assert_eq!(
+            sanitize_relative_path("illegal:name*file?.txt"),
+            "illegal_name_file_.txt"
+        );
+        assert_eq!(
+            sanitize_relative_path("folder<1>/file:name?version*\"test\"|pipe.txt"),
+            "folder_1_/file_name_version__test__pipe.txt"
+        );
 
         // Whitespace trimming in path segments
-        assert_eq!(sanitize_relative_path(" foo / bar / file.txt "), "foo/bar/file.txt");
+        assert_eq!(
+            sanitize_relative_path(" foo / bar / file.txt "),
+            "foo/bar/file.txt"
+        );
     }
 
     #[test]
     fn test_safe_join_rejects_parent_paths() {
         let root = std::env::temp_dir().join(format!("synapse_safe_join_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        assert!(safe_join(&root, "nested/file.txt").unwrap().starts_with(&root));
+        assert!(safe_join(&root, "nested/file.txt")
+            .unwrap()
+            .starts_with(&root));
         assert!(safe_join(&root, "../outside.txt").is_err());
         assert!(safe_join(&root, "/outside.txt").is_err());
         let _ = fs::remove_dir_all(root);

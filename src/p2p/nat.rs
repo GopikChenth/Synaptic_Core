@@ -38,7 +38,11 @@ pub fn build_stun_binding_request(tx_id: &[u8; 12]) -> [u8; 20] {
 }
 
 /// Builds a STUN Binding Response packet with an IPv4 XOR-mapped address or standard mapped address.
-pub fn build_stun_binding_response(tx_id: &[u8; 12], mapped_addr: SocketAddr, xor: bool) -> Vec<u8> {
+pub fn build_stun_binding_response(
+    tx_id: &[u8; 12],
+    mapped_addr: SocketAddr,
+    xor: bool,
+) -> Vec<u8> {
     let mut resp = Vec::with_capacity(32);
     resp.extend_from_slice(&STUN_BINDING_RESPONSE.to_be_bytes());
     resp.extend_from_slice(&12u16.to_be_bytes());
@@ -174,7 +178,8 @@ pub async fn query_stun_external_addr(
     socket.send_to(&request, target_addr).await?;
 
     let mut buf = [0u8; 1024];
-    let (len, _) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await??;
+    let (len, _) =
+        tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await??;
 
     let resolved = parse_stun_response(&buf[..len])?;
     info!("STUN resolved external mapped address: {}", resolved);
@@ -397,10 +402,8 @@ pub async fn discover_upnp_gateways(
 
         match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await {
             Ok(Ok((len, _sender))) => {
-                if let Some(resp) = parse_ssdp_packet(&buf[..len]) {
-                    if let SsdpPacket::Response(r) = resp {
-                        responses.push(r);
-                    }
+                if let Some(SsdpPacket::Response(r)) = parse_ssdp_packet(&buf[..len]) {
+                    responses.push(r);
                 }
             }
             _ => break,
@@ -485,10 +488,7 @@ pub fn generate_nat_pmp_port_request(
 }
 
 /// Generates a 12-byte NAT-PMP mapping deletion request (lifetime = 0).
-pub fn generate_nat_pmp_port_deletion(
-    protocol: NatPmpProtocol,
-    internal_port: u16,
-) -> [u8; 12] {
+pub fn generate_nat_pmp_port_deletion(protocol: NatPmpProtocol, internal_port: u16) -> [u8; 12] {
     generate_nat_pmp_port_request(protocol, internal_port, 0, 0)
 }
 
@@ -533,7 +533,12 @@ pub fn parse_nat_pmp_mapping_response(bytes: &[u8]) -> Result<NatPmpMappingRespo
     let protocol = match op {
         129 => NatPmpProtocol::Udp,
         130 => NatPmpProtocol::Tcp,
-        _ => return Err(format!("Unexpected OP code in NAT-PMP mapping response: {}", op)),
+        _ => {
+            return Err(format!(
+                "Unexpected OP code in NAT-PMP mapping response: {}",
+                op
+            ))
+        }
     };
 
     let raw_result_code = u16::from_be_bytes([bytes[2], bytes[3]]);
@@ -575,7 +580,10 @@ pub fn parse_nat_pmp_address_response(bytes: &[u8]) -> Result<NatPmpAddressRespo
         return Err(format!("Unsupported NAT-PMP version: {}", bytes[0]));
     }
     if bytes[1] != 128 {
-        return Err(format!("Unexpected OP code in NAT-PMP address response: {}", bytes[1]));
+        return Err(format!(
+            "Unexpected OP code in NAT-PMP address response: {}",
+            bytes[1]
+        ));
     }
 
     let raw_result_code = u16::from_be_bytes([bytes[2], bytes[3]]);
@@ -646,7 +654,10 @@ mod tests {
         assert_eq!(req.len(), 20);
         assert_eq!(u16::from_be_bytes([req[0], req[1]]), STUN_BINDING_REQUEST);
         assert_eq!(u16::from_be_bytes([req[2], req[3]]), 0); // message length: 0
-        assert_eq!(u32::from_be_bytes([req[4], req[5], req[6], req[7]]), STUN_MAGIC_COOKIE);
+        assert_eq!(
+            u32::from_be_bytes([req[4], req[5], req[6], req[7]]),
+            STUN_MAGIC_COOKIE
+        );
         assert_eq!(&req[8..20], &tx_id);
     }
 
@@ -663,7 +674,8 @@ mod tests {
 
         for &addr in &test_addrs {
             let resp_bytes = build_stun_binding_response(&tx_id, addr, true);
-            let parsed = parse_stun_response(&resp_bytes).expect("Failed to parse XOR-mapped STUN response");
+            let parsed =
+                parse_stun_response(&resp_bytes).expect("Failed to parse XOR-mapped STUN response");
             assert_eq!(parsed, addr);
         }
     }
@@ -679,7 +691,8 @@ mod tests {
 
         for &addr in &test_addrs {
             let resp_bytes = build_stun_binding_response(&tx_id, addr, false);
-            let parsed = parse_stun_response(&resp_bytes).expect("Failed to parse standard mapped STUN response");
+            let parsed = parse_stun_response(&resp_bytes)
+                .expect("Failed to parse standard mapped STUN response");
             assert_eq!(parsed, addr);
         }
     }
@@ -717,7 +730,8 @@ mod tests {
         };
         resp.extend_from_slice(&(raw_ip ^ STUN_MAGIC_COOKIE).to_be_bytes());
 
-        let parsed = parse_stun_response(&resp).expect("Failed to parse response with multiple attributes");
+        let parsed =
+            parse_stun_response(&resp).expect("Failed to parse response with multiple attributes");
         assert_eq!(parsed, mapped);
     }
 
@@ -814,7 +828,10 @@ mod tests {
             let (len, client_addr) = server_socket.recv_from(&mut buf).await.unwrap();
             assert!(len >= 20);
             assert_eq!(u16::from_be_bytes([buf[0], buf[1]]), STUN_BINDING_REQUEST);
-            assert_eq!(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]), STUN_MAGIC_COOKIE);
+            assert_eq!(
+                u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
+                STUN_MAGIC_COOKIE
+            );
 
             let mut tx_id = [0u8; 12];
             tx_id.copy_from_slice(&buf[8..20]);
@@ -826,7 +843,10 @@ mod tests {
 
         match query_stun_external_addr(&server_addr.to_string(), 0).await {
             Ok(resolved) => {
-                assert_eq!(resolved, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77)), 45678));
+                assert_eq!(
+                    resolved,
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77)), 45678)
+                );
             }
             Err(e) if e.to_string().contains("Network is unreachable") => {
                 // In sandboxed environments without loopback routing, skip network I/O
@@ -897,7 +917,10 @@ mod tests {
         assert_eq!(parsed.host, "239.255.255.250:1900");
         assert_eq!(parsed.man, "ssdp:discover");
         assert_eq!(parsed.mx, 3);
-        assert_eq!(parsed.st, "urn:schemas-upnp-org:device:InternetGatewayDevice:1");
+        assert_eq!(
+            parsed.st,
+            "urn:schemas-upnp-org:device:InternetGatewayDevice:1"
+        );
     }
 
     #[test]
@@ -913,7 +936,10 @@ mod tests {
         assert_eq!(parsed.host, "239.255.255.250:1900");
         assert_eq!(parsed.man, "ssdp:discover");
         assert_eq!(parsed.mx, 4);
-        assert_eq!(parsed.st, "urn:schemas-upnp-org:device:InternetGatewayDevice:1");
+        assert_eq!(
+            parsed.st,
+            "urn:schemas-upnp-org:device:InternetGatewayDevice:1"
+        );
     }
 
     #[test]
@@ -934,15 +960,28 @@ mod tests {
         assert_eq!(parsed.man, "ssdp:discover");
         assert_eq!(parsed.mx, 2);
         assert_eq!(parsed.st, "upnp:rootdevice");
-        assert_eq!(parsed.headers.get("bootid.upnp.org").map(|s| s.as_str()), Some("42"));
-        assert_eq!(parsed.headers.get("configid.upnp.org").map(|s| s.as_str()), Some("1337"));
-        assert_eq!(parsed.headers.get("searchport.upnp.org").map(|s| s.as_str()), Some("1900"));
+        assert_eq!(
+            parsed.headers.get("bootid.upnp.org").map(|s| s.as_str()),
+            Some("42")
+        );
+        assert_eq!(
+            parsed.headers.get("configid.upnp.org").map(|s| s.as_str()),
+            Some("1337")
+        );
+        assert_eq!(
+            parsed
+                .headers
+                .get("searchport.upnp.org")
+                .map(|s| s.as_str()),
+            Some("1900")
+        );
     }
 
     #[test]
     fn test_ssdp_msearch_malformed_variations() {
         // Missing HOST
-        let no_host = "M-SEARCH * HTTP/1.1\r\nMAN: \"ssdp:discover\"\r\nMX: 3\r\nST: upnp:rootdevice\r\n\r\n";
+        let no_host =
+            "M-SEARCH * HTTP/1.1\r\nMAN: \"ssdp:discover\"\r\nMX: 3\r\nST: upnp:rootdevice\r\n\r\n";
         assert!(parse_ssdp_msearch(no_host).is_none());
 
         // Missing MAN
@@ -1012,7 +1051,10 @@ mod tests {
         let r10 = parse_ssdp_response(raw10).expect("Failed to parse HTTP/1.0 response");
         assert_eq!(r10.status_code, 200);
         assert_eq!(r10.status_text, "OK");
-        assert_eq!(r10.location.as_deref(), Some("http://192.168.1.1:80/rootDesc.xml"));
+        assert_eq!(
+            r10.location.as_deref(),
+            Some("http://192.168.1.1:80/rootDesc.xml")
+        );
         assert_eq!(r10.server.as_deref(), Some("Linux/4.14 UPnP/1.0 OpenWrt"));
         assert_eq!(r10.st.as_deref(), Some("upnp:rootdevice"));
         assert!(r10.usn.is_some());
@@ -1022,7 +1064,10 @@ mod tests {
         let r_nt = parse_ssdp_response(raw_no_text).expect("Failed to parse 200 without text");
         assert_eq!(r_nt.status_code, 200);
         assert_eq!(r_nt.status_text, "");
-        assert_eq!(r_nt.location.as_deref(), Some("http://10.0.0.1:49152/desc.xml"));
+        assert_eq!(
+            r_nt.location.as_deref(),
+            Some("http://10.0.0.1:49152/desc.xml")
+        );
         assert!(r_nt.server.is_none());
 
         // Status 404
@@ -1032,7 +1077,8 @@ mod tests {
         assert_eq!(r404.status_text, "Not Found");
 
         // Leading blank lines
-        let raw_leading = "\r\n\r\nHTTP/1.1 200 OK\r\nLOCATION: http://192.168.0.1:1900/igd.xml\r\n\r\n";
+        let raw_leading =
+            "\r\n\r\nHTTP/1.1 200 OK\r\nLOCATION: http://192.168.0.1:1900/igd.xml\r\n\r\n";
         let r_lead = parse_ssdp_response(raw_leading).expect("Failed to parse with leading blanks");
         assert_eq!(r_lead.status_code, 200);
     }
@@ -1097,13 +1143,19 @@ mod tests {
         assert_eq!(req_udp[3], 0); // Reserved
         assert_eq!(u16::from_be_bytes([req_udp[4], req_udp[5]]), 9190);
         assert_eq!(u16::from_be_bytes([req_udp[6], req_udp[7]]), 9190);
-        assert_eq!(u32::from_be_bytes([req_udp[8], req_udp[9], req_udp[10], req_udp[11]]), 7200);
+        assert_eq!(
+            u32::from_be_bytes([req_udp[8], req_udp[9], req_udp[10], req_udp[11]]),
+            7200
+        );
 
         let req_tcp = generate_nat_pmp_port_request(NatPmpProtocol::Tcp, 8080, 0, 3600);
         assert_eq!(req_tcp[1], 2); // OP 2 (TCP)
         assert_eq!(u16::from_be_bytes([req_tcp[4], req_tcp[5]]), 8080);
         assert_eq!(u16::from_be_bytes([req_tcp[6], req_tcp[7]]), 0);
-        assert_eq!(u32::from_be_bytes([req_tcp[8], req_tcp[9], req_tcp[10], req_tcp[11]]), 3600);
+        assert_eq!(
+            u32::from_be_bytes([req_tcp[8], req_tcp[9], req_tcp[10], req_tcp[11]]),
+            3600
+        );
     }
 
     #[test]
@@ -1221,7 +1273,8 @@ mod tests {
             resp[10..12].copy_from_slice(&9190u16.to_be_bytes()); // External port
             resp[12..16].copy_from_slice(&7200u32.to_be_bytes()); // Lifetime
 
-            let parsed = parse_nat_pmp_mapping_response(&resp).expect("Failed to parse mapping response");
+            let parsed =
+                parse_nat_pmp_mapping_response(&resp).expect("Failed to parse mapping response");
             assert_eq!(parsed.protocol, NatPmpProtocol::Udp);
             assert_eq!(parsed.result_code, expected_variant);
             assert_eq!(parsed.raw_result_code, code);
@@ -1300,7 +1353,8 @@ mod tests {
             resp[4..8].copy_from_slice(&5555u32.to_be_bytes());
             resp[8..12].copy_from_slice(&ip.octets());
 
-            let parsed = parse_nat_pmp_address_response(&resp).expect("Failed to parse address response");
+            let parsed =
+                parse_nat_pmp_address_response(&resp).expect("Failed to parse address response");
             assert_eq!(parsed.result_code, NatPmpResultCode::Success);
             assert_eq!(parsed.epoch_seconds, 5555);
             assert_eq!(parsed.external_ip, ip);

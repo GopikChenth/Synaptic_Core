@@ -4,9 +4,9 @@
 //! (`RelayJoin`, `RelayInvitation`, `RelayTunnelData`), wire protocol framing,
 //! and session sequencing for nodes that cannot establish direct peer-to-peer connections.
 
-use std::time::{SystemTime, UNIX_EPOCH};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Returns the current system timestamp in milliseconds since the UNIX epoch.
 pub fn current_timestamp_ms() -> u64 {
@@ -315,20 +315,11 @@ pub enum RelayMessage {
     /// Blind forwarded tunnel frame between peers
     Tunnel(RelayTunnelData),
     /// Relay keepalive ping
-    Ping {
-        session_id: String,
-        timestamp: u64,
-    },
+    Ping { session_id: String, timestamp: u64 },
     /// Relay keepalive pong
-    Pong {
-        session_id: String,
-        timestamp: u64,
-    },
+    Pong { session_id: String, timestamp: u64 },
     /// Teardown of the relay session
-    CloseSession {
-        session_id: String,
-        reason: String,
-    },
+    CloseSession { session_id: String, reason: String },
 }
 
 impl RelayMessage {
@@ -453,7 +444,11 @@ impl RelaySession {
     }
 
     /// Transitions to a target state, verifying lifecycle invariants.
-    pub fn transition_to(&mut self, next: RelaySessionState) -> Result<(), crate::state::StateTransitionError> {
+    #[allow(clippy::result_large_err)]
+    pub fn transition_to(
+        &mut self,
+        next: RelaySessionState,
+    ) -> Result<(), crate::state::StateTransitionError> {
         if !self.can_transition_to(next) {
             return Err(crate::state::StateTransitionError {
                 entity: "relay_session".to_string(),
@@ -492,7 +487,10 @@ impl RelaySession {
 
     /// Validates an inbound tunnel packet: checks session ID, peer endpoints,
     /// and ensures strictly increasing sequence numbers to prevent replay attacks.
-    pub fn verify_inbound_data<'a>(&mut self, frame: &'a RelayTunnelData) -> Result<&'a [u8], String> {
+    pub fn verify_inbound_data<'a>(
+        &mut self,
+        frame: &'a RelayTunnelData,
+    ) -> Result<&'a [u8], String> {
         if frame.session_id != self.session_id {
             return Err(format!(
                 "Session mismatch: expected {}, got {}",
@@ -539,7 +537,12 @@ mod tests {
         let device_id = hex::encode(key.verifying_key().as_bytes());
         let session_id = "sess-12345".to_string();
 
-        let join = RelayJoin::new(&key, device_id.clone(), session_id.clone(), Some("token_abc".into()));
+        let join = RelayJoin::new(
+            &key,
+            device_id.clone(),
+            session_id.clone(),
+            Some("token_abc".into()),
+        );
         assert_eq!(join.device_id, device_id);
         assert_eq!(join.session_id, session_id);
         assert_eq!(join.signature.len(), 64);
@@ -666,7 +669,8 @@ mod tests {
         let framed = msg.to_length_prefixed().expect("Framing failed");
         assert!(framed.len() > 4);
 
-        let (unframed, consumed) = RelayMessage::from_length_prefixed(&framed).expect("Unframing failed");
+        let (unframed, consumed) =
+            RelayMessage::from_length_prefixed(&framed).expect("Unframing failed");
         assert_eq!(consumed, framed.len());
         assert_eq!(msg, unframed);
     }
@@ -696,7 +700,9 @@ mod tests {
             vec![99],
             vec![5],
         );
-        let decrypted1 = session.verify_inbound_data(&inbound_frame1).expect("Inbound packet 1 failed");
+        let decrypted1 = session
+            .verify_inbound_data(&inbound_frame1)
+            .expect("Inbound packet 1 failed");
         assert_eq!(decrypted1, &[10, 20, 30]);
 
         // Inbound replay attack (same sequence number) rejected!
@@ -712,7 +718,9 @@ mod tests {
         let mut inbound_frame2 = inbound_frame1.clone();
         inbound_frame2.sequence_number = 2;
         inbound_frame2.encrypted_payload = vec![40, 50];
-        let decrypted2 = session.verify_inbound_data(&inbound_frame2).expect("Inbound packet 2 failed");
+        let decrypted2 = session
+            .verify_inbound_data(&inbound_frame2)
+            .expect("Inbound packet 2 failed");
         assert_eq!(decrypted2, &[40, 50]);
     }
 
@@ -798,7 +806,12 @@ mod tests {
         assert!(join_none.auth_token.is_none());
         assert!(join_none.verify().unwrap());
 
-        let join_some = RelayJoin::new(&key, device_id, "s-some".into(), Some("my_auth_token".into()));
+        let join_some = RelayJoin::new(
+            &key,
+            device_id,
+            "s-some".into(),
+            Some("my_auth_token".into()),
+        );
         assert_eq!(join_some.auth_token.as_deref(), Some("my_auth_token"));
         assert!(join_some.verify().unwrap());
     }
@@ -940,17 +953,26 @@ mod tests {
         let mut bad = valid.clone();
         bad.sender_id = "same_peer".into();
         bad.recipient_id = "same_peer".into();
-        assert_eq!(bad.validate().unwrap_err(), "Sender ID and Recipient ID cannot be identical");
+        assert_eq!(
+            bad.validate().unwrap_err(),
+            "Sender ID and Recipient ID cannot be identical"
+        );
 
         // Empty encrypted_payload
         let mut bad = valid.clone();
         bad.encrypted_payload = vec![];
-        assert_eq!(bad.validate().unwrap_err(), "Encrypted payload cannot be empty");
+        assert_eq!(
+            bad.validate().unwrap_err(),
+            "Encrypted payload cannot be empty"
+        );
 
         // Empty auth_tag
         let mut bad = valid.clone();
         bad.auth_tag = vec![];
-        assert_eq!(bad.validate().unwrap_err(), "Authentication tag cannot be empty");
+        assert_eq!(
+            bad.validate().unwrap_err(),
+            "Authentication tag cannot be empty"
+        );
 
         // Empty nonce
         let mut bad = valid.clone();
@@ -968,8 +990,24 @@ mod tests {
         let dev = hex::encode(key.verifying_key().as_bytes());
 
         let join = RelayJoin::new(&key, dev.clone(), "sess-01".into(), Some("tok".into()));
-        let invitation = RelayInvitation::new(&key, dev.clone(), "target".into(), "relay:443".into(), "sess-02".into(), "key-share".into(), 60_000);
-        let tunnel = RelayTunnelData::new("sess-03".into(), 10, "sender".into(), "receiver".into(), vec![1, 2], vec![3], vec![4]);
+        let invitation = RelayInvitation::new(
+            &key,
+            dev.clone(),
+            "target".into(),
+            "relay:443".into(),
+            "sess-02".into(),
+            "key-share".into(),
+            60_000,
+        );
+        let tunnel = RelayTunnelData::new(
+            "sess-03".into(),
+            10,
+            "sender".into(),
+            "receiver".into(),
+            vec![1, 2],
+            vec![3],
+            vec![4],
+        );
 
         let variants = vec![
             RelayMessage::Join(join),
@@ -1015,7 +1053,8 @@ mod tests {
             assert_eq!(msg, decoded);
 
             let framed = msg.to_length_prefixed().expect("Framing failed");
-            let (unframed, consumed) = RelayMessage::from_length_prefixed(&framed).expect("Unframing failed");
+            let (unframed, consumed) =
+                RelayMessage::from_length_prefixed(&framed).expect("Unframing failed");
             assert_eq!(consumed, framed.len());
             assert_eq!(msg, unframed);
         }
@@ -1030,24 +1069,71 @@ mod tests {
         assert_eq!(RelayMessage::Join(join).session_id(), Some("s-join"));
 
         assert_eq!(
-            RelayMessage::JoinAck { session_id: "s-ack".into(), accepted: true, reason: None }.session_id(),
+            RelayMessage::JoinAck {
+                session_id: "s-ack".into(),
+                accepted: true,
+                reason: None
+            }
+            .session_id(),
             Some("s-ack")
         );
 
-        let inv = RelayInvitation::new(&key, dev.clone(), "t".into(), "r".into(), "s-inv".into(), "k".into(), 1000);
+        let inv = RelayInvitation::new(
+            &key,
+            dev.clone(),
+            "t".into(),
+            "r".into(),
+            "s-inv".into(),
+            "k".into(),
+            1000,
+        );
         assert_eq!(RelayMessage::Invitation(inv).session_id(), Some("s-inv"));
 
         assert_eq!(
-            RelayMessage::InvitationResponse { invitation_id: "inv-1".into(), accepted: true, reason: None }.session_id(),
+            RelayMessage::InvitationResponse {
+                invitation_id: "inv-1".into(),
+                accepted: true,
+                reason: None
+            }
+            .session_id(),
             None
         );
 
-        let tun = RelayTunnelData::new("s-tun".into(), 1, "a".into(), "b".into(), vec![1], vec![1], vec![1]);
+        let tun = RelayTunnelData::new(
+            "s-tun".into(),
+            1,
+            "a".into(),
+            "b".into(),
+            vec![1],
+            vec![1],
+            vec![1],
+        );
         assert_eq!(RelayMessage::Tunnel(tun).session_id(), Some("s-tun"));
 
-        assert_eq!(RelayMessage::Ping { session_id: "s-p".into(), timestamp: 0 }.session_id(), Some("s-p"));
-        assert_eq!(RelayMessage::Pong { session_id: "s-po".into(), timestamp: 0 }.session_id(), Some("s-po"));
-        assert_eq!(RelayMessage::CloseSession { session_id: "s-cl".into(), reason: "".into() }.session_id(), Some("s-cl"));
+        assert_eq!(
+            RelayMessage::Ping {
+                session_id: "s-p".into(),
+                timestamp: 0
+            }
+            .session_id(),
+            Some("s-p")
+        );
+        assert_eq!(
+            RelayMessage::Pong {
+                session_id: "s-po".into(),
+                timestamp: 0
+            }
+            .session_id(),
+            Some("s-po")
+        );
+        assert_eq!(
+            RelayMessage::CloseSession {
+                session_id: "s-cl".into(),
+                reason: "".into()
+            }
+            .session_id(),
+            Some("s-cl")
+        );
     }
 
     #[test]
@@ -1072,7 +1158,10 @@ mod tests {
 
     #[test]
     fn test_relay_multi_frame_stream_unframing() {
-        let msg1 = RelayMessage::Ping { session_id: "stream-1".into(), timestamp: 100 };
+        let msg1 = RelayMessage::Ping {
+            session_id: "stream-1".into(),
+            timestamp: 100,
+        };
         let msg2 = RelayMessage::Tunnel(RelayTunnelData::new(
             "stream-1".into(),
             1,
@@ -1082,8 +1171,14 @@ mod tests {
             vec![99],
             vec![77],
         ));
-        let msg3 = RelayMessage::Pong { session_id: "stream-1".into(), timestamp: 101 };
-        let msg4 = RelayMessage::CloseSession { session_id: "stream-1".into(), reason: "done".into() };
+        let msg3 = RelayMessage::Pong {
+            session_id: "stream-1".into(),
+            timestamp: 101,
+        };
+        let msg4 = RelayMessage::CloseSession {
+            session_id: "stream-1".into(),
+            reason: "done".into(),
+        };
 
         // Concatenate all 4 frames into a single continuous byte stream
         let mut stream = Vec::new();
@@ -1221,7 +1316,9 @@ mod tests {
             let frame = sender_session.pack_tunnel_data(payload.clone(), tag, nonce);
             assert_eq!(frame.sequence_number, expected_seq);
 
-            let verified_payload = receiver_session.verify_inbound_data(&frame).expect("Inbound frame verification failed");
+            let verified_payload = receiver_session
+                .verify_inbound_data(&frame)
+                .expect("Inbound frame verification failed");
             assert_eq!(verified_payload, &payload[..]);
         }
 
@@ -1248,7 +1345,9 @@ mod tests {
         // Exchange 250 legitimate frames
         for _ in 1..=250 {
             let frame = sender_session.pack_tunnel_data(vec![1, 2, 3], vec![9], vec![0]);
-            receiver_session.verify_inbound_data(&frame).expect("Legitimate frame should be accepted");
+            receiver_session
+                .verify_inbound_data(&frame)
+                .expect("Legitimate frame should be accepted");
             captured_frames.push(frame);
         }
         assert_eq!(receiver_session.inbound_seq, 250);
@@ -1256,7 +1355,11 @@ mod tests {
         // Adversary re-injects all 250 captured frames in reverse order (replay attack storm)
         for replayed_frame in captured_frames.iter().rev() {
             let res = receiver_session.verify_inbound_data(replayed_frame);
-            assert!(res.is_err(), "Replay frame seq {} must be rejected!", replayed_frame.sequence_number);
+            assert!(
+                res.is_err(),
+                "Replay frame seq {} must be rejected!",
+                replayed_frame.sequence_number
+            );
         }
 
         // Receiver state remains at seq 250
@@ -1289,9 +1392,15 @@ mod tests {
                 );
 
                 for i in 1..=200u64 {
-                    let frame = sender.pack_tunnel_data(vec![(i % 256) as u8; 64], vec![0x55; 16], vec![0x33; 12]);
+                    let frame = sender.pack_tunnel_data(
+                        vec![(i % 256) as u8; 64],
+                        vec![0x55; 16],
+                        vec![0x33; 12],
+                    );
                     assert_eq!(frame.sequence_number, i);
-                    let payload = receiver.verify_inbound_data(&frame).expect("Concurrent inbound frame failed");
+                    let payload = receiver
+                        .verify_inbound_data(&frame)
+                        .expect("Concurrent inbound frame failed");
                     assert_eq!(payload.len(), 64);
                 }
             });
